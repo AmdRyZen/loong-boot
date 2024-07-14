@@ -3,8 +3,8 @@ cmake_minimum_required(VERSION 3.28)
 #[[SET(CMAKE_C_COMPILER "/opt/homebrew/Cellar/gcc@11/11.4.0/bin/gcc-11")
 SET(CMAKE_CXX_COMPILER "/opt/homebrew/Cellar/gcc@11/11.4.0/bin/g++-11")]]
 
-SET(CMAKE_C_COMPILER "/opt/homebrew/Cellar/gcc/14.1.0_1/bin/gcc-14")
-SET(CMAKE_CXX_COMPILER "/opt/homebrew/Cellar/gcc/14.1.0_1/bin/g++-14")
+SET(CMAKE_C_COMPILER "/opt/homebrew/Cellar/gcc/14.1.0_2/bin/gcc-14")
+SET(CMAKE_CXX_COMPILER "/opt/homebrew/Cellar/gcc/14.1.0_2/bin/g++-14")
 
 project(loong-boot C CXX)
 

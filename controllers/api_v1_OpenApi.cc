@@ -541,6 +541,7 @@ Task<> OpenApi::fastJson(const HttpRequestPtr req, std::function<void(const Http
 {
     std::string buffer{};
     GOOGLE_PROTOBUF_VERIFY_VERSION;
+    std::cout << "Protocol Buffers version: " << GOOGLE_PROTOBUF_VERSION << std::endl;
 
     auto t1 = std::chrono::steady_clock::now();
     for (auto i = 0; i < 1000; i++)
