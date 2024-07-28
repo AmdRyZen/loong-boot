@@ -109,13 +109,13 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
     //wsConnPtr->send(std::format("欢迎 {} 加入我们 {}", userName_, s.chatRoomName_));
     chatRooms_.publish(s.chatRoomName_, std::format("欢迎 {} 加入我们 {}", userName_, s.chatRoomName_));
 
-    // 主动向客户端发送定时消息 并保存定时器ID
-    const auto timerId = HttpAppFramework::instance().getLoop()->runEvery(10.0, [s, userName_, wsConnPtr, this] {
-        //chatRooms_.publish(s.chatRoomName_, std::format("心跳检测 {} 正常", s.chatRoomName_));
-        wsConnPtr->send(std::format("{} 心跳检测 {} 正常", userName_, s.chatRoomName_));
-    });
-    // 将定时器ID与连接关联
-    timers_[wsConnPtr] = timerId;
+    // 将新连接加入到连接列表
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        connections_.insert(wsConnPtr);
+        // 用户ID
+        userNames_[wsConnPtr] = userName_;
+    }
 
     s.id_ = chatRooms_.subscribe(s.chatRoomName_,
                                  [wsConnPtr](const std::string& topic,
@@ -133,12 +133,11 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConnP
     //write your application logic here
     try
     {
-        // 取消定时任务
-        const auto it = timers_.find(wsConnPtr);
-        if (it != timers_.end())
+        // 从连接列表中移除关闭的连接
         {
-            HttpAppFramework::instance().getLoop()->invalidateTimer(it->second);
-            timers_.erase(it);
+            std::lock_guard<std::mutex> guard(mutex_);
+            connections_.erase(wsConnPtr);
+            userNames_.erase(wsConnPtr);
         }
 
         //std::cout << "handleConnectionClosed" << std::endl;
