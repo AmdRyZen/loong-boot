@@ -20,6 +20,7 @@ public:
 
 private:
     PubSubService<std::string> chatRooms_;
+    std::unordered_map<WebSocketConnectionPtr, trantor::TimerId> timers_;
 
     struct chatMessageDto
     {

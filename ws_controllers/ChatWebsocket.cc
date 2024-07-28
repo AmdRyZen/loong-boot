@@ -109,11 +109,13 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
     //wsConnPtr->send(std::format("欢迎 {} 加入我们 {}", userName_, s.chatRoomName_));
     chatRooms_.publish(s.chatRoomName_, std::format("欢迎 {} 加入我们 {}", userName_, s.chatRoomName_));
 
-    // 主动向客户端发送定时消息
-    HttpAppFramework::instance().getLoop()->runEvery(10.0, [s, userName_, wsConnPtr, this] {
+    // 主动向客户端发送定时消息 并保存定时器ID
+    const auto timerId = HttpAppFramework::instance().getLoop()->runEvery(10.0, [s, userName_, wsConnPtr, this] {
         //chatRooms_.publish(s.chatRoomName_, std::format("心跳检测 {} 正常", s.chatRoomName_));
         wsConnPtr->send(std::format("{} 心跳检测 {} 正常", userName_, s.chatRoomName_));
     });
+    // 将定时器ID与连接关联
+    timers_[wsConnPtr] = timerId;
 
     s.id_ = chatRooms_.subscribe(s.chatRoomName_,
                                  [wsConnPtr](const std::string& topic,
@@ -131,6 +133,14 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConnP
     //write your application logic here
     try
     {
+        // 取消定时任务
+        const auto it = timers_.find(wsConnPtr);
+        if (it != timers_.end())
+        {
+            HttpAppFramework::instance().getLoop()->invalidateTimer(it->second);
+            timers_.erase(it);
+        }
+
         //std::cout << "handleConnectionClosed" << std::endl;
         // 获取Subscriber引用
         const auto& subscriber = wsConnPtr->getContextRef<Subscriber>();
@@ -139,11 +149,11 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConnP
         // 退出所有房间
         chatRooms_.unsubscribe(chatRoomName, id);
         // todo 暂时不确定是否需要
-        if (chatRooms_.size() == 0)
+        /*if (chatRooms_.size() == 0)
         {
             std::cout << "chatRooms_.size() = " << chatRooms_.size() << std::endl;
             chatRooms_.clear();
-        }
+        }*/
         // 清理资源
         wsConnPtr->clearContext();
 
