@@ -12,7 +12,7 @@ class User final : public drogon::HttpController<User>
     METHOD_LIST_BEGIN
     METHOD_ADD(User::buildSql, "/buildSql", Get);
     METHOD_ADD(User::login, "/login?userId={1}&passwd={2}", Post);
-    METHOD_ADD(User::getInfo, "/{1}/getInfo?token={2}", Get, "drogon::LoginFilter");
+    METHOD_ADD(User::getInfo, "/{1}/getInfo?token={2}", Post, "drogon::LoginFilter");
     METHOD_ADD(User::getBanWord, "/getBanWord?word={1}", Get);
     METHOD_ADD(User::serdeJson, "/serdeJson", Get);
     METHOD_ADD(User::quit, "/quit", Get);

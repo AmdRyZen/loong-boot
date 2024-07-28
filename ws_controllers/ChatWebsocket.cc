@@ -106,7 +106,15 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
         userName_ = "default_name"; // 设置默认的名称
     }
     // 处理用户加入聊天室
-    wsConnPtr->send(std::format("欢迎 {} 加入我们 {}", userName_, s.chatRoomName_));
+    //wsConnPtr->send(std::format("欢迎 {} 加入我们 {}", userName_, s.chatRoomName_));
+    chatRooms_.publish(s.chatRoomName_, std::format("欢迎 {} 加入我们 {}", userName_, s.chatRoomName_));
+
+    // 主动向客户端发送定时消息
+    HttpAppFramework::instance().getLoop()->runEvery(10.0, [s, userName_, wsConnPtr, this] {
+        //chatRooms_.publish(s.chatRoomName_, std::format("心跳检测 {} 正常", s.chatRoomName_));
+        wsConnPtr->send(std::format("{} 心跳检测 {} 正常", userName_, s.chatRoomName_));
+    });
+
     s.id_ = chatRooms_.subscribe(s.chatRoomName_,
                                  [wsConnPtr](const std::string& topic,
                                              const std::string& message) {
