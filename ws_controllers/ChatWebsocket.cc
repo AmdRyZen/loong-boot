@@ -2,6 +2,7 @@
 #include "utils/redisUtils.h"
 #include "user.pb.h"
 #include <glaze/glaze.hpp>
+#include "utils/KafkaManager.h"
 
 struct Subscriber
 {
@@ -73,6 +74,26 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConnPtr, st
                                 // BEVE
                                 (void) glz::write_json(messageVo, buffer);
                                 chatRooms_.publish(chatRoomName, buffer);
+
+                                {
+                                    // 推送kfk
+                                    auto producer = KafkaManager::instance().getProducer();
+
+                                    // 生产消息（异步）
+                                    if (rd_kafka_produce(
+                                           rd_kafka_topic_new(producer, "message_topic", nullptr),
+                                           RD_KAFKA_PARTITION_UA,
+                                           RD_KAFKA_MSG_F_COPY,
+                                           const_cast<char *>(buffer.c_str()), buffer.size(),
+                                           nullptr, 0,
+                                           nullptr) == -1)
+                                    {
+                                        LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(rd_kafka_last_error());
+                                    } else
+                                    {
+                                        // LOG_INFO << "produce message: " << rd_kafka_err2str(rd_kafka_last_error());
+                                    }
+                                }
                             }
                             // 其他操作...
                         }
@@ -94,7 +115,6 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConnPtr, st
 void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSocketConnectionPtr& wsConnPtr)
 {
     //write your application logic here
-    std::cout << "handleNewConnection" << std::endl;
 
     Subscriber s;
     s.chatRoomName_ = req->getHeader("room_name");
@@ -105,9 +125,16 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
     if (userName_.empty()) {
         userName_ = "default_name"; // 设置默认的名称
     }
-    // 处理用户加入聊天室
-    //wsConnPtr->send(std::format("欢迎 {} 加入我们 {}", userName_, s.chatRoomName_));
-    chatRooms_.publish(s.chatRoomName_, std::format("欢迎 {} 加入我们 {}", userName_, s.chatRoomName_));
+
+    s.id_ = chatRooms_.subscribe(s.chatRoomName_,
+                                 [wsConnPtr](const std::string& topic,
+                                             const std::string& message) {
+                                     // Supress unused variable warning
+                                     (void)topic;
+                                     wsConnPtr->send(message);
+                                 });
+    LOG_INFO << "id = " << s.id_;
+    LOG_INFO << "chatRoomName = " << s.chatRoomName_;
 
     // 将新连接加入到连接列表
     {
@@ -117,15 +144,10 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
         userNames_[wsConnPtr] = userName_;
     }
 
-    s.id_ = chatRooms_.subscribe(s.chatRoomName_,
-                                 [wsConnPtr](const std::string& topic,
-                                             const std::string& message) {
-                                     // Supress unused variable warning
-                                     (void)topic;
-                                     wsConnPtr->send(message);
-                                 });
-    std::cout << "id = " << s.id_ << std::endl;
-    std::cout << "chatRoomName = " << s.chatRoomName_ << std::endl;
+    // 处理用户加入聊天室
+    //wsConnPtr->send(std::format("欢迎 {} 加入我们 {}", userName_, s.chatRoomName_));
+    chatRooms_.publish(s.chatRoomName_, std::format("欢迎 {} 加入我们 {}", userName_, s.chatRoomName_));
+
     wsConnPtr->setContext(std::make_shared<Subscriber>(std::move(s)));
 }
 void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConnPtr)
@@ -139,8 +161,6 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConnP
             connections_.erase(wsConnPtr);
             userNames_.erase(wsConnPtr);
         }
-
-        //std::cout << "handleConnectionClosed" << std::endl;
         // 获取Subscriber引用
         const auto& subscriber = wsConnPtr->getContextRef<Subscriber>();
         // 使用结构化绑定提取成员变量
@@ -154,13 +174,10 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConnP
             chatRooms_.clear();
         }*/
         // 清理资源
-        wsConnPtr->clearContext();
-
-        std::cout << "handleConnectionClosed id = " << id << std::endl;
-        std::cout << "handleConnectionClosed chatRoomName = " << chatRoomName << std::endl;
+        //wsConnPtr->clearContext();
     }
     catch (...)
     {
-        std::cout << "handleConnectionClosed ..." << std::endl;
+        LOG_INFO << "handleConnectionClosed ...";
     }
 }

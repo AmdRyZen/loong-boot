@@ -1,4 +1,3 @@
-
 {
   "app": {
     "number_of_threads": 8,
@@ -47,7 +46,7 @@
     "log": {
       "logfile_base_name": "",
       "log_size_limit": 100000000,
-      "log_level": "WARN"
+      "log_level": "INFO"
     },
     "run_as_daemon": false,
     "handle_sig_term": true,
@@ -124,6 +123,9 @@
   "custom_config": {
     "image-default": "https://github.com/an-tao/drogon/wiki/images/drogon-white.jpg",
     "jwt-secret": "nRvyYC4soFxBdZ-F-5Nnzz5USXstR1YylsTd-mA0aKtI9HUlriGrtkf-TiuDapkLiUCogO3JOK7kwZisrHp6wA",
-    "jwt-sessionTime": 864000
+    "jwt-sessionTime": 864000,
+    "kafka_manager": {
+      "bootstrap.servers": "localhost:9092,localhost:9092"
+    }
   }
 }

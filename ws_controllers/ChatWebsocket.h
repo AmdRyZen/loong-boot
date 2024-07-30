@@ -1,6 +1,7 @@
 #pragma once
 #include <drogon/PubSubService.h>
 #include <drogon/WebSocketController.h>
+#include "utils/KafkaManager.h"
 
 using namespace drogon;
 class ChatWebsocket final : public WebSocketController<ChatWebsocket>
@@ -24,6 +25,7 @@ public:
     // list path definitions here;
     // WS_PATH_ADD("/path","filter1","filter2",...);
     WS_PATH_ADD("/chat");
+    WS_ADD_PATH_VIA_REGEX("/[^/]*", Get);
     WS_PATH_LIST_END
 
 private:
@@ -47,6 +49,18 @@ private:
                 std::string userName = userNames_.at(wsConnPtr); // 获取用户名
                 std::string message = std::format("{} 心跳检测 正常 这是定制消息", userName);
                 wsConnPtr->send(message);
+
+                // 推送kfk 生产消息（异步）
+                if (rd_kafka_produce(
+                       rd_kafka_topic_new(KafkaManager::instance().getProducer(), "message_topic", nullptr),
+                       RD_KAFKA_PARTITION_UA,
+                       RD_KAFKA_MSG_F_COPY,
+                       const_cast<char *>(message.c_str()), message.size(),
+                       nullptr, 0,
+                       nullptr) == -1)
+                {
+                    LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(rd_kafka_last_error());
+                }
             }
         }
     }

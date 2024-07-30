@@ -147,6 +147,8 @@ add_executable(
         threadPool/threadPool.h utils/checkloginUtils.h
         filters/LoginFilter.h utils/printer.h utils/opensslCrypto.h
         filters/SqlFilter.h
+        utils/kafkaManager.h
+        kfkConsumer/AsyncKafkaConsumer.h
         #[[${MODEL_SOURCES}]])
 
 
@@ -167,10 +169,19 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(glaze)
 
+# 下载和构建 librdkafka
+FetchContent_Declare(
+        librdkafka
+        GIT_REPOSITORY https://github.com/confluentinc/librdkafka.git
+        GIT_TAG master
+        GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(librdkafka)
+
 find_package(Drogon CONFIG REQUIRED)
 find_package(mimalloc 2.1.7 REQUIRED)
 find_package(Boost 1.85.0 REQUIRED)
-target_link_libraries(${PROJECT_NAME} PRIVATE Drogon::Drogon Boost::boost glaze::glaze mimalloc proto_gen_cxx)
+target_link_libraries(${PROJECT_NAME} PRIVATE Drogon::Drogon Boost::boost glaze::glaze rdkafka mimalloc proto_gen_cxx)
 
 # ##############################################################################
 
