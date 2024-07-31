@@ -51,13 +51,13 @@ private:
     {
         const auto consumer = KafkaManager::instance().getConsumer();
         // 创建一个新的 topic partition list
-        rd_kafka_topic_partition_list_t *topics = rd_kafka_topic_partition_list_new(1);
+        rd_kafka_topic_partition_list_t *partitions = rd_kafka_topic_partition_list_new(1);
         // 向列表中添加主题和分区
-        rd_kafka_topic_partition_list_add(topics, "message_topic", RD_KAFKA_PARTITION_UA);
+        rd_kafka_topic_partition_list_add(partitions, "message_topic", RD_KAFKA_PARTITION_UA);
         // 订阅主题
-        const rd_kafka_resp_err_t err = rd_kafka_subscribe(consumer, topics);
+        const rd_kafka_resp_err_t err = rd_kafka_subscribe(consumer, partitions);
         // 销毁 topic partition list
-        rd_kafka_topic_partition_list_destroy(topics);
+        rd_kafka_topic_partition_list_destroy(partitions);
 
         if (err != RD_KAFKA_RESP_ERR_NO_ERROR)
         {
@@ -86,11 +86,18 @@ private:
                     std::string message(static_cast<const char*>(msg->payload), msg->len);
 
                     // 启动协程处理消息
-                    async_run([message, consumer, this]() -> Task<> {
-                        LOG_INFO << "收到消息 Received message: " << message;
+                    async_run([message, msg, consumer, this]() -> Task<> {
+                        try
+                        {
+                            LOG_INFO << "收到消息 Received message: " << message;
 
-                        // 处理完消息后手动提交偏移量
-                        //rd_kafka_commit(consumer, nullptr, RD_KAFKA_OFFSET_END);
+                            // 处理完消息后手动提交偏移量
+                            rd_kafka_commit_message(consumer, msg, 0);
+                        }
+                        catch (const std::exception& ex)
+                        {
+                            LOG_ERROR << "Exception while processing message: " << ex.what();
+                        }
                         co_return;
                     });
                 }
