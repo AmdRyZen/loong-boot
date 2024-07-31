@@ -25,25 +25,11 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         if (!initialized_)
         {
+            // 创建生产者
             conf_ = rd_kafka_conf_new();
-
-            // 	session.timeout.ms: 消费者组会话超时。消费者在多长时间没有发送心跳时，协调器会将其从组中移除。生产环境中通常设置为 60s 或更长。
-            rd_kafka_conf_set(conf_, "session.timeout.ms", "60000", nullptr, 0);
-
-            // heartbeat.interval.ms: 心跳间隔。消费者发送心跳的频率。建议设置为 session.timeout.ms 的一半或更少，例如 3s。
-            rd_kafka_conf_set(conf_, "heartbeat.interval.ms", "3000", nullptr, 0);
 
             // 	request.timeout.ms: 请求超时。客户端在等待响应时的最大时间。设置为 30s 或更长时间。
             rd_kafka_conf_set(conf_, "request.timeout.ms", "30000", nullptr, 0);
-
-            // auto.offset.reset: 指定当没有初始偏移量时应该如何开始消费。earliest 表示从最早的消息开始。
-            rd_kafka_conf_set(conf_, "auto.offset.reset", "earliest", nullptr, 0);
-
-            // enable.auto.commit: 自动提交偏移量的开关。生产环境中通常建议手动提交，以更好地控制偏移量的提交。
-            rd_kafka_conf_set(conf_, "enable.auto.commit", "false", nullptr, 0);
-
-            // auto.commit.interval.ms: 自动提交偏移量的时间间隔。如果 enable.auto.commit 设置为 true，则此配置项生效。
-            rd_kafka_conf_set(conf_, "auto.commit.interval.ms", "5000", nullptr, 0);
 
             // offset.commit.interval.ms: 手动提交偏移量的时间间隔，通常设置为 60s。
             rd_kafka_conf_set(conf_, "offset.commit.interval.ms", "60000", nullptr, 0);
@@ -69,7 +55,6 @@ public:
                 throw std::runtime_error(std::string("Failed to configure Kafka broker: ") + errstr_);
             }
 
-            // 创建生产者
             producer_ = rd_kafka_new(RD_KAFKA_PRODUCER, conf_, errstr_, sizeof(errstr_));
             if (!producer_)
             {
@@ -78,6 +63,22 @@ public:
 
             // 创建消费者
             consumer_conf_ = rd_kafka_conf_new();
+
+            // enable.auto.commit: 自动提交偏移量的开关。生产环境中通常建议手动提交，以更好地控制偏移量的提交。
+            rd_kafka_conf_set(consumer_conf_, "enable.auto.commit", "false", nullptr, 0);
+
+            // auto.commit.interval.ms: 自动提交偏移量的时间间隔。如果 enable.auto.commit 设置为 true，则此配置项生效。
+            rd_kafka_conf_set(consumer_conf_, "auto.commit.interval.ms", "5000", nullptr, 0);
+
+            // 	session.timeout.ms: 消费者组会话超时。消费者在多长时间没有发送心跳时，协调器会将其从组中移除。生产环境中通常设置为 60s 或更长。
+            rd_kafka_conf_set(consumer_conf_, "session.timeout.ms", "60000", nullptr, 0);
+
+            // heartbeat.interval.ms: 心跳间隔。消费者发送心跳的频率。建议设置为 session.timeout.ms 的一半或更少，例如 3s。
+            rd_kafka_conf_set(consumer_conf_, "heartbeat.interval.ms", "3000", nullptr, 0);
+
+            // auto.offset.reset: 指定当没有初始偏移量时应该如何开始消费。earliest 表示从最早的消息开始。
+            rd_kafka_conf_set(consumer_conf_, "auto.offset.reset", "earliest", nullptr, 0);
+
             if (rd_kafka_conf_set(consumer_conf_, "bootstrap.servers", brokers.c_str(), errstr_, sizeof(errstr_)) != RD_KAFKA_CONF_OK)
             {
                 throw std::runtime_error(std::string("Failed to configure Kafka consumer: ") + errstr_);
