@@ -10,6 +10,8 @@
 #include "service/SbcConvertService.h"
 #include <algorithm>
 #include <execution>
+#include "base/base.h"
+#include "base/vo/data_vo.h"
 
 using namespace api::v1;
 using namespace drogon::orm;
@@ -19,7 +21,7 @@ using namespace sql;
 
 Task<> User::buildSql(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
 {
-    Json::Value data;
+    std::string msg = "success";
     try
     {
          // Insert
@@ -131,12 +133,9 @@ Task<> User::buildSql(const HttpRequestPtr req, std::function<void(const HttpRes
     }
     catch (...)
     {
-        data["msg"] = "error";
+       msg = "error";
     }
-    data["msg"] = "ok";
-    data["code"] = 200;
-    co_return callback(HttpResponse::newHttpJsonResponse(std::move(data)));
-
+    co_return callback(Base<std::string>::createHttpResponse(200, msg, ""));
 }
 
 //add definition of your processing function here
@@ -183,14 +182,6 @@ void User::login(const HttpRequestPtr& req,
     }
 }
 
-template <typename... Arguments>
-drogon::Task<drogon::orm::Result> dynamicQuery(std::string dynamicSql, Arguments &&...args)
-{
-    auto clientPtr = drogon::app().getFastDbClient();
-    auto result = co_await clientPtr->execSqlCoro(dynamicSql + " order by id asc limit 10 ", args...);
-    co_return result;
-}
-
 Task<> User::getInfo(const HttpRequestPtr req,
                      std::function<void(const HttpResponsePtr&)> callback,
                      std::string userId,
@@ -198,12 +189,11 @@ Task<> User::getInfo(const HttpRequestPtr req,
 {
     LOG_INFO << "User " << userId << " get his information";
 
-    auto clientPtr = drogon::app().getFastDbClient();
+    auto clientPtr = app().getFastDbClient();
 
-    Json::Value item;
-    Json::Value data;
-    std::int32_t num_users = 0;
-    std::string redis_value;
+
+
+    UserDataListVo user_data_list_vo{};
 
     try
     {
@@ -295,13 +285,16 @@ Task<> User::getInfo(const HttpRequestPtr req,
         auto result = co_await clientPtr->execSqlCoro(dynamicSql);
         auto count = co_await clientPtr->execSqlCoro(dynamicCountSql);
 
-        std::for_each(std::execution::par, result.begin(), result.end(), [&item, &data](const auto& row) {
-            item["id"] = row["id"].template as<std::int64_t>();
-            item["author"] = row["author"].template as<std::string>();
-            item["job_desc"] = row["job_desc"].template as<std::string>();
-            data.append(item);
+        std::vector<UserDataItem> list; // 用于存储结果
+        std::for_each(std::execution::par, result.begin(), result.end(), [&list](const auto& row) {
+            UserDataItem data_item;
+            data_item.id = row["id"].template as<std::int64_t>();
+            data_item.author = row["author"].template as<std::string>();
+            data_item.job_desc = row["job_desc"].template as<std::string>();
+            list.push_back(data_item);
         });
-        num_users = count[0][0].as<std::int32_t>();
+        user_data_list_vo.list = std::move(list);
+        user_data_list_vo.num_users = count[0][0].as<std::int32_t>();
 
         // 创建SqlBinder对象
         std::string sql = "SELECT * FROM xxl_job_info WHERE id = ? and author = ?";
@@ -338,18 +331,9 @@ Task<> User::getInfo(const HttpRequestPtr req,
     }
 
     std::string command = std::format("get {}", "aa");
-    redis_value = co_await redisUtils::getCoroRedisValue(command);
+    user_data_list_vo.redis_value = co_await redisUtils::getCoroRedisValue(command);
 
-
-    //验证token有效性等
-    //读数据库或缓存获取用户信息
-    Json::Value ret;
-    ret["msg"] = "ok";
-    ret["code"] = 200;
-    ret["redis_value"] = redis_value;
-    ret["num_users"] = num_users;
-    ret["data"] = std::move(data);
-    co_return callback(HttpResponse::newHttpJsonResponse(std::move(ret)));
+    co_return callback(Base<UserDataListVo>::createHttpResponse(200, "success", user_data_list_vo));
 }
 
 void User::getBanWord(const HttpRequestPtr& req,
@@ -392,11 +376,11 @@ void User::getBanWord(const HttpRequestPtr& req,
         std::cout << "[cost: " << dr_ms << " ms]" << item << " => " << SbcConvertService::ws2s(result) << std::endl;
     });
 
-    Json::Value data;
-    data["msg"] = "ok";
-    data["code"] = 200;
-    data["banWord"] = SbcConvertService::ws2s(trieService.replaceSensitive(SbcConvertService::s2ws(word)));
-    callback(HttpResponse::newHttpJsonResponse(std::move(data)));
+    callback(Base<std::string>::createHttpResponse(
+        200,
+        "success",
+        SbcConvertService::ws2s(TrieService::replaceSensitive(SbcConvertService::s2ws(word))))
+    );
 }
 
 void User::serdeJson(const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& callback)
@@ -428,16 +412,13 @@ void User::serdeJson(const HttpRequestPtr& req, std::function<void(const HttpRes
     std::cout << "[cost: " << dr_ms << " ms]" << std::endl;
     std::cout << "type: " << root["type"].asString() << std::endl;
 
-    Json::Value data;
-    data["msg"] = "ok";
-    data["code"] = 200;
-    callback(HttpResponse::newHttpJsonResponse(std::move(data)));
+    callback(Base<std::string>::createHttpResponse(200, "success", ""));
 }
 
 void User::quit(const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& callback)
 {
-    drogon::app().quit();
+    app().quit();
     const auto data = HttpResponse::newHttpResponse();
-    data->setStatusCode(HttpStatusCode::k204NoContent);
+    data->setStatusCode(k204NoContent);
     callback(data);
 }

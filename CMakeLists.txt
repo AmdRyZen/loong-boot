@@ -149,6 +149,8 @@ add_executable(
         filters/SqlFilter.h
         utils/kafkaManager.h
         kfkConsumer/AsyncKafkaConsumer.h
+        base/base.h
+        base/vo/data_vo.h
         #[[${MODEL_SOURCES}]])
 
 

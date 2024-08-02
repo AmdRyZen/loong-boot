@@ -22,6 +22,8 @@
 #include <execution> // 可能需要此头文件
 #include <glaze/glaze.hpp>
 #include "user.pb.h"
+#include "base/base.h"
+#include "base/vo/data_vo.h"
 
 #if defined(__arm__) || defined(__aarch64__)
     #include <arm_neon.h>
@@ -115,10 +117,7 @@ Task<> OpenApi::coroutine(const HttpRequestPtr req, std::function<void(const Htt
         t.join();
     }
 
-    Json::Value ret;
-    ret["msg"] = "ok";
-    ret["code"] = 200;
-    co_return callback(HttpResponse::newHttpJsonResponse(std::move(ret)));
+    co_return callback(Base<std::string>::createHttpResponse(200, "success", ""));
 }
 
 Task<> OpenApi::algorithm(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
@@ -234,54 +233,40 @@ Task<> OpenApi::algorithm(const HttpRequestPtr req, std::function<void(const Htt
     std::ranges::set_symmetric_difference(vec.begin(), vec.end(), vec_copy.begin(), vec_copy.end(), std::back_inserter(result3));
     std::cout << "set_symmetric_difference size: " << result3.size() << '\n';
 
-
-    Json::Value ret;
-    ret["msg"] = "ok";
-    ret["code"] = 200;
-    co_return callback(HttpResponse::newHttpJsonResponse(std::move(ret)));
+    co_return callback(Base<std::string>::createHttpResponse(200, "success", ""));
 }
 
 
 Task<> OpenApi::aes(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
 {
-    std::string encrypted;
-    std::string decrypted;
-    std::string hash;
-    std::string md5_hash;
+    AesResponseDataVo aes_response_data_vo{};
+
     try
     {
         const std::string input = "123456";
 
-        hash = opensslCrypto::sha3_256(input);
+        aes_response_data_vo.hash = opensslCrypto::sha3_256(input);
         //std::cout << "SHA-256 Hash: " << hash << std::endl;
 
         // 不建议使用md5 虽然性能更好
-        md5_hash = opensslCrypto::md5(input);
+        aes_response_data_vo.md5_hash = opensslCrypto::md5(input);
         //std::cout << "MD5: " << md5_hash << std::endl;
 
         const std::string keyHex = "0123456789abcdef0123456789abcdef";
         const std::string ivHex = "0123456789abcdef0123456789abcdef";
         const std::string plaintext = "谢谢谢谢谢寻寻👀👀👀👀你好啊👀👀xxxx";
 
-        encrypted = opensslCrypto::AesCBCPk5EncryptBase64(plaintext, keyHex, ivHex);
+        aes_response_data_vo.encrypted = opensslCrypto::AesCBCPk5EncryptBase64(plaintext, keyHex, ivHex);
         //std::cout << "Encrypted: " << encrypted << std::endl;
 
-        decrypted = opensslCrypto::AesCBCPk5DecryptBase64(encrypted, keyHex, ivHex);
+        aes_response_data_vo.decrypted = opensslCrypto::AesCBCPk5DecryptBase64(aes_response_data_vo.encrypted, keyHex, ivHex);
         //std::cout << "Decrypted: " << decrypted << std::endl;
 
     } catch (const std::exception& e)
     {
         std::cout << "aes: err  " << e.what() << std::endl;
     }
-
-    Json::Value ret;
-    ret["msg"] = "ok";
-    ret["code"] = 200;
-    ret["Encrypted"] = encrypted;
-    ret["Decrypted"] = decrypted;
-    ret["hash"] = hash;
-    ret["md5_hash"] = md5_hash;
-    co_return callback(HttpResponse::newHttpJsonResponse(std::move(ret)));
+    co_return callback(Base<AesResponseDataVo>::createHttpResponse(200, "success", aes_response_data_vo));
 }
 
 
@@ -299,39 +284,15 @@ Task<> OpenApi::simd(const HttpRequestPtr req, std::function<void(const HttpResp
     int32_t res[4];
     vst1q_s32(res, result);
 
-    // 打印结果
-    std::cout << res[0] << " " << res[1] << " " << res[2] << " " << res[3] << std::endl;
+    // 创建一个包含 5 个整数的静态数组
+    std::vector<int> myVector;
 
-    // 创建一个 StringBuffer 和 PrettyWriter
-    StringBuffer buffer;
-    PrettyWriter<StringBuffer> writer(buffer);
-
-    // 开始对象
-    writer.StartObject();
-
-    // 添加其他键值对
-    writer.Key("code");
-    writer.Int(200);
-    writer.Key("msg");
-    writer.String("ok");
-
-    // 添加 res 键和值
-    writer.Key("res");
-    writer.StartArray();
-    for (int const re : res) {
-        writer.Int(re);
+    for (const int& re : res)
+    {
+        myVector.push_back(re);
     }
-    writer.EndArray();
 
-    // 结束对象
-    writer.EndObject();
-
-    // 返回响应
-    auto const resp = HttpResponse::newHttpResponse();
-    resp->setContentTypeCodeAndCustomString(CT_APPLICATION_JSON, "utf-8");
-    resp->setBody(buffer.GetString());
-    co_return callback(resp);
-    //co_return callback(HttpResponse::newHttpJsonResponse(std::move(ret)));
+    co_return callback(Base<std::vector<int>>::createHttpResponse(200, "success", myVector));
 }
 
 // 不会丢失精度
@@ -431,10 +392,7 @@ Task<> OpenApi::boost(const HttpRequestPtr req, std::function<void(const HttpRes
     date_duration days_to_valentine = valentine - today;
     std::cout << "Days to Valentine's day: " << days_to_valentine.days() << std::endl;
 
-    Json::Value ret;
-    ret["msg"] = "ok";
-    ret["code"] = 200;
-    co_return callback(HttpResponse::newHttpJsonResponse(std::move(ret)));
+    co_return callback(Base<std::string>::createHttpResponse(200, "success", ""));
 }
 
 // Add definition of your processing function here
@@ -509,33 +467,17 @@ void OpenApi::curlPost(const HttpRequestPtr& req, std::function<void(const HttpR
             std::cout << "cpp-demo : 接收反馈result = " << response->getBody() << std::endl;
         });
 
-    Json::Value data;
-    data["msg"] = "ok";
-    data["code"] = 200;
-    callback(HttpResponse::newHttpJsonResponse(std::move(data)));
+    callback(Base<std::string>::createHttpResponse(200, "success", ""));
 }
 
 Task<> OpenApi::getValue(const HttpRequestPtr req,
                          std::function<void(const HttpResponsePtr&)> callback)
 {
-    std::string command = std::format("get {}", "aa");
-    const Json::Value redis_value = co_await redisUtils::getCoroRedisValue(command);
+    const std::string command = std::format("get {}", "aa");
+    const std::string redis_value = co_await redisUtils::getCoroRedisValue(command);
 
-    Json::Value ret;
-    ret["msg"] = "ok";
-    ret["code"] = 200;
-    ret["redis_value"] = redis_value;
-    co_return callback(HttpResponse::newHttpJsonResponse(std::move(ret)));
+    co_return callback(Base<std::string>::createHttpResponse(200, "success", redis_value));
 }
-
-struct my_struct
-{
-    int i = 1;
-    /*double d = 3.14;*/
-    std::string hello = "c";
-    /*std::array<uint64_t, 3> arr = { 1, 2, 3 };
-    std::map<std::string, int> map{{"one", 1}, {"two", 2}};*/
-};
 
 Task<> OpenApi::fastJson(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
 {
@@ -623,7 +565,7 @@ Task<> OpenApi::fastJson(const HttpRequestPtr req, std::function<void(const Http
     const auto t9 = std::chrono::steady_clock::now();
     for (auto i = 0; i < 1000; i++)
     {
-        my_struct s{};
+        MyStruct s{};
         // BEVE
         (void) glz::write_json(s, buffer);
         // glz::write_binary(s, buffer);
@@ -635,11 +577,9 @@ Task<> OpenApi::fastJson(const HttpRequestPtr req, std::function<void(const Http
 
     std::cout << "---------------xx-----------------" << std::endl;
 
-    const auto resp = HttpResponse::newHttpResponse();
-    resp->setStatusCode(k200OK);
-    resp->setContentTypeCode(drogon::CT_APPLICATION_JSON);
-    resp->setBody(buffer);
-    co_return callback(resp);
+    MyStruct my_struct{};
+    (void) glz::read_json(my_struct, buffer);
+    co_return callback(Base<MyStruct>::createHttpResponse(200, "success", my_struct));
 }
 
 std::atomic<int64_t> value(0);
@@ -687,7 +627,7 @@ Task<> OpenApi::threadPool(const HttpRequestPtr req, std::function<void(const Ht
     tf::Taskflow taskflow;
 
     const auto clientPtr = drogon::app().getFastDbClient();
-    const auto ret = co_await clientPtr->execSqlCoro("select count(1) from f_user where username != ?", "薯条三兄弟");
+    const auto ret = co_await clientPtr->execSqlCoro("select count(1) from xxl_job_info where author != ?", "薯条三兄弟");
     auto count = ret[0][0].as<std::int32_t>();
 
     // now - use std::future instead
@@ -723,8 +663,8 @@ Task<> OpenApi::threadPool(const HttpRequestPtr req, std::function<void(const Ht
 
     constexpr double foo = 0.0;
     constexpr double bar = 1.0;
-    auto const res = foo <=> bar;
-    if (res < 0)
+    auto constexpr res = foo <=> bar;
+    if (res < 0) [[likely]]
         std::cout << "foo 小于 bar" << std::endl;
     else if (res > 0) [[unlikely]]
     {
@@ -734,7 +674,7 @@ Task<> OpenApi::threadPool(const HttpRequestPtr req, std::function<void(const Ht
     else  // (res == 0)
         std::cout << "foo 与 bar 相等" << std::endl;
 
-    co_return callback(HttpResponse::newHttpJsonResponse(future_ret));
+    co_return callback(Base<bool>::createHttpResponse(200, "success", future_ret));
 }
 
 Task<> OpenApi::fix(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
@@ -805,11 +745,7 @@ Task<> OpenApi::fix(const HttpRequestPtr req, std::function<void(const HttpRespo
 
     std::cout << "size  = " << _data.data.size() << std::endl;
 
-    Json::Value ret;
-    ret["msg"] = "ok";
-    ret["data"] = _data.data;
-
-    co_return callback(HttpResponse::newHttpJsonResponse(std::move(ret)));
+    co_return callback(Base<Json::Value>::createHttpResponse(200, "success", _data.data));
 }
 
 Task<> OpenApi::random(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
@@ -843,9 +779,7 @@ Task<> OpenApi::random(const HttpRequestPtr req, std::function<void(const HttpRe
     });
     value.clear();
 
-    Json::Value ret;
-    ret["msg"] = "ok";
-    co_return callback(HttpResponse::newHttpJsonResponse(std::move(ret)));
+    co_return callback(Base<std::string>::createHttpResponse(200, "success", ""));
 }
 
 Task<> OpenApi::taskflow(HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
@@ -938,9 +872,5 @@ Task<> OpenApi::taskflow(HttpRequestPtr req, std::function<void(const HttpRespon
 
     executor.wait_for_all();
 
-
-
-    Json::Value ret;
-    ret["msg"] = "ok";
-    co_return callback(HttpResponse::newHttpJsonResponse(std::move(ret)));
+    co_return callback(Base<std::string>::createHttpResponse(200, "success", ""));
 }
