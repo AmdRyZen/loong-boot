@@ -31,6 +31,14 @@ struct AesResponseDataVo {
     std::string md5_hash;
 };
 
+
+struct MemberInfoVo
+{
+    uint64_t user_id;
+    std::string name;
+    std::string token;
+};
+
 struct MyStruct
 {
     int i = 1;

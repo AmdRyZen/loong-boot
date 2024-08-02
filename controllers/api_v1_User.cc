@@ -12,6 +12,7 @@
 #include <execution>
 #include "base/base.h"
 #include "base/vo/data_vo.h"
+#include "base/dto/open_dto.h"
 
 using namespace api::v1;
 using namespace drogon::orm;
@@ -135,50 +136,48 @@ Task<> User::buildSql(const HttpRequestPtr req, std::function<void(const HttpRes
     {
        msg = "error";
     }
-    co_return callback(Base<std::string>::createHttpResponse(200, msg, ""));
+    co_return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
 }
 
 //add definition of your processing function here
 void User::login(const HttpRequestPtr& req,
                  std::function<void(const HttpResponsePtr&)>&& callback,
-                 std::string&& userId,
+                 uint64_t&& userId,
                  const std::string& password)
 {
-    Json::Value data;
     try
     {
-        if (req->getJsonObject() == nullptr || req->getJsonObject()->empty())
+        if (req->getBody().empty())
         {
-            data["msg"] = "json is empty";
-            return callback(HttpResponse::newHttpJsonResponse(data));
+            return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, "json is empty", ""));
         }
 
-        LOG_INFO << "userId= " << userId << " login";
-        auto json = req->getJsonObject();
-        LOG_INFO << "auto json = req.getJsonObject();= " << (*json)["name"].asString() << " ";
+        MemberInfoDto memberInfoDto{};
+        if (glz::read_json(memberInfoDto, req->getBody()))
+        {
+            return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
+        }
         // ...
 
         const auto token = jwt::create()
                          .set_issuer("auth0")
                          .set_type("JWS")
-                         .set_payload_claim("user_id", jwt::claim(std::string("123456")))
-                         .set_payload_claim("name", jwt::claim(std::string("xxxxx")))
+                         .set_payload_claim("user_id", jwt::claim(std::to_string(userId)))
+                         .set_payload_claim("user_name", jwt::claim(memberInfoDto.user_name))
                          .set_expires_at(std::chrono::system_clock::now() + std::chrono::seconds{drogon::app().getCustomConfig()["jwt-sessionTime"].asInt()})
                          .sign(jwt::algorithm::hs256{drogon::app().getCustomConfig()["jwt-secret"].asString()});
 
-        std::cout << "secret = " << drogon::app().getCustomConfig()["jwt-secret"].asString() << std::endl;
-        std::cout << "sessionTime = " << drogon::app().getCustomConfig()["jwt-sessionTime"].asInt() << std::endl;
+        MemberInfoVo memberInfoVo{};
 
-        data["msg"] = "ok";
-        data["name"] = (*json)["name"].asString();
-        data["token"] = token;
-        data["user_id"] = userId;
-        return callback(HttpResponse::newHttpJsonResponse(data));
+        memberInfoVo.name = memberInfoDto.user_name;
+        memberInfoVo.token = token;
+        memberInfoVo.user_id = userId;
+
+        return callback(Base<MemberInfoVo>::createHttpSuccessResponse(StatusOK, Success, memberInfoVo));
     }
     catch (...)
     {
-        data["msg"] = "loginError";
-        return callback(HttpResponse::newHttpJsonResponse(std::move(data)));
+        return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, "loginError", ""));
     }
 }
 
@@ -333,7 +332,7 @@ Task<> User::getInfo(const HttpRequestPtr req,
     std::string command = std::format("get {}", "aa");
     user_data_list_vo.redis_value = co_await redisUtils::getCoroRedisValue(command);
 
-    co_return callback(Base<UserDataListVo>::createHttpResponse(200, "success", user_data_list_vo));
+    co_return callback(Base<UserDataListVo>::createHttpSuccessResponse(StatusOK, Success, user_data_list_vo));
 }
 
 void User::getBanWord(const HttpRequestPtr& req,
@@ -369,16 +368,16 @@ void User::getBanWord(const HttpRequestPtr& req,
     std::ranges::for_each(words.begin(), words.end(), [&](const auto& item) {
         auto const t1 = std::chrono::steady_clock::now();
 
-        std::wstring const result = trieService.replaceSensitive(SbcConvertService::s2ws(item));
+        std::wstring const result = TrieService::replaceSensitive(SbcConvertService::s2ws(item));
 
         auto const t2 = std::chrono::steady_clock::now();
         double const dr_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
         std::cout << "[cost: " << dr_ms << " ms]" << item << " => " << SbcConvertService::ws2s(result) << std::endl;
     });
 
-    callback(Base<std::string>::createHttpResponse(
-        200,
-        "success",
+    callback(Base<std::string>::createHttpSuccessResponse(
+        StatusOK,
+        Success,
         SbcConvertService::ws2s(TrieService::replaceSensitive(SbcConvertService::s2ws(word))))
     );
 }
@@ -412,7 +411,7 @@ void User::serdeJson(const HttpRequestPtr& req, std::function<void(const HttpRes
     std::cout << "[cost: " << dr_ms << " ms]" << std::endl;
     std::cout << "type: " << root["type"].asString() << std::endl;
 
-    callback(Base<std::string>::createHttpResponse(200, "success", ""));
+    callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
 }
 
 void User::quit(const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& callback)

@@ -9,12 +9,18 @@
 
 using namespace drogon;
 
+constexpr int StatusOK = 200;
+constexpr int StatusError = 400;
+constexpr std::string Success = "success";
+constexpr std::string NoLogin = "NoLogin";
+constexpr std::string Error = "error";
+
 // 泛型 Base 结构体，封装 HTTP 响应数据
 template <typename T>
 struct Base {
-    int code = 200; // 默认响应码
+    int code = StatusOK; // 默认响应码
     T data; // 泛型数据
-    std::string msg = "success"; // 默认消息
+    std::string message = Success; // 默认消息
 
     // 序列化为 JSON 的方法
     [[nodiscard]] std::string toJson() const {
@@ -24,15 +30,45 @@ struct Base {
     }
 
     // 静态方法，创建并返回 HTTP 响应  编译期多态：由于 Base 是模板类，所有操作（包括序列化和响应创建）都在编译期确定。这可以避免运行时开销，通常会有较好的性能。
-    static HttpResponsePtr createHttpResponse(int statusCode = 200, const std::string& msg = "success", const T& data = T()) {
+    [[gnu::always_inline]] static HttpResponsePtr createHttpSuccessResponse(int statusCode = StatusOK, const std::string& message = Success, const T& data = T()) {
         Base<T> response;
         response.code = statusCode;
-        response.msg = msg;
+        response.message = message;
         response.data = std::move(data);
 
         // 创建 HTTP 响应对象
         auto resp = HttpResponse::newHttpResponse();
         resp->setStatusCode(k200OK);
+        resp->setContentTypeCode(CT_APPLICATION_JSON);
+        resp->setBody(response.toJson());
+        return resp;
+    }
+
+    // 静态方法，创建并返回 HTTP 响应  编译期多态：由于 Base 是模板类，所有操作（包括序列化和响应创建）都在编译期确定。这可以避免运行时开销，通常会有较好的性能。
+    [[gnu::always_inline]] static HttpResponsePtr createHttpErrorResponse(int statusCode = StatusError, const std::string& message = Error, const T& data = T()) {
+        Base<T> response;
+        response.code = statusCode;
+        response.message = message;
+        response.data = std::move(data);
+
+        // 创建 HTTP 响应对象
+        auto resp = HttpResponse::newHttpResponse();
+        resp->setStatusCode(k400BadRequest);
+        resp->setContentTypeCode(CT_APPLICATION_JSON);
+        resp->setBody(response.toJson());
+        return resp;
+    }
+
+    // 静态方法，创建并返回 HTTP 响应  编译期多态：由于 Base 是模板类，所有操作（包括序列化和响应创建）都在编译期确定。这可以避免运行时开销，通常会有较好的性能。
+    [[gnu::always_inline]] static HttpResponsePtr createHttpUnauthorizedResponse(int statusCode = k401Unauthorized, const std::string& message = NoLogin, const T& data = T()) {
+        Base<T> response;
+        response.code = statusCode;
+        response.message = message;
+        response.data = std::move(data);
+
+        // 创建 HTTP 响应对象
+        auto resp = HttpResponse::newHttpResponse();
+        resp->setStatusCode(k401Unauthorized);
         resp->setContentTypeCode(CT_APPLICATION_JSON);
         resp->setBody(response.toJson());
         return resp;

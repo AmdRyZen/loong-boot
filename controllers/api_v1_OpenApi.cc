@@ -117,7 +117,7 @@ Task<> OpenApi::coroutine(const HttpRequestPtr req, std::function<void(const Htt
         t.join();
     }
 
-    co_return callback(Base<std::string>::createHttpResponse(200, "success", ""));
+    co_return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
 }
 
 Task<> OpenApi::algorithm(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
@@ -233,7 +233,7 @@ Task<> OpenApi::algorithm(const HttpRequestPtr req, std::function<void(const Htt
     std::ranges::set_symmetric_difference(vec.begin(), vec.end(), vec_copy.begin(), vec_copy.end(), std::back_inserter(result3));
     std::cout << "set_symmetric_difference size: " << result3.size() << '\n';
 
-    co_return callback(Base<std::string>::createHttpResponse(200, "success", ""));
+    co_return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
 }
 
 
@@ -266,7 +266,7 @@ Task<> OpenApi::aes(const HttpRequestPtr req, std::function<void(const HttpRespo
     {
         std::cout << "aes: err  " << e.what() << std::endl;
     }
-    co_return callback(Base<AesResponseDataVo>::createHttpResponse(200, "success", aes_response_data_vo));
+    co_return callback(Base<AesResponseDataVo>::createHttpSuccessResponse(StatusOK, Success, aes_response_data_vo));
 }
 
 
@@ -292,7 +292,7 @@ Task<> OpenApi::simd(const HttpRequestPtr req, std::function<void(const HttpResp
         myVector.push_back(re);
     }
 
-    co_return callback(Base<std::vector<int>>::createHttpResponse(200, "success", myVector));
+    co_return callback(Base<std::vector<int>>::createHttpSuccessResponse(StatusOK, Success, myVector));
 }
 
 // 不会丢失精度
@@ -392,7 +392,7 @@ Task<> OpenApi::boost(const HttpRequestPtr req, std::function<void(const HttpRes
     date_duration days_to_valentine = valentine - today;
     std::cout << "Days to Valentine's day: " << days_to_valentine.days() << std::endl;
 
-    co_return callback(Base<std::string>::createHttpResponse(200, "success", ""));
+    co_return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
 }
 
 // Add definition of your processing function here
@@ -467,7 +467,7 @@ void OpenApi::curlPost(const HttpRequestPtr& req, std::function<void(const HttpR
             std::cout << "cpp-demo : 接收反馈result = " << response->getBody() << std::endl;
         });
 
-    callback(Base<std::string>::createHttpResponse(200, "success", ""));
+    callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
 }
 
 Task<> OpenApi::getValue(const HttpRequestPtr req,
@@ -476,7 +476,7 @@ Task<> OpenApi::getValue(const HttpRequestPtr req,
     const std::string command = std::format("get {}", "aa");
     const std::string redis_value = co_await redisUtils::getCoroRedisValue(command);
 
-    co_return callback(Base<std::string>::createHttpResponse(200, "success", redis_value));
+    co_return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, redis_value));
 }
 
 Task<> OpenApi::fastJson(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
@@ -579,7 +579,7 @@ Task<> OpenApi::fastJson(const HttpRequestPtr req, std::function<void(const Http
 
     MyStruct my_struct{};
     (void) glz::read_json(my_struct, buffer);
-    co_return callback(Base<MyStruct>::createHttpResponse(200, "success", my_struct));
+    co_return callback(Base<MyStruct>::createHttpSuccessResponse(StatusOK, Success, my_struct));
 }
 
 std::atomic<int64_t> value(0);
@@ -674,7 +674,7 @@ Task<> OpenApi::threadPool(const HttpRequestPtr req, std::function<void(const Ht
     else  // (res == 0)
         std::cout << "foo 与 bar 相等" << std::endl;
 
-    co_return callback(Base<bool>::createHttpResponse(200, "success", future_ret));
+    co_return callback(Base<bool>::createHttpSuccessResponse(StatusOK, Success, future_ret));
 }
 
 Task<> OpenApi::fix(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
@@ -745,7 +745,7 @@ Task<> OpenApi::fix(const HttpRequestPtr req, std::function<void(const HttpRespo
 
     std::cout << "size  = " << _data.data.size() << std::endl;
 
-    co_return callback(Base<Json::Value>::createHttpResponse(200, "success", _data.data));
+    co_return callback(Base<Json::Value>::createHttpSuccessResponse(StatusOK, Success, _data.data));
 }
 
 Task<> OpenApi::random(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
@@ -779,7 +779,7 @@ Task<> OpenApi::random(const HttpRequestPtr req, std::function<void(const HttpRe
     });
     value.clear();
 
-    co_return callback(Base<std::string>::createHttpResponse(200, "success", ""));
+    co_return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
 }
 
 Task<> OpenApi::taskflow(HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
@@ -813,7 +813,6 @@ Task<> OpenApi::taskflow(HttpRequestPtr req, std::function<void(const HttpRespon
 
     std::cout << "-----------------" << std::endl;
 
-
     auto [A, B, C, D] = taskflow.emplace(  // create four tasks
         [] () { std::cout << "TaskA\n"; },
         [] () { std::cout << "TaskB\n"; },
@@ -825,8 +824,6 @@ Task<> OpenApi::taskflow(HttpRequestPtr req, std::function<void(const HttpRespon
     D.succeed(B, C);  // D runs after  B and C
 
     executor.run(taskflow).wait();
-
-
 
     tf::Task A1 = taskflow.emplace([](){}).name("A");
     tf::Task C1 = taskflow.emplace([](){}).name("C");
@@ -842,8 +839,6 @@ Task<> OpenApi::taskflow(HttpRequestPtr req, std::function<void(const HttpRespon
     A1.precede(B1, C1);  // A runs before B and C
     D1.succeed(B1, C1);  // D runs after  B and C
 
-
-
     tf::Task init = taskflow.emplace([](){}).name("init");
     tf::Task stop = taskflow.emplace([](){}).name("stop");
 
@@ -853,9 +848,6 @@ Task<> OpenApi::taskflow(HttpRequestPtr req, std::function<void(const HttpRespon
     // creates a feedback loop {0: cond, 1: stop}
     init.precede(cond);
     cond.precede(cond, stop);  // moves on to 'cond' on returning 0, or 'stop' on 1
-
-
-
 
     // create asynchronous tasks directly from an executor
     std::future<int> future = executor.async([](){
@@ -872,5 +864,5 @@ Task<> OpenApi::taskflow(HttpRequestPtr req, std::function<void(const HttpRespon
 
     executor.wait_for_all();
 
-    co_return callback(Base<std::string>::createHttpResponse(200, "success", ""));
+    co_return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
 }

@@ -26,7 +26,7 @@ class User final : public drogon::HttpController<User>
 
     static void login(const HttpRequestPtr& req,
                       std::function<void(const HttpResponsePtr&)>&& callback,
-                      std::string&& userId,
+                      uint64_t&& userId,
                       const std::string& password);
 
     static Task<> getInfo(HttpRequestPtr req,

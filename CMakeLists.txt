@@ -129,9 +129,17 @@ include_directories(${PROTO_GEN_CXX_INCLUDE_DIRS}) # cpp
         models/XxlJobUser.h  models/XxlJobUser.cc
 )]]
 
+set(MODEL_SOURCES_DTO
+        base/dto/open_dto.h
+)
+
+set(MODEL_SOURCES_VO
+        base/vo/data_vo.h
+)
 
 add_executable(
-        ${PROJECT_NAME} main.cc utils/sql.h
+        ${PROJECT_NAME} ${MODEL_SOURCES_DTO} ${MODEL_SOURCES_VO}
+        main.cc utils/sql.h
         controllers/PlaintextCtrl.cc controllers/PlaintextCtrl.h
         controllers/api_v1_User.cc controllers/api_v1_User.h
         controllers/api_v1_OpenApi.cc controllers/api_v1_OpenApi.h
@@ -149,9 +157,7 @@ add_executable(
         filters/SqlFilter.h
         utils/kafkaManager.h
         kfkConsumer/AsyncKafkaConsumer.h
-        base/base.h
-        base/vo/data_vo.h
-        #[[${MODEL_SOURCES}]])
+        base/base.h)
 
 
 # ##############################################################################
