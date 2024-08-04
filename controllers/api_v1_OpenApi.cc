@@ -681,7 +681,7 @@ Task<> OpenApi::fix(const HttpRequestPtr req, std::function<void(const HttpRespo
 {
     // mysqlbinlog --no-defaults --base64-output=decode-rows -v ./mysql-bin.000131 --result-file=./2.sql
 
-    auto clientPtr = drogon::app().getFastDbClient();
+    const auto clientPtr = drogon::app().getFastDbClient();
 
     struct Data : public Json::Value
     {
@@ -748,11 +748,22 @@ Task<> OpenApi::fix(const HttpRequestPtr req, std::function<void(const HttpRespo
     co_return callback(Base<Json::Value>::createHttpSuccessResponse(StatusOK, Success, _data.data));
 }
 
+int getRandomValue() {
+    // 随机数引擎
+    std::random_device rd;  // 获取一个随机数种子
+    std::mt19937 gen(rd()); // 使用 Mersenne Twister 算法作为随机数引擎
+
+    // 生成 0 到 1 的随机整数
+    std::uniform_int_distribution<> dis(0, 1);
+
+    return dis(gen);
+}
+
 Task<> OpenApi::random(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
 {
     std::default_random_engine random(time(nullptr));
 
-    std::uniform_int_distribution<int> int_dis(0, 100);        // 整数均匀分布
+    std::uniform_int_distribution int_dis(0, 100);        // 整数均匀分布
     std::uniform_real_distribution<float> real_dis(0.0, 1.0);  // 浮点数均匀分布
 
     std::vector<int32_t> value;
@@ -770,9 +781,9 @@ Task<> OpenApi::random(const HttpRequestPtr req, std::function<void(const HttpRe
     }
     std::cout << std::endl;
 
-    auto const result = std::minmax_element(value.begin(), value.end());
-    std::cout << "min element at: " << *(result.first) << std::endl;
-    std::cout << "max element at: " << *(result.second) << std::endl;
+    auto const [first, second] = std::minmax_element(value.begin(), value.end());
+    std::cout << "min element at: " << *first << std::endl;
+    std::cout << "max element at: " << *second << std::endl;
     std::ranges::sort(value.begin(), value.end());
     std::ranges::for_each(value.begin(), value.end(), [&](const auto& item) {
         std::cout << item << std::endl;
@@ -792,7 +803,7 @@ Task<> OpenApi::taskflow(HttpRequestPtr req, std::function<void(const HttpRespon
     int count2 = 0;
 
     // 创建一个循环，执行 5 次
-    auto loop = taskflow.emplace([&count1, &count2](){
+    auto loop = taskflow.emplace([&count1](){
                             std::cout << "Loop iteration " << count1 << std::endl;
                             count1++;
                         }).name("loop");
@@ -843,7 +854,7 @@ Task<> OpenApi::taskflow(HttpRequestPtr req, std::function<void(const HttpRespon
     tf::Task stop = taskflow.emplace([](){}).name("stop");
 
     // creates a condition task that returns a random binary
-    tf::Task cond = taskflow.emplace([](){ return std::rand() % 2; }).name("cond");
+    tf::Task cond = taskflow.emplace([&](){ return getRandomValue(); }).name("cond");
 
     // creates a feedback loop {0: cond, 1: stop}
     init.precede(cond);
@@ -866,3 +877,4 @@ Task<> OpenApi::taskflow(HttpRequestPtr req, std::function<void(const HttpRespon
 
     co_return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
 }
+

@@ -1,5 +1,4 @@
 #include "api_v1_User.h"
-#include "jwt-cpp/base.h"
 #include "jwt-cpp/jwt.h"
 #include "utils/redisUtils.h"
 #include "filters/SqlFilter.h"
@@ -22,6 +21,7 @@ using namespace sql;
 
 Task<> User::buildSql(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
 {
+    auto method  = req->getMethod();
     std::string msg = "success";
     try
     {
@@ -136,7 +136,7 @@ Task<> User::buildSql(const HttpRequestPtr req, std::function<void(const HttpRes
     {
        msg = "error";
     }
-    co_return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
+    co_return callback(Base<HttpMethod>::createHttpSuccessResponse(StatusOK, msg, method));
 }
 
 //add definition of your processing function here
@@ -190,10 +190,7 @@ Task<> User::getInfo(const HttpRequestPtr req,
 
     auto clientPtr = app().getFastDbClient();
 
-
-
     UserDataListVo user_data_list_vo{};
-
     try
     {
         // 基本 SQL 查询语句
@@ -205,23 +202,18 @@ Task<> User::getInfo(const HttpRequestPtr req,
         conditions.push_back({"author", "!=", "xxx"});
         conditions.push_back({"id", "<", "3"});
 
-        DynamicResult resultBase = buildDynamicQuery(baseSql, conditions);
-        DynamicResult resultBaseCount = buildDynamicQuery(baseCountSql, conditions);
         // 构建动态 SQL 查询语句
-        std::string dynamicSql = resultBase.baseSql.str();
-        std::string dynamicCountSql = resultBaseCount.baseSql.str();
+        auto [dynamicSql, resultBaseParameters] = buildDynamicQuery(baseSql, conditions);
+        auto [dynamicCountSql, resultBaseCountParameters]  = buildDynamicQuery(baseCountSql, conditions);
 
-        std::cout << "dynamicSql: " << dynamicSql << std::endl;
-        std::cout << "dynamicCountSql: " << dynamicCountSql << std::endl;
-        for (const auto& param : resultBase.parameters)
+        std::cout << "dynamicSql: " << dynamicSql.str() << std::endl;
+        std::cout << "dynamicCountSql: " << dynamicCountSql.str() << std::endl;
+        for (const auto& param : resultBaseParameters)
             std::cout << "resultBase params: " << param.c_str() << std::endl;
 
-        for (const auto& param : resultBaseCount.parameters)
+        for (const auto& param : resultBaseCountParameters)
             std::cout << "resultBaseCount params: " << param.c_str() << std::endl;
 
-
-
-        //co_await clientPtr->execSqlCoro("update f_user set username = ? where id = ? limit 1", "xxxix", 2);
         auto transPtr = co_await clientPtr->newTransactionCoro();
         try
         {
@@ -229,19 +221,15 @@ Task<> User::getInfo(const HttpRequestPtr req,
             co_await transPtr->execSqlCoro("update xxl_job_info set author = ? where id = ? limit 1", "bb", 2);
             //throw std::runtime_error("hahaha");
         }
-        catch (const drogon::orm::DrogonDbException& e)
+        catch (const DrogonDbException& e)
         {
             transPtr->rollback();
-            std::cout << "update failed: " << e.base().what() << std::endl;
             LOG_ERROR << "update failed: " << e.base().what();
         }
 
-        std::vector<drogon::orm::Field> params;
-        //params.emplace_back("Alice"); // 字符串参数
-
         *clientPtr  << "select * from xxl_job_info where author != ? and id = ?"
             << "xxx" << 1
-            >> [](const drogon::orm::Result &result)
+            >> [](const Result &result)
             {
                 std::cout << result.size() << " rows selected!" << std::endl;
                 int i = 0;
@@ -250,7 +238,7 @@ Task<> User::getInfo(const HttpRequestPtr req,
                     std::cout << i++ << ": author is " << row["author"].as<std::string>() << std::endl;
                 }
             }
-        >> [](const orm::DrogonDbException &e)
+        >> [](const DrogonDbException &e)
         {
             std::cerr << "error1:" << e.base().what() << std::endl;
         };
@@ -265,7 +253,7 @@ Task<> User::getInfo(const HttpRequestPtr req,
                      "    a.id = u.id "
                      "where u.author = ?"
                   << "xxx"
-                >> [](const drogon::orm::Result &result)
+                >> [](const Result &result)
         {
             std::cout << result.size() << " rows selected!" << std::endl;
             int i = 0;
@@ -276,13 +264,13 @@ Task<> User::getInfo(const HttpRequestPtr req,
                 std::cout << i++ << ": author is " << row["author"].as<std::string>() << std::endl;
             }
         }
-            >> [](const orm::DrogonDbException &e)
+            >> [](const DrogonDbException &e)
         {
             std::cerr << "error2:" << e.base().what() << std::endl;
         };
 
-        auto result = co_await clientPtr->execSqlCoro(dynamicSql);
-        auto count = co_await clientPtr->execSqlCoro(dynamicCountSql);
+        auto result = co_await clientPtr->execSqlCoro(dynamicSql.str());
+        auto count = co_await clientPtr->execSqlCoro(dynamicCountSql.str());
 
         std::vector<UserDataItem> list; // 用于存储结果
         std::for_each(std::execution::par, result.begin(), result.end(), [&list](const auto& row) {
@@ -310,19 +298,9 @@ Task<> User::getInfo(const HttpRequestPtr req,
 
         std::string sql1 = "SELECT * FROM xxl_job_info WHERE id = 1 and author = 'aa'";
         auto zz = clientPtr->execSqlCoro(sql1);
-        /*for (const auto &value : values)
-        {
-            co_await (*zz) << value;
-        }*/
 
         auto r = co_await zz;
         std::cout << "Affected rows: " << r.affectedRows() << std::endl;
-       /* Mapper<XxlJobInfo> mp(clientPtr);
-        mp.findBy(criteria);*/
-
-        // 执行查询
-        /*auto xxx = co_await clientPtr->execSqlCoro("SELECT * FROM xxl_job_info WHERE " + criteria.criteriaString());
-        std::cout << "xxx: " << xxx.size() << std::endl;*/
     }
     catch (const std::exception& e)
     {
