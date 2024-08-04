@@ -2,6 +2,7 @@
 #include <drogon/PubSubService.h>
 #include <drogon/WebSocketController.h>
 #include "utils/KafkaManager.h"
+#include <glaze/glaze.hpp>
 
 using namespace drogon;
 class ChatWebsocket final : public WebSocketController<ChatWebsocket>
@@ -47,15 +48,22 @@ private:
             if (wsConnPtr->connected())
             {
                 std::string userName = userNames_.at(wsConnPtr); // 获取用户名
-                std::string message = std::format("{} 心跳检测 正常 这是定制消息", userName);
-                wsConnPtr->send(message);
+                chatMessageVo messageVo{};
+                messageVo.code = 200;
+                messageVo.id = 0;
+                messageVo.name = userName;
+                messageVo.message = std::format("{} 心跳检测 正常 这是定制消息", userName);
+                // BEVE
+                std::string buffer{};
+                (void) glz::write_json(messageVo, buffer);
+                wsConnPtr->send(buffer);
 
                 // 推送kfk 生产消息（异步）
                 if (rd_kafka_produce(
                        rd_kafka_topic_new(KafkaManager::instance().getProducer(), "message_topic", nullptr),
                        RD_KAFKA_PARTITION_UA,
                        RD_KAFKA_MSG_F_COPY,
-                       const_cast<char *>(message.c_str()), message.size(),
+                       const_cast<char *>(buffer.c_str()), buffer.size(),
                        nullptr, 0,
                        nullptr) == -1)
                 {

@@ -76,12 +76,9 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConnPtr, st
                                 chatRooms_.publish(chatRoomName, buffer);
 
                                 {
-                                    // 推送kfk
-                                    auto producer = KafkaManager::instance().getProducer();
-
-                                    // 生产消息（异步）
+                                    // 推送kfk 生产消息（异步）
                                     if (rd_kafka_produce(
-                                           rd_kafka_topic_new(producer, "message_topic", nullptr),
+                                           rd_kafka_topic_new(KafkaManager::instance().getProducer(), "message_topic", nullptr),
                                            RD_KAFKA_PARTITION_UA,
                                            RD_KAFKA_MSG_F_COPY,
                                            const_cast<char *>(buffer.c_str()), buffer.size(),
@@ -89,9 +86,6 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConnPtr, st
                                            nullptr) == -1)
                                     {
                                         LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(rd_kafka_last_error());
-                                    } else
-                                    {
-                                        // LOG_INFO << "produce message: " << rd_kafka_err2str(rd_kafka_last_error());
                                     }
                                 }
                             }
@@ -147,6 +141,26 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
     // 处理用户加入聊天室
     //wsConnPtr->send(std::format("欢迎 {} 加入我们 {}", userName_, s.chatRoomName_));
     chatRooms_.publish(s.chatRoomName_, std::format("欢迎 {} 加入我们 {}", userName_, s.chatRoomName_));
+
+    chatMessageVo messageVo{};
+    messageVo.code = 200;
+    messageVo.id = s.id_;
+    messageVo.name = s.chatRoomName_;
+    messageVo.message = std::format("欢迎 {} 加入我们 {}", userName_, s.chatRoomName_);
+    // BEVE
+    std::string buffer{};
+    (void) glz::write_json(messageVo, buffer);
+    // 推送kfk 生产消息（异步）
+    if (rd_kafka_produce(
+           rd_kafka_topic_new(KafkaManager::instance().getProducer(), "message_topic", nullptr),
+           RD_KAFKA_PARTITION_UA,
+           RD_KAFKA_MSG_F_COPY,
+           const_cast<char *>(buffer.c_str()), buffer.size(),
+           nullptr, 0,
+           nullptr) == -1)
+    {
+        LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(rd_kafka_last_error());
+    }
 
     wsConnPtr->setContext(std::make_shared<Subscriber>(std::move(s)));
 }

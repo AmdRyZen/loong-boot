@@ -10,21 +10,21 @@
 #include <vector>
 
 // UserDataItem 结构体
-struct UserDataItem {
+struct alignas(16) UserDataItem {
     std::int64_t id{};
     std::string author;
     std::string job_desc;
 };
 
 // UserDataListVo 结构体
-struct UserDataListVo {
+struct alignas(16) UserDataListVo {
     std::int64_t num_users{};
     std::string redis_value;
     std::vector<UserDataItem> list; // 用于存储结果
 };
 
 // 定义 AesResponseDataVo 结构体
-struct AesResponseDataVo {
+struct alignas(16) AesResponseDataVo {
     std::string encrypted;
     std::string decrypted;
     std::string hash;
@@ -32,14 +32,14 @@ struct AesResponseDataVo {
 };
 
 
-struct MemberInfoVo
+struct alignas(16) MemberInfoVo
 {
     uint64_t user_id;
     std::string name;
     std::string token;
 };
 
-struct MyStruct
+struct alignas(16) MyStruct
 {
     int i = 1;
     /*double d = 3.14;*/
