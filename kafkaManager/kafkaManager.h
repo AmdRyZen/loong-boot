@@ -7,7 +7,7 @@
 
 #pragma once
 
-#include <../cmake-build-debug/_deps/librdkafka-src/src/rdkafka.h>
+#include <rdkafka.h>
 #include <string>
 #include <mutex>
 
