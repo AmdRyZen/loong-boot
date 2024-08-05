@@ -2,7 +2,7 @@
 #include "utils/redisUtils.h"
 #include "user.pb.h"
 #include <glaze/glaze.hpp>
-#include "utils/KafkaManager.h"
+#include "../kafkaManager/kafkaManager.h"
 
 struct Subscriber
 {
@@ -81,12 +81,14 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConnPtr, st
                                            rd_kafka_topic_new(KafkaManager::instance().getProducer(), "message_topic", nullptr),
                                            RD_KAFKA_PARTITION_UA,
                                            RD_KAFKA_MSG_F_COPY,
-                                           const_cast<char *>(buffer.c_str()), buffer.size(),
+                                           const_cast<char *>(buffer.data()), buffer.size(),
                                            nullptr, 0,
                                            nullptr) == -1)
                                     {
                                         LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(rd_kafka_last_error());
                                     }
+                                    // 处理确认和错误事件
+                                     rd_kafka_poll(KafkaManager::instance().getProducer(), 0);
                                 }
                             }
                             // 其他操作...
@@ -155,12 +157,14 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
            rd_kafka_topic_new(KafkaManager::instance().getProducer(), "message_topic", nullptr),
            RD_KAFKA_PARTITION_UA,
            RD_KAFKA_MSG_F_COPY,
-           const_cast<char *>(buffer.c_str()), buffer.size(),
+           const_cast<char *>(buffer.data()), buffer.size(),
            nullptr, 0,
            nullptr) == -1)
     {
         LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(rd_kafka_last_error());
     }
+    // 处理确认和错误事件
+    rd_kafka_poll(KafkaManager::instance().getProducer(), 0);
 
     wsConnPtr->setContext(std::make_shared<Subscriber>(std::move(s)));
 }

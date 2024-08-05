@@ -14,8 +14,8 @@
 #include <trantor/utils/Utilities.h>
 #include <boost/format.hpp>
 #include <boost/date_time.hpp>
-#include "utils/kafkaManager.h"
-#include "kfkConsumer/AsyncKafkaConsumer.h"
+#include "../kafkaManager/kafkaManager.h"
+#include "kafkaManager/AsyncKafkaConsumer.h"
 
 inline TrieService trieService;
 

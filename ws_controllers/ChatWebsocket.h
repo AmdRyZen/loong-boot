@@ -1,7 +1,7 @@
 #pragma once
 #include <drogon/PubSubService.h>
 #include <drogon/WebSocketController.h>
-#include "utils/KafkaManager.h"
+#include "../kafkaManager/kafkaManager.h"
 #include <glaze/glaze.hpp>
 
 using namespace drogon;
@@ -35,7 +35,6 @@ private:
     std::unordered_map<WebSocketConnectionPtr, std::string> userNames_; // 连接与用户名的映射
     mutable std::mutex mutex_;
 
-
     void sendHeartbeatToAll() const
     {
         // "001" 房间的name 可以从摸个集合或者Redis里面获取
@@ -43,6 +42,7 @@ private:
 
         // 根据用户名发送定制消息
         std::lock_guard<std::mutex> guard(mutex_);
+        const auto producer = rd_kafka_topic_new(KafkaManager::instance().getProducer(), "message_topic", nullptr);
         for (const auto &wsConnPtr : connections_)
         {
             if (wsConnPtr->connected())
@@ -60,15 +60,17 @@ private:
 
                 // 推送kfk 生产消息（异步）
                 if (rd_kafka_produce(
-                       rd_kafka_topic_new(KafkaManager::instance().getProducer(), "message_topic", nullptr),
+                       producer,
                        RD_KAFKA_PARTITION_UA,
                        RD_KAFKA_MSG_F_COPY,
-                       const_cast<char *>(buffer.c_str()), buffer.size(),
+                       const_cast<char *>(buffer.data()), buffer.size(),
                        nullptr, 0,
                        nullptr) == -1)
                 {
                     LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(rd_kafka_last_error());
                 }
+                // 处理确认和错误事件
+                rd_kafka_poll(KafkaManager::instance().getProducer(), 0);
             }
         }
     }

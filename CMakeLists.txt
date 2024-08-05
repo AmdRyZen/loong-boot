@@ -155,8 +155,8 @@ add_executable(
         threadPool/threadPool.h utils/checkloginUtils.h
         filters/LoginFilter.h utils/printer.h utils/opensslCrypto.h
         filters/SqlFilter.h
-        utils/kafkaManager.h
-        kfkConsumer/AsyncKafkaConsumer.h
+        kafkaManager/kafkaManager.h
+        kafkaManager/AsyncKafkaConsumer.h
         base/base.h)
 
 
