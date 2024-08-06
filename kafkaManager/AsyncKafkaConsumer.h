@@ -6,7 +6,6 @@
 
 #include <rdkafka.h>
 #include <iostream>
-#include <thread>
 #include <atomic>
 
 using namespace drogon;
@@ -49,6 +48,7 @@ public:
         for (const auto consumer : consumers_)
         {
             rd_kafka_consumer_close(consumer);
+            rd_kafka_flush(consumer, 1000);
             rd_kafka_destroy(consumer);
         }
         std::cout << "Kafka consumer stopped." << std::endl;
@@ -76,41 +76,51 @@ private:
         {
             if (rd_kafka_message_t *msg = rd_kafka_consumer_poll(consumer_, 1000)) // Poll every second
             {
-                if (msg->err)
-                {
-                    if (msg->err == RD_KAFKA_RESP_ERR__PARTITION_EOF)
+                // 启动协程处理消息
+                async_run([msg, consumer_, this]() -> Task<> {
+                    try
                     {
-                        // 当前分区的消息已经消费完毕
-                        std::cout << "Reached end of partition." << std::endl;
+                        if (msg->err)
+                        {
+                            if (msg->err == RD_KAFKA_RESP_ERR__PARTITION_EOF)
+                            {
+                                // 当前分区的消息已经消费完毕
+                                LOG_ERROR << "EReached end of partition.";
+                            }
+                            else
+                            {
+                                LOG_ERROR << "Error consuming message: " <<  rd_kafka_err2str(msg->err);
+                            }
+                            rd_kafka_message_destroy(msg); // 释放消息资源
+                            co_return;
+                        }
+
+                        const std::string message(static_cast<const char*>(msg->payload), msg->len);
+
+                        //LOG_INFO << "收到消息 Received message: " << message;
+                        co_await handleKafkaMessage(message);
+
+                        // 处理完消息后手动提交偏移量
+                        rd_kafka_commit_message(consumer_, msg, 0);
                     }
-                    else
+                    catch (const std::exception& ex)
                     {
-                        std::cerr << "Error consuming message: " << rd_kafka_err2str(msg->err) << std::endl;
+                        LOG_ERROR << "Exception while processing message: " << ex.what();
                     }
-                }
-                else
-                {
-                    std::string message(static_cast<const char*>(msg->payload), msg->len);
-
-                    // 启动协程处理消息
-                    async_run([message, msg, consumer_, this]() -> Task<> {
-                        try
-                        {
-                            LOG_INFO << "收到消息 Received message: " << message;
-
-                            // 处理完消息后手动提交偏移量
-                            rd_kafka_commit_message(consumer_, msg, 0);
-                        }
-                        catch (const std::exception& ex)
-                        {
-                            LOG_ERROR << "Exception while processing message: " << ex.what();
-                        }
-                        co_return;
-                    });
-                }
-                rd_kafka_message_destroy(msg); // 释放消息资源
+                    rd_kafka_message_destroy(msg); // 释放消息资源
+                });
             }
         }
+    }
+
+    // 将处理 Kafka 消息的逻辑封装为协程
+    static Task<> handleKafkaMessage(const std::string& message) {
+        try {
+            LOG_INFO << "收到消息 Received message: " << message;
+        } catch (const std::exception& ex) {
+            throw std::invalid_argument(ex.what());
+        }
+        co_return;
     }
 
     std::vector<std::thread> consumerThreads_; // Kafka 消费线程
