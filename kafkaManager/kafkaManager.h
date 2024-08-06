@@ -26,7 +26,7 @@ public:
         if (!initialized_)
         {
             // 创建生产者
-            producer_conf_ = (rd_kafka_conf_new());
+            producer_conf_ = rd_kafka_conf_new();
 
             // 	request.timeout.ms: 请求超时。客户端在等待响应时的最大时间。设置为 30s 或更长时间。
             rd_kafka_conf_set(producer_conf_, "request.timeout.ms", "30000", nullptr, 0);
@@ -55,14 +55,14 @@ public:
                 throw std::runtime_error(std::string("Failed to configure Kafka broker: ") + errstr_);
             }
 
-            producer_ = (rd_kafka_new(RD_KAFKA_PRODUCER, producer_conf_, errstr_, sizeof(errstr_)));
+            producer_ = rd_kafka_new(RD_KAFKA_PRODUCER, producer_conf_, errstr_, sizeof(errstr_));
             if (!producer_)
             {
                 throw std::runtime_error(std::string("Failed to create Kafka producer: ") + errstr_);
             }
 
             // 创建消费者
-            consumer_conf_ = (rd_kafka_conf_new());
+            consumer_conf_ = rd_kafka_conf_new();
 
             // enable.auto.commit: 自动提交偏移量的开关。生产环境中通常建议手动提交，以更好地控制偏移量的提交。
             rd_kafka_conf_set(consumer_conf_, "enable.auto.commit", "false", nullptr, 0);
@@ -96,7 +96,7 @@ public:
                 throw std::runtime_error(std::string("Failed to configure Kafka group ID: ") + errstr_);
             }
 
-            consumer_ = (rd_kafka_new(RD_KAFKA_CONSUMER, consumer_conf_, errstr_, sizeof(errstr_)));
+            consumer_ = rd_kafka_new(RD_KAFKA_CONSUMER, consumer_conf_, errstr_, sizeof(errstr_));
             if (!consumer_)
             {
                 throw std::runtime_error(std::string("Failed to create Kafka consumer: ") + errstr_);
@@ -122,6 +122,25 @@ public:
             throw std::runtime_error("KafkaManager is not initialized");
         }
         return consumer_;
+    }
+
+    // 创建新消费者：为了支持每个线程创建独立的消费者
+    rd_kafka_t* createNewConsumer()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!initialized_)
+        {
+            throw std::runtime_error("KafkaManager is not initialized");
+        }
+
+        // 创建新的消费者实例
+        rd_kafka_t *consumer = rd_kafka_new(RD_KAFKA_CONSUMER, consumer_conf_, errstr_, sizeof(errstr_));
+        if (!consumer)
+        {
+            throw std::runtime_error(std::string("Failed to create Kafka consumer: ") + errstr_);
+        }
+
+        return consumer;
     }
 
 private:

@@ -21,8 +21,11 @@ public:
             // 启动多个后台线程来异步消费消息
             for (size_t i = 0; i < numThreads; ++i)
             {
+                // 为每个线程创建独立的 Kafka 消费者实例
+                rd_kafka_t* consumer = KafkaManager::instance().createNewConsumer();
+                consumers_.push_back(consumer);
                 // 创建并启动 Kafka 消费线程
-                consumerThreads_.emplace_back(&AsyncKafkaConsumer::consumeMessages, this);
+                consumerThreads_.emplace_back(&AsyncKafkaConsumer::consumeMessages, this, consumer);
             }
             std::cout << "Kafka consumer started." << std::endl;
         }
@@ -43,13 +46,18 @@ public:
                 thread.join(); // 等待线程完成
             }
         }
+        for (const auto consumer : consumers_)
+        {
+            rd_kafka_consumer_close(consumer);
+            rd_kafka_destroy(consumer);
+        }
         std::cout << "Kafka consumer stopped." << std::endl;
     }
 
 private:
-    void consumeMessages() const
+    void consumeMessages(rd_kafka_t* consumer_) const
     {
-        const auto consumer_ = KafkaManager::instance().getConsumer();
+        //const auto consumer_ = KafkaManager::instance().getConsumer();
         // 创建一个新的 topic partition list
         rd_kafka_topic_partition_list_t *partitions = rd_kafka_topic_partition_list_new(1);
         // 向列表中添加主题和分区
@@ -106,5 +114,6 @@ private:
     }
 
     std::vector<std::thread> consumerThreads_; // Kafka 消费线程
+    std::vector<rd_kafka_t*> consumers_;       // Kafka 消费者实例
     std::atomic<bool> stop_{false}; // 控制消费线程的停止
 };
