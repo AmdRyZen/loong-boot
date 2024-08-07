@@ -5,7 +5,6 @@
 #pragma once
 
 #include <rdkafka.h>
-#include <iostream>
 #include <atomic>
 
 using namespace drogon;
@@ -26,11 +25,11 @@ public:
                 // 创建并启动 Kafka 消费线程
                 consumerThreads_.emplace_back(&AsyncKafkaConsumer::consumeMessages, this, consumer);
             }
-            std::cout << "Kafka consumer started." << std::endl;
+            LOG_INFO << "Kafka consumer started.";
         }
         catch (const std::exception &e)
         {
-            std::cerr << "Exception in AsyncKafkaConsumer constructor: " << e.what() << std::endl;
+            LOG_ERROR <<  "Exception in AsyncKafkaConsumer constructor: " << e.what();
             // 可能需要进一步处理异常，例如重新尝试初始化
         }
     }
@@ -51,7 +50,7 @@ public:
             rd_kafka_flush(consumer, 1000);
             rd_kafka_destroy(consumer);
         }
-        std::cout << "Kafka consumer stopped." << std::endl;
+        LOG_INFO << "Kafka consumer stopped.";
     }
 
 private:
@@ -69,7 +68,7 @@ private:
 
         if (err != RD_KAFKA_RESP_ERR_NO_ERROR)
         {
-            std::cerr << "Failed to subscribe to topic: " << rd_kafka_err2str(err) << std::endl;
+            LOG_ERROR << "Failed to subscribe to topic: " << rd_kafka_err2str(err);
             return;
         }
         while (!stop_)
