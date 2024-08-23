@@ -579,7 +579,14 @@ Task<> OpenApi::fastJson(const HttpRequestPtr req, std::function<void(const Http
 
     MyStruct my_struct{};
     (void) glz::read_json(my_struct, buffer);
-    co_return callback(Base<MyStruct>::createHttpSuccessResponse(StatusOK, Success, my_struct));
+    //co_return callback(Base<MyStruct>::createHttpSuccessResponse(StatusOK, Success, my_struct));
+
+    // protobuf
+    dto::UserData protobufResponse;
+    protobufResponse.set_id("200");
+    protobufResponse.set_name("Hello, this is a Protobuf response");
+    protobufResponse.set_message("我草");
+    co_return callback(Base<dto::UserData>::createHttpProtobufSuccessResponse(StatusOK, Success, protobufResponse));
 }
 
 std::atomic<int64_t> value(0);
