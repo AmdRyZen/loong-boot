@@ -583,9 +583,27 @@ Task<> OpenApi::fastJson(const HttpRequestPtr req, std::function<void(const Http
 
     // protobuf
     dto::UserData protobufResponse;
-    protobufResponse.set_id("200");
+    if (!protobufResponse.ParseFromString(std::string(req->getBody())))
+    {
+        LOG_ERROR << "---------------ParseFromString error-----------------";
+    }
+
+    /*protobufResponse.set_id("200");
     protobufResponse.set_name("Hello, this is a Protobuf response");
-    protobufResponse.set_message("我草");
+    protobufResponse.set_message("我草");*/
+
+    // 序列化到字符串
+    std::string output;
+    if (!protobufResponse.SerializeToString(&output)) {
+        LOG_ERROR << "Failed to serialize message.";
+    }
+    // 将序列化后的数据写入文件
+    std::ofstream ofs("message.bin", std::ios::binary);
+    ofs.write(output.data(), static_cast<std::streamsize>(output.size()));
+    ofs.close();
+
+    LOG_INFO << "Binary file generated successfully.";
+
     co_return callback(Base<dto::UserData>::createHttpProtobufSuccessResponse(StatusOK, Success, protobufResponse));
 }
 

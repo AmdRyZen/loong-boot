@@ -41,9 +41,10 @@ struct alignas(16) MemberInfoVo
 
 struct alignas(16) MyStruct
 {
-    int i = 1;
+    int id = 1;
     /*double d = 3.14;*/
-    std::string hello = "c";
+    std::string name = "Hello, this is a glaze response";
+    std::string message = "我草";
     /*std::array<uint64_t, 3> arr = { 1, 2, 3 };
     std::map<std::string, int> map{{"one", 1}, {"two", 2}};*/
 };
