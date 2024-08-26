@@ -1,6 +1,5 @@
 #include "aop/Application.h"
 #include <drogon/drogon.h>
-#include <csignal> // 包含 signal 处理头文件
 
 int main()
 {

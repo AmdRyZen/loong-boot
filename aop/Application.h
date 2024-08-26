@@ -13,7 +13,6 @@
 #include <drogon/version.h>
 #include <trantor/utils/Utilities.h>
 #include <boost/format.hpp>
-#include <boost/date_time.hpp>
 #include "../kafkaManager/kafkaManager.h"
 #include "kafkaManager/AsyncKafkaConsumer.h"
 
@@ -22,7 +21,7 @@ inline TrieService trieService;
 inline ThreadPool pool(2);
 
 namespace App {
-constexpr char drogon[] = "\n"
+constexpr char Loong[] = "\n"
                       "                       .::::.\n"
                       "                     .::::::::.\n"
                       "                    :::::::::::  HELLO LOONG\n"
@@ -105,10 +104,12 @@ class Application final
 
 Application::Application()
 {
-    // 创建一个定时器，每隔10秒执行一次
-    /*drogon::HttpAppFramework::instance().getLoop()->runEvery(10.0, [] {
-        std::cout << "定时器触发了" << std::endl;
-    });*/
+    std::cout << Loong << std::endl;
+    std::cout << "A utility for drogon" << std::endl;
+    std::cout << std::format("Version: {}", DROGON_VERSION) << std::endl;
+    std::cout << std::format("Git commit: {}", DROGON_VERSION_SHA1) << std::endl;
+    std::cout << std::format("Ssl/tls backend: {}",  trantor::utils::tlsBackend()) << std::endl;
+    std::cout << std::endl;
 
     try
     {
@@ -127,30 +128,21 @@ Application::Application()
     }
 
     app().registerBeginningAdvice([]() {
-        std::cout << drogon << std::endl;
-        std::cout << "A utility for drogon" << std::endl;
-        std::cout << std::format("Version: {}", DROGON_VERSION) << std::endl;
-        std::cout << std::format("Git commit: {}", DROGON_VERSION_SHA1) << std::endl;
-        std::cout << std::format("Ssl/tls backend: {}",  trantor::utils::tlsBackend()) << std::endl;
-
         std::string word_path;
         std::string stopped_path;
         word_path.append(std::filesystem::current_path()).append("/public/word.txt");
         stopped_path.append(std::filesystem::current_path()).append("/public/stopped.txt");
         TrieService::loadFromFile(word_path);
         TrieService::loadStopWordFromFile(stopped_path);
-        std::cout << "TrieService load is success!" << std::endl;
-
-        boost::posix_time::ptime current_datetime = boost::posix_time::second_clock::local_time();
-        std::cout << "Current date and time: " << current_datetime << std::endl;
-        std::cout << std::endl << std::endl;
+        LOG_INFO << "TrieService load is success!";
+        std::cout << std::endl;
     });
 
-    app().registerPreRoutingAdvice([](const drogon::HttpRequestPtr& req,
-                                              drogon::AdviceCallback&& acb,
-                                              drogon::AdviceChainCallback&& accb) {
+    app().registerPreRoutingAdvice([](const HttpRequestPtr& req,
+                                              AdviceCallback&& acb,
+                                              AdviceChainCallback&& accb) {
         // todo ...
-        //std::cout << "preRouting1!" << std::endl;
+        //LOG_INFO << "preRouting1!";
         accb();
     });
 }

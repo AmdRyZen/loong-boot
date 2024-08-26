@@ -1,8 +1,5 @@
 cmake_minimum_required(VERSION 3.29)
 
-#[[SET(CMAKE_C_COMPILER "/opt/homebrew/Cellar/gcc@11/11.4.0/bin/gcc-11")
-SET(CMAKE_CXX_COMPILER "/opt/homebrew/Cellar/gcc@11/11.4.0/bin/g++-11")]]
-
 SET(CMAKE_C_COMPILER "/opt/homebrew/Cellar/gcc/14.2.0/bin/gcc-14")
 SET(CMAKE_CXX_COMPILER "/opt/homebrew/Cellar/gcc/14.2.0/bin/g++-14")
 
