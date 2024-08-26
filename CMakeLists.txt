@@ -1,10 +1,10 @@
-cmake_minimum_required(VERSION 3.28)
+cmake_minimum_required(VERSION 3.29)
 
 #[[SET(CMAKE_C_COMPILER "/opt/homebrew/Cellar/gcc@11/11.4.0/bin/gcc-11")
 SET(CMAKE_CXX_COMPILER "/opt/homebrew/Cellar/gcc@11/11.4.0/bin/g++-11")]]
 
-SET(CMAKE_C_COMPILER "/opt/homebrew/Cellar/gcc/14.1.0_2/bin/gcc-14")
-SET(CMAKE_CXX_COMPILER "/opt/homebrew/Cellar/gcc/14.1.0_2/bin/g++-14")
+SET(CMAKE_C_COMPILER "/opt/homebrew/Cellar/gcc/14.2.0/bin/gcc-14")
+SET(CMAKE_CXX_COMPILER "/opt/homebrew/Cellar/gcc/14.2.0/bin/g++-14")
 
 project(loong-boot C CXX)
 
@@ -182,6 +182,16 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(librdkafka)
 
+set(ABSL_PROPAGATE_CXX_STD ON)
+FetchContent_Declare(
+        abseil
+        GIT_REPOSITORY https://github.com/abseil/abseil-cpp.git
+        GIT_TAG master  # 选择你需要的版本
+        GIT_SHALLOW TRUE
+)
+
+FetchContent_MakeAvailable(abseil)
+
 FetchContent_Declare(
         protobuf
         GIT_REPOSITORY https://github.com/protocolbuffers/protobuf.git
@@ -199,7 +209,7 @@ include_directories(${PROTO_GEN_CXX_INCLUDE_DIRS}) # cpp
 find_package(Drogon CONFIG REQUIRED)
 find_package(mimalloc 2.1.7 REQUIRED)
 find_package(Boost 1.86.0 REQUIRED)
-target_link_libraries(${PROJECT_NAME} PRIVATE Drogon::Drogon Boost::boost glaze::glaze rdkafka protobuf::libprotobuf mimalloc proto_gen_cxx)
+target_link_libraries(${PROJECT_NAME} PRIVATE Drogon::Drogon Boost::boost glaze::glaze rdkafka absl::base absl::strings absl::status protobuf::libprotobuf mimalloc proto_gen_cxx)
 
 # ##############################################################################
 
