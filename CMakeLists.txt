@@ -103,13 +103,18 @@ set(FOO_USE_STATIC_LIBS ON) # 告诉CMake优先使用静态库
 #find_package(PkgConfig REQUIRED)
 # Find required protobuf package
 
-#[[find_package(Protobuf REQUIRED)
+find_package(Protobuf REQUIRED)
 if (PROTOBUF_FOUND)
     message(STATUS "protobuf library found")
 else ()
     message(FATAL_ERROR "protobuf library is needed but cant be found")
 endif ()
-include_directories(${Protobuf_INCLUDE_DIRS})]]
+# 添加 Protobuf 的库目录
+link_directories(/usr/local/lib)
+include_directories(${Protobuf_INCLUDE_DIRS})
+add_subdirectory(proto)
+include_directories(${PROTO_GEN_C_INCLUDE_DIRS}) # c
+include_directories(${PROTO_GEN_CXX_INCLUDE_DIRS}) # cpp
 
 #[[set(MODEL_SOURCES
         models/XxlJobGroup.h  models/XxlJobGroup.cc
@@ -179,6 +184,7 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(librdkafka)
 
+#[[
 set(ABSL_PROPAGATE_CXX_STD ON)
 FetchContent_Declare(
         abseil
@@ -202,11 +208,12 @@ include_directories(${protobuf_SOURCE_DIR}/src)
 add_subdirectory(proto)
 include_directories(${PROTO_GEN_C_INCLUDE_DIRS}) # c
 include_directories(${PROTO_GEN_CXX_INCLUDE_DIRS}) # cpp
+]]
 
 find_package(Drogon CONFIG REQUIRED)
 find_package(mimalloc 2.1.7 REQUIRED)
 find_package(Boost 1.86.0 REQUIRED)
-target_link_libraries(${PROJECT_NAME} PRIVATE Drogon::Drogon Boost::boost glaze::glaze rdkafka absl::base absl::strings absl::status protobuf::libprotobuf mimalloc proto_gen_cxx)
+target_link_libraries(${PROJECT_NAME} PRIVATE Drogon::Drogon Boost::boost glaze::glaze rdkafka mimalloc proto_gen_cxx)
 
 # ##############################################################################
 
