@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.29)
 
+# 检查 CMake 版本，并根据版本设置政策
+if(POLICY CMP0167)
+    cmake_policy(SET CMP0167 NEW)
+else()
+    message(STATUS "CMake version does not support policy CMP0167")
+endif()
+
 SET(CMAKE_C_COMPILER "/opt/homebrew/Cellar/gcc/14.2.0/bin/gcc-14")
 SET(CMAKE_CXX_COMPILER "/opt/homebrew/Cellar/gcc/14.2.0/bin/g++-14")
 
