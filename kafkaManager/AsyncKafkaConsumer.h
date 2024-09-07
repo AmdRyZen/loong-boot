@@ -8,11 +8,12 @@
 #include <atomic>
 
 using namespace drogon;
-
 class AsyncKafkaConsumer
 {
 public:
-    explicit AsyncKafkaConsumer(const size_t numThreads = 4) : stop_(false)
+    explicit AsyncKafkaConsumer(const size_t numThreads = 4)
+      : stop_(false)
+      , pool(4)
     {
         try
         {
@@ -23,13 +24,14 @@ public:
                 rd_kafka_t* consumer = KafkaManager::instance().createNewConsumer();
                 consumers_.push_back(consumer);
                 // 创建并启动 Kafka 消费线程
-                consumerThreads_.emplace_back(&AsyncKafkaConsumer::consumeMessages, this, consumer);
+                //consumerThreads_.emplace_back(&AsyncKafkaConsumer::consumeMessages, this, consumer);
+                pool.enqueue(&AsyncKafkaConsumer::consumeMessages, this, consumer);
             }
             LOG_INFO << "Kafka consumer started.";
         }
-        catch (const std::exception &e)
+        catch (const std::exception& e)
         {
-            LOG_ERROR <<  "Exception in AsyncKafkaConsumer constructor: " << e.what();
+            LOG_ERROR << "Exception in AsyncKafkaConsumer constructor: " << e.what();
             // 可能需要进一步处理异常，例如重新尝试初始化
         }
     }
@@ -125,4 +127,5 @@ private:
     std::vector<std::thread> consumerThreads_; // Kafka 消费线程
     std::vector<rd_kafka_t*> consumers_;       // Kafka 消费者实例
     std::atomic<bool> stop_{false}; // 控制消费线程的停止
+    ThreadPool pool;
 };

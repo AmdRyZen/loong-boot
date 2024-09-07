@@ -8,7 +8,7 @@
 #pragma once
 
 #include <mqtt/async_client.h>
-#include <memory>
+#include <string>
 
 class MqttManager {
 public:
@@ -18,7 +18,7 @@ public:
     }
 
     void initialize(const std::string& serverAddress, const std::string& clientId) {
-        client_ = std::make_unique<mqtt::async_client>(serverAddress, clientId);
+        client_ = new mqtt::async_client(serverAddress, clientId);
         mqtt::connect_options connOpts;
         connOpts.set_clean_session(true);
 
@@ -31,16 +31,19 @@ public:
     }
 
     void publish(const std::string& topic, const std::string& message) const {
-        const auto msg = mqtt::make_message(topic, message);
-        msg->set_qos(1);
-        client_->publish(msg)->wait();
+        if (client_) {
+            const auto msg = mqtt::make_message(topic, message);
+            msg->set_qos(1);
+            client_->publish(msg)->wait();
+        } else {
+            LOG_ERROR << "MQTT client is not initialized.";
+        }
     }
 
-    MqttManager()
-    {
+    MqttManager() : client_(nullptr) {
         // 启动全局定时器
         HttpAppFramework::instance().getLoop()->runEvery(10.0, [this] {
-            //instance().publish("topic", "MQTT 心跳检测!");
+            Example: instance().publish("topic", "MQTT 心跳检测!");
         });
     }
 
@@ -49,6 +52,8 @@ public:
             LOG_INFO << "Disconnecting from MQTT broker...";
             if (client_) {
                 client_->disconnect()->wait();
+                delete client_; // 手动释放资源
+                client_ = nullptr;
             }
             LOG_INFO << "Disconnected from the MQTT broker.";
         } catch (const mqtt::exception& e) {
@@ -57,11 +62,11 @@ public:
     }
 
     [[nodiscard]] mqtt::async_client* getClient() const {
-        return client_.get();
+        return client_;
     }
 
 private:
-    std::unique_ptr<mqtt::async_client> client_;
+    mqtt::async_client* client_; // 使用裸指针
 };
 
 #endif // MQTTMANAGER_H

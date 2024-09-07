@@ -8,58 +8,85 @@
 #pragma once
 
 #include <mqtt/async_client.h>
-#include <thread>
 #include <atomic>
-#include <vector>
+#include <stdexcept>
+#include "MqttManager.h" // 确保包含 MqttManager 的头文件
 
-class MqttConsumer {
-public:
-    explicit MqttConsumer(const size_t numThreads = 1)
-        : client_(MqttManager::instance().getClient()), stop_(false) {
-        try {
+using namespace drogon;
+class MqttConsumer
+{
+  public:
+    explicit MqttConsumer(const size_t numThreads = 2)
+      : stop_(false)
+      , pool(2)
+    {
+        try
+        {
+            // 获取 MQTT 客户端
+            client_ = MqttManager::instance().getClient();
+            if (!client_)
+            {
+                throw std::runtime_error("MQTT client is not initialized.");
+            }
             // 订阅主题
+            client_->start_consuming();
             client_->subscribe("topic", 1)->wait();
 
-            // 启动多个线程来消费消息
-            for (size_t i = 0; i < numThreads; ++i) {
-                consumerThreads_.emplace_back(&MqttConsumer::consumeMessages, this);
-            }
-        } catch (const mqtt::exception& exc) {
+            // 启动线程池处理消息
+            pool.enqueue(&MqttConsumer::consumeMessages, this);
+        }
+        catch (const mqtt::exception& exc)
+        {
             LOG_ERROR << "Error subscribing to topic: " << exc.what();
+        }
+        catch (const std::exception& ex)
+        {
+            LOG_ERROR << "Exception in MqttConsumer constructor: " << ex.what();
         }
     }
 
     void stop() {
         stop_ = true;
-        for (auto& thread : consumerThreads_) {
-            if (thread.joinable()) {
-                thread.join();
-            }
-        }
+        client_->stop_consuming(); // 确保停止消费消息
+        // 等待线程池中的所有任务完成
     }
 
-    ~MqttConsumer() {
+    ~MqttConsumer()
+    {
         stop();
     }
 
-  private:
+private:
     void consumeMessages()const {
-        client_->start_consuming();
         while (!stop_) {
-            if (const auto msg = client_->consume_message()) {
-                handleMqttMessage(msg->to_string());
+            try {
+                if (const auto msg = client_->consume_message();msg) {
+                    // 启动协程处理消息
+                    async_run([this, msg]() -> Task<> {
+                        try
+                        {
+                            handleMqttMessage(msg->to_string());
+                        }
+                        catch (const std::exception& ex)
+                        {
+                            LOG_ERROR << "Exception async_run processing message: " << ex.what();
+                        }
+                        co_return;
+                    });
+                }
+            } catch (const mqtt::exception& exc) {
+                LOG_ERROR << "Error while consuming message: " << exc.what();
             }
         }
-        client_->stop_consuming();
     }
 
     static void handleMqttMessage(const std::string& message) {
         LOG_INFO << "Message received: " << message;
     }
 
-    mqtt::async_client* client_;
-    std::vector<std::thread> consumerThreads_;
+    mqtt::async_client* client_{nullptr};
     std::atomic<bool> stop_;
+    ThreadPool pool;
 };
 
 #endif // MQTTCONSUMER_H
