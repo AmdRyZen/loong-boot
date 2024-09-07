@@ -6,3 +6,8 @@ sudo make install
 
 # brew services start zookeeper
 # brew services restart kafka
+
+
+
+#paho-mqttpp3
+#cmake -DPAHO_WITH_SSL=ON .. -DCMAKE_CXX_COMPILER=g++-14

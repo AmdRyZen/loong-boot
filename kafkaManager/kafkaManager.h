@@ -50,15 +50,15 @@ public:
             rd_kafka_conf_set(producer_conf_, "log.connection.close", "false", nullptr, 0);
 
             // 	bootstrap.servers: 指定 Kafka 集群的地址。
-            if (rd_kafka_conf_set(producer_conf_, "bootstrap.servers", brokers.c_str(), errstr_, sizeof(errstr_)) != RD_KAFKA_CONF_OK)
+            if (rd_kafka_conf_set(producer_conf_, "bootstrap.servers", brokers.c_str(), err_str_, sizeof(err_str_)) != RD_KAFKA_CONF_OK)
             {
-                throw std::runtime_error(std::string("Failed to configure Kafka broker: ") + errstr_);
+                throw std::runtime_error(std::string("Failed to configure Kafka broker: ") + err_str_);
             }
 
-            producer_ = rd_kafka_new(RD_KAFKA_PRODUCER, producer_conf_, errstr_, sizeof(errstr_));
+            producer_ = rd_kafka_new(RD_KAFKA_PRODUCER, producer_conf_, err_str_, sizeof(err_str_));
             if (!producer_)
             {
-                throw std::runtime_error(std::string("Failed to create Kafka producer: ") + errstr_);
+                throw std::runtime_error(std::string("Failed to create Kafka producer: ") + err_str_);
             }
 
             // 创建消费者
@@ -86,20 +86,20 @@ public:
             rd_kafka_conf_set(consumer_conf_, "fetch.min.bytes", "4096", nullptr, 0);
             rd_kafka_conf_set(consumer_conf_, "fetch.max.wait.ms", "200", nullptr, 0);
 
-            if (rd_kafka_conf_set(consumer_conf_, "bootstrap.servers", brokers.c_str(), errstr_, sizeof(errstr_)) != RD_KAFKA_CONF_OK)
+            if (rd_kafka_conf_set(consumer_conf_, "bootstrap.servers", brokers.c_str(), err_str_, sizeof(err_str_)) != RD_KAFKA_CONF_OK)
             {
-                throw std::runtime_error(std::string("Failed to configure Kafka consumer: ") + errstr_);
+                throw std::runtime_error(std::string("Failed to configure Kafka consumer: ") + err_str_);
             }
 
-            if (rd_kafka_conf_set(consumer_conf_, "group.id", "my_consumer_group", errstr_, sizeof(errstr_)) != RD_KAFKA_CONF_OK)
+            if (rd_kafka_conf_set(consumer_conf_, "group.id", "my_consumer_group", err_str_, sizeof(err_str_)) != RD_KAFKA_CONF_OK)
             {
-                throw std::runtime_error(std::string("Failed to configure Kafka group ID: ") + errstr_);
+                throw std::runtime_error(std::string("Failed to configure Kafka group ID: ") + err_str_);
             }
 
-            consumer_ = rd_kafka_new(RD_KAFKA_CONSUMER, consumer_conf_, errstr_, sizeof(errstr_));
+            consumer_ = rd_kafka_new(RD_KAFKA_CONSUMER, consumer_conf_, err_str_, sizeof(err_str_));
             if (!consumer_)
             {
-                throw std::runtime_error(std::string("Failed to create Kafka consumer: ") + errstr_);
+                throw std::runtime_error(std::string("Failed to create Kafka consumer: ") + err_str_);
             }
 
             initialized_ = true;
@@ -134,10 +134,10 @@ public:
         }
 
         // 创建新的消费者实例
-        rd_kafka_t *consumer = rd_kafka_new(RD_KAFKA_CONSUMER, consumer_conf_, errstr_, sizeof(errstr_));
+        rd_kafka_t *consumer = rd_kafka_new(RD_KAFKA_CONSUMER, consumer_conf_, err_str_, sizeof(err_str_));
         if (!consumer)
         {
-            throw std::runtime_error(std::string("Failed to create Kafka consumer: ") + errstr_);
+            throw std::runtime_error(std::string("Failed to create Kafka consumer: ") + err_str_);
         }
 
         return consumer;
@@ -165,7 +165,7 @@ private:
     rd_kafka_t *producer_ = nullptr;
     rd_kafka_conf_t *consumer_conf_ = nullptr;
     rd_kafka_t *consumer_ = nullptr;
-    char errstr_[512] = {};
+    char err_str_[512] = {};
     bool initialized_ = false;
 };
 

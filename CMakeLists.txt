@@ -123,17 +123,6 @@ add_subdirectory(proto)
 include_directories(${PROTO_GEN_C_INCLUDE_DIRS}) # c
 include_directories(${PROTO_GEN_CXX_INCLUDE_DIRS}) # cpp
 
-#[[set(MODEL_SOURCES
-        models/XxlJobGroup.h  models/XxlJobGroup.cc
-        models/XxlJobInfo.h  models/XxlJobInfo.cc
-        models/XxlJobLock.h  models/XxlJobLock.cc
-        models/XxlJobLog.h  models/XxlJobLog.cc
-        models/XxlJobLogglue.h  models/XxlJobLogglue.cc
-        models/XxlJobLogReport.h  models/XxlJobLogReport.cc
-        models/XxlJobRegistry.h  models/XxlJobRegistry.cc
-        models/XxlJobUser.h  models/XxlJobUser.cc
-)]]
-
 set(MODEL_SOURCES_DTO
         base/dto/open_dto.h
 )
@@ -142,8 +131,20 @@ set(MODEL_SOURCES_VO
         base/vo/data_vo.h
 )
 
+set(MODEL_SOURCES_COMMON
+        aop/Application.h
+        threadPool/threadPool.h utils/checkloginUtils.h
+        filters/LoginFilter.h utils/printer.h utils/opensslCrypto.h
+        filters/SqlFilter.h
+        kafkaManager/kafkaManager.h
+        kafkaManager/AsyncKafkaConsumer.h
+        base/base.h
+        mqttManager/MqttManager.h
+        mqttManager/MqttConsumer.h
+)
+
 add_executable(
-        ${PROJECT_NAME} ${MODEL_SOURCES_DTO} ${MODEL_SOURCES_VO}
+        ${PROJECT_NAME} ${MODEL_SOURCES_DTO} ${MODEL_SOURCES_VO} ${MODEL_SOURCES_COMMON}
         main.cc utils/sql.h
         controllers/PlaintextCtrl.cc controllers/PlaintextCtrl.h
         controllers/api_v1_User.cc controllers/api_v1_User.h
@@ -152,17 +153,7 @@ add_executable(
         ws_controllers/ChatWebsocket.h ws_controllers/ChatWebsocket.cc
         service/SbcConvertService.h service/impl/SbcConvertServiceImpl.cpp
         service/TrieService.h service/impl/TrieServiceImpl.cpp
-        #utils/base64Utils.h utils/base64Utils.c
-        #utils/aes.h utils/aes.c
-        #utils/cipherUtils.h utils/cipherUtils.cpp
-        #utils/md5Utils.h utils/md5Utils.cpp
-        aop/Application.h
-        threadPool/threadPool.h utils/checkloginUtils.h
-        filters/LoginFilter.h utils/printer.h utils/opensslCrypto.h
-        filters/SqlFilter.h
-        kafkaManager/kafkaManager.h
-        kafkaManager/AsyncKafkaConsumer.h
-        base/base.h)
+)
 
 
 # ##############################################################################
@@ -220,7 +211,8 @@ include_directories(${PROTO_GEN_CXX_INCLUDE_DIRS}) # cpp
 find_package(Drogon CONFIG REQUIRED)
 find_package(mimalloc 2.1.7 REQUIRED)
 find_package(Boost 1.86.0 REQUIRED)
-target_link_libraries(${PROJECT_NAME} PRIVATE Drogon::Drogon Boost::boost glaze::glaze rdkafka mimalloc proto_gen_cxx)
+find_package(PahoMqttCpp REQUIRED)
+target_link_libraries(${PROJECT_NAME} PRIVATE Drogon::Drogon Boost::boost glaze::glaze rdkafka PahoMqttCpp::paho-mqttpp3 mimalloc proto_gen_cxx)
 
 # ##############################################################################
 

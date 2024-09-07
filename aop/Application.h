@@ -15,6 +15,8 @@
 #include <boost/format.hpp>
 #include "../kafkaManager/kafkaManager.h"
 #include "kafkaManager/AsyncKafkaConsumer.h"
+#include "mqttManager/MqttManager.h"
+#include "mqttManager/MqttConsumer.h"
 
 inline TrieService trieService;
 
@@ -120,11 +122,17 @@ Application::Application()
         KafkaManager::instance().initialize(brokers);
 
         // 创建一个消费者实例
-        static AsyncKafkaConsumer kafkaConsumer;
+        static AsyncKafkaConsumer asyncKafkaConsumer;
+
+        // 初始化 MqttManager 并连接到 MQTT broker  mosquitto/emqx start
+        MqttManager::instance().initialize("tcp://localhost:1883", "client_id");
+
+        // 创建并启动消费者实例
+        static MqttConsumer mqttConsumer;
     }
     catch (const std::exception &e)
     {
-        LOG_ERROR << "Kafka initialization failed: " << e.what();
+        LOG_ERROR << "initialization failed: " << e.what();
     }
 
     app().registerBeginningAdvice([]() {

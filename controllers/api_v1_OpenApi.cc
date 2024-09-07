@@ -24,6 +24,7 @@
 #include "user.pb.h"
 #include "base/base.h"
 #include "base/vo/data_vo.h"
+#include "mqttManager/MqttManager.h"
 
 #if defined(__arm__) || defined(__aarch64__)
     #include <arm_neon.h>
@@ -39,6 +40,15 @@ using json = nlohmann::json;
 using namespace boost::gregorian;
 namespace mp = boost::multiprecision;
 using namespace rapidjson;
+
+
+Task<> OpenApi::mqtt(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
+{
+    // 发布消息
+    MqttManager::instance().publish("topic", "Hello, MQTT!");
+
+    co_return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
+}
 
 void printerFunc()
 {
@@ -105,11 +115,11 @@ void run_test(const int iterations) {
 
 Task<> OpenApi::coroutine(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
 {
-    constexpr int iterations = 10000000;  // 调整为合理的次数，避免程序运行时间过长
     constexpr int num_threads = 8;
     std::vector<std::thread> threads;
 
     for (int i = 0; i < num_threads; ++i) {
+        constexpr int iterations = 10000000;
         threads.emplace_back(run_test, iterations);
     }
 
