@@ -21,6 +21,8 @@
 inline TrieService trieService;
 
 inline ThreadPool pool(2);
+inline ThreadPool poolKafka(2);
+inline ThreadPool poolMqtt(2);
 
 namespace App {
 constexpr char Loong[] = "\n"

@@ -12,13 +12,13 @@
 #include <stdexcept>
 #include "MqttManager.h" // 确保包含 MqttManager 的头文件
 
+extern ThreadPool poolMqtt;
 using namespace drogon;
 class MqttConsumer
 {
   public:
     explicit MqttConsumer(const size_t numThreads = 2)
       : stop_(false)
-      , pool(2)
     {
         try
         {
@@ -33,7 +33,7 @@ class MqttConsumer
             client_->subscribe("topic", 1)->wait();
 
             // 启动线程池处理消息
-            pool.enqueue(&MqttConsumer::consumeMessages, this);
+            poolMqtt.enqueue(&MqttConsumer::consumeMessages, this);
         }
         catch (const mqtt::exception& exc)
         {
@@ -86,7 +86,6 @@ private:
 
     mqtt::async_client* client_{nullptr};
     std::atomic<bool> stop_;
-    ThreadPool pool;
 };
 
 #endif // MQTTCONSUMER_H

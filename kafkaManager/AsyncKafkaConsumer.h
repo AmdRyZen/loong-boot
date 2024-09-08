@@ -7,13 +7,13 @@
 #include <rdkafka.h>
 #include <atomic>
 
+extern ThreadPool poolKafka;
 using namespace drogon;
 class AsyncKafkaConsumer
 {
 public:
     explicit AsyncKafkaConsumer(const size_t numThreads = 4)
       : stop_(false)
-      , pool(4)
     {
         try
         {
@@ -25,7 +25,8 @@ public:
                 consumers_.push_back(consumer);
                 // 创建并启动 Kafka 消费线程
                 //consumerThreads_.emplace_back(&AsyncKafkaConsumer::consumeMessages, this, consumer);
-                pool.enqueue(&AsyncKafkaConsumer::consumeMessages, this, consumer);
+                poolKafka.setThreadCount(4);
+                poolKafka.enqueue(&AsyncKafkaConsumer::consumeMessages, this, consumer);
             }
             LOG_INFO << "Kafka consumer started.";
         }
@@ -39,13 +40,7 @@ public:
     ~AsyncKafkaConsumer()
     {
         stop_ = true;
-        for (auto& thread : consumerThreads_)
-        {
-            if (thread.joinable())
-            {
-                thread.join(); // 等待线程完成
-            }
-        }
+        // 等待线程池中的所有任务完成
         for (const auto consumer : consumers_)
         {
             rd_kafka_consumer_close(consumer);
@@ -124,8 +119,6 @@ private:
         co_return;
     }
 
-    std::vector<std::thread> consumerThreads_; // Kafka 消费线程
     std::vector<rd_kafka_t*> consumers_;       // Kafka 消费者实例
     std::atomic<bool> stop_{false}; // 控制消费线程的停止
-    ThreadPool pool;
 };
