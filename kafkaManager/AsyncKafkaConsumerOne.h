@@ -1,53 +1,42 @@
-//
-// Created by 神圣•凯莎 on 24-7-30.
-//
-
 #pragma once
 
 #include <rdkafka.h>
 #include <atomic>
 
-extern ThreadPool poolKafka;
+extern ThreadPool poolKafkaOne;
 using namespace drogon;
-class AsyncKafkaConsumer
+class AsyncKafkaConsumerOne
 {
 public:
-    explicit AsyncKafkaConsumer(const size_t numThreads = 4)
-      : stop_(false)
+    explicit AsyncKafkaConsumerOne(const size_t nemThreads = 4) : stop_(false)
     {
-        try
+        for (size_t i = 0; i < nemThreads; i++)
         {
-            // 启动多个后台线程来异步消费消息
-            for (size_t i = 0; i < numThreads; ++i)
+            try
             {
-                // 为每个线程创建独立的 Kafka 消费者实例
                 rd_kafka_t* consumer = KafkaManager::instance().createNewConsumer();
                 consumers_.push_back(consumer);
-                // 创建并启动 Kafka 消费线程
-                //consumerThreads_.emplace_back(&AsyncKafkaConsumer::consumeMessages, this, consumer);
-                poolKafka.setThreadCount(4);
-                poolKafka.enqueue(&AsyncKafkaConsumer::consumeMessages, this, consumer);
+                poolKafkaOne.setThreadCount(4);
+                poolKafkaOne.enqueue(&AsyncKafkaConsumerOne::consumeMessages, this, consumer);
+
+            } catch (const std::exception &ex)
+            {
+                LOG_ERROR << "AsyncKafkaConsumerOne Exception in constructor: " << ex.what();
             }
-            LOG_INFO << "AsyncKafkaConsumer consumer started.";
         }
-        catch (const std::exception& e)
-        {
-            LOG_ERROR << "AsyncKafkaConsumer Exception in constructor: " << e.what();
-            // 可能需要进一步处理异常，例如重新尝试初始化
-        }
+        LOG_INFO << "AsyncKafkaConsumerOne consumer started.";
     }
 
-    ~AsyncKafkaConsumer()
+    ~AsyncKafkaConsumerOne()
     {
         stop_ = true;
-        // 等待线程池中的所有任务完成
         for (const auto consumer : consumers_)
         {
             rd_kafka_consumer_close(consumer);
             rd_kafka_flush(consumer, 1000);
             rd_kafka_destroy(consumer);
         }
-        LOG_INFO << "AsyncKafkaConsumer consumer stopped.";
+        LOG_INFO << "AsyncKafkaConsumerOne consumer stopped.";
     }
 
 private:
@@ -57,7 +46,7 @@ private:
         // 创建一个新的 topic partition list
         rd_kafka_topic_partition_list_t *partitions = rd_kafka_topic_partition_list_new(1);
         // 向列表中添加主题和分区
-        rd_kafka_topic_partition_list_add(partitions, "message_topic", RD_KAFKA_PARTITION_UA);
+        rd_kafka_topic_partition_list_add(partitions, "message_topic_one", RD_KAFKA_PARTITION_UA);
         // 订阅主题
         const rd_kafka_resp_err_t err = rd_kafka_subscribe(consumer_, partitions);
         // 销毁 topic partition list
@@ -65,7 +54,7 @@ private:
 
         if (err != RD_KAFKA_RESP_ERR_NO_ERROR)
         {
-            LOG_ERROR << "AsyncKafkaConsumer Failed to subscribe to topic: " << rd_kafka_err2str(err);
+            LOG_ERROR << "Failed to subscribe to topic: " << rd_kafka_err2str(err);
             return;
         }
         while (!stop_)
@@ -81,11 +70,11 @@ private:
                             if (msg->err == RD_KAFKA_RESP_ERR__PARTITION_EOF)
                             {
                                 // 当前分区的消息已经消费完毕
-                                LOG_ERROR << "AsyncKafkaConsumer EReached end of partition.";
+                                LOG_ERROR << "AsyncKafkaConsumerOne EReached end of partition.";
                             }
                             else
                             {
-                                LOG_ERROR << "AsyncKafkaConsumer Error consuming message: " <<  rd_kafka_err2str(msg->err);
+                                LOG_ERROR << "AsyncKafkaConsumerOne Error consuming message: " <<  rd_kafka_err2str(msg->err);
                             }
                             rd_kafka_message_destroy(msg); // 释放消息资源
                             co_return;
@@ -101,7 +90,7 @@ private:
                     }
                     catch (const std::exception& ex)
                     {
-                        LOG_ERROR << "AsyncKafkaConsumer Exception while processing message: " << ex.what();
+                        LOG_ERROR << "AsyncKafkaConsumerOne Exception while processing message: " << ex.what();
                     }
                     rd_kafka_message_destroy(msg); // 释放消息资源
                 });
@@ -112,13 +101,13 @@ private:
     // 将处理 Kafka 消息的逻辑封装为协程
     static Task<> handleKafkaMessage(const std::string& message) {
         try {
-            LOG_INFO << "AsyncKafkaConsumer 收到消息 Received message: " << message;
+            LOG_INFO << "AsyncKafkaConsumerOne 收到消息 Received message: " << message;
         } catch (const std::exception& ex) {
             throw std::invalid_argument(ex.what());
         }
         co_return;
     }
 
-    std::vector<rd_kafka_t*> consumers_; // Kafka 消费者实例
-    std::atomic<bool> stop_{false}; // 控制消费线程的停止
+    std::vector<rd_kafka_t*> consumers_;
+    std::atomic<bool> stop_{false};
 };

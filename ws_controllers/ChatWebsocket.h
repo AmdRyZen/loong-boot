@@ -42,7 +42,7 @@ private:
 
         // 根据用户名发送定制消息
         std::lock_guard<std::mutex> guard(mutex_);
-        const auto producer = rd_kafka_topic_new(KafkaManager::instance().getProducer(), "message_topic", nullptr);
+        const auto producer = rd_kafka_topic_new(KafkaManager::instance().getProducer(), "message_topic_one", nullptr);
         for (const auto &wsConnPtr : connections_)
         {
             if (wsConnPtr->connected())
@@ -53,7 +53,6 @@ private:
                 messageVo.id = 0;
                 messageVo.name = userName;
                 messageVo.message = std::format("{} 心跳检测 正常 这是定制消息", userName);
-                // BEVE
                 std::string buffer{};
                 (void) glz::write_json(messageVo, buffer);
                 wsConnPtr->send(buffer);

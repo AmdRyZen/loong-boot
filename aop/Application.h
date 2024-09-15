@@ -15,6 +15,7 @@
 #include <boost/format.hpp>
 #include "../kafkaManager/kafkaManager.h"
 #include "kafkaManager/AsyncKafkaConsumer.h"
+#include "kafkaManager/AsyncKafkaConsumerOne.h"
 #include "mqttManager/MqttManager.h"
 #include "mqttManager/MqttConsumer.h"
 
@@ -22,6 +23,7 @@ inline TrieService trieService;
 
 inline ThreadPool pool(2);
 inline ThreadPool poolKafka(2);
+inline ThreadPool poolKafkaOne(2);
 inline ThreadPool poolMqtt(2);
 
 namespace App {
@@ -126,8 +128,10 @@ Application::Application()
         // 创建一个消费者实例
         static AsyncKafkaConsumer asyncKafkaConsumer;
 
+        static AsyncKafkaConsumerOne asyncKafkaConsumerOne;
+
         // 初始化 MqttManager 并连接到 MQTT broker  mosquitto/emqx start
-        MqttManager::instance().initialize("tcp://localhost:1883", "client_id");
+        MqttManager::instance().initialize(app().getCustomConfig()["mqtt_manager"]["servers"].asString(), app().getCustomConfig()["mqtt_manager"]["client_id"].asString());
 
         // 创建并启动消费者实例
         static MqttConsumer mqttConsumer;

@@ -126,6 +126,10 @@
     "jwt-sessionTime": 864000,
     "kafka_manager": {
       "bootstrap.servers": "localhost:9092,localhost:9092"
+    },
+    "mqtt_manager": {
+      "servers" : "tcp://localhost:1883",
+      "client_id" : "client_id"
     }
   }
 }

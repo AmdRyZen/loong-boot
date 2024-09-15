@@ -20,7 +20,8 @@ public:
     void initialize(const std::string& serverAddress, const std::string& clientId) {
         client_ = new mqtt::async_client(serverAddress, clientId);
         mqtt::connect_options connOpts;
-        connOpts.set_clean_session(true);
+        connOpts.set_keep_alive_interval(20);  // 设置保活间隔为 20 秒
+        connOpts.set_clean_session(true);    // 清理会话
 
         try {
             client_->connect(connOpts)->wait();
@@ -34,6 +35,7 @@ public:
         if (client_) {
             const auto msg = mqtt::make_message(topic, message);
             msg->set_qos(1);
+            msg->set_retained(false); // false：消息不被服务器保留，只有当前订阅者会收到。
             client_->publish(msg)->wait();
         } else {
             LOG_ERROR << "MQTT client is not initialized.";

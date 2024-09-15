@@ -141,6 +141,7 @@ set(MODEL_SOURCES_COMMON
         base/base.h
         mqttManager/MqttManager.h
         mqttManager/MqttConsumer.h
+        kafkaManager/AsyncKafkaConsumerOne.h
 )
 
 add_executable(
@@ -213,6 +214,7 @@ find_package(mimalloc 2.1.7 REQUIRED)
 find_package(Boost 1.86.0 REQUIRED)
 find_package(PahoMqttCpp REQUIRED)
 target_link_libraries(${PROJECT_NAME} PRIVATE Drogon::Drogon Boost::boost glaze::glaze rdkafka PahoMqttCpp::paho-mqttpp3 mimalloc proto_gen_cxx)
+target_compile_definitions(${PROJECT_NAME} PRIVATE MI_MALLOC=1)
 
 # ##############################################################################
 
