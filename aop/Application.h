@@ -131,10 +131,10 @@ Application::Application()
         static AsyncKafkaConsumerOne asyncKafkaConsumerOne;
 
         // 初始化 MqttManager 并连接到 MQTT broker  mosquitto/emqx start
-        MqttManager::instance().initialize(app().getCustomConfig()["mqtt_manager"]["servers"].asString(), app().getCustomConfig()["mqtt_manager"]["client_id"].asString());
+        //MqttManager::instance().initialize(app().getCustomConfig()["mqtt_manager"]["servers"].asString(), app().getCustomConfig()["mqtt_manager"]["client_id"].asString());
 
         // 创建并启动消费者实例
-        static MqttConsumer mqttConsumer;
+        //static MqttConsumer mqttConsumer;
     }
     catch (const std::exception &e)
     {

@@ -495,7 +495,7 @@ Task<> OpenApi::fastJson(const HttpRequestPtr req, std::function<void(const Http
     GOOGLE_PROTOBUF_VERIFY_VERSION;
     std::cout << "Protocol Buffers version: " << GOOGLE_PROTOBUF_VERSION << std::endl;
 
-    auto t1 = std::chrono::steady_clock::now();
+    /*auto t1 = std::chrono::steady_clock::now();
     for (auto i = 0; i < 1000; i++)
     {
         // protobuf
@@ -511,10 +511,10 @@ Task<> OpenApi::fastJson(const HttpRequestPtr req, std::function<void(const Http
     //微妙级
     double dr_us = std::chrono::duration<double, std::micro>(t2 - t1).count();
     std::cout << "[pb cost: " << dr_ns << " ns]" << std::endl;
-    std::cout << "[pb cost: " << dr_us << " us]" << std::endl;
+    std::cout << "[pb cost: " << dr_us << " us]" << std::endl;*/
 
     //------------------解析----------------------
-    dto::UserData rsp2{};
+    /*dto::UserData rsp2{};
     if (!rsp2.ParseFromString(buffer))
     {
         std::cout << "parse error\n";
@@ -522,7 +522,7 @@ Task<> OpenApi::fastJson(const HttpRequestPtr req, std::function<void(const Http
     auto name = rsp2.name();
     // 清理 Protobuf 库
     google::protobuf::ShutdownProtobufLibrary();
-    std::cout << "name:" << name << std::endl;
+    std::cout << "name:" << name << std::endl;*/
 
     // jsoncpp
     const auto t3 = std::chrono::steady_clock::now();
@@ -592,29 +592,29 @@ Task<> OpenApi::fastJson(const HttpRequestPtr req, std::function<void(const Http
     //co_return callback(Base<MyStruct>::createHttpSuccessResponse(StatusOK, Success, my_struct));
 
     // protobuf
-    dto::UserData protobufResponse;
+    /*dto::UserData protobufResponse;
     if (!protobufResponse.ParseFromString(std::string(req->getBody())))
     {
         LOG_ERROR << "---------------ParseFromString error-----------------";
-    }
+    }*/
 
     /*protobufResponse.set_id("200");
     protobufResponse.set_name("Hello, this is a Protobuf response");
     protobufResponse.set_message("我草");*/
 
     // 序列化到字符串
-    std::string output;
+    /*std::string output;
     if (!protobufResponse.SerializeToString(&output)) {
         LOG_ERROR << "Failed to serialize message.";
     }
     // 将序列化后的数据写入文件
     std::ofstream ofs("message.bin", std::ios::binary);
     ofs.write(output.data(), static_cast<std::streamsize>(output.size()));
-    ofs.close();
+    ofs.close();*/
 
     LOG_INFO << "Binary file generated successfully.";
 
-    co_return callback(Base<dto::UserData>::createHttpProtobufSuccessResponse(StatusOK, Success, protobufResponse));
+    co_return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
 }
 
 std::atomic<int64_t> value(0);

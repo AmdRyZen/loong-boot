@@ -7,8 +7,8 @@ else()
     message(STATUS "CMake version does not support policy CMP0167")
 endif()
 
-SET(CMAKE_C_COMPILER "/opt/homebrew/Cellar/gcc/14.2.0/bin/gcc-14")
-SET(CMAKE_CXX_COMPILER "/opt/homebrew/Cellar/gcc/14.2.0/bin/g++-14")
+SET(CMAKE_C_COMPILER "/opt/homebrew/Cellar/gcc/14.2.0_1/bin/gcc-14")
+SET(CMAKE_CXX_COMPILER "/opt/homebrew/Cellar/gcc/14.2.0_1/bin/g++-14")
 
 project(loong-boot C CXX)
 

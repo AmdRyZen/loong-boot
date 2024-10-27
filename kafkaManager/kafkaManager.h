@@ -64,6 +64,8 @@ public:
             // 创建消费者
             consumer_conf_ = rd_kafka_conf_new();
 
+            rd_kafka_conf_set(consumer_conf_, "socket_cb", nullptr, nullptr, 0);
+
             // enable.auto.commit: 自动提交偏移量的开关。生产环境中通常建议手动提交，以更好地控制偏移量的提交。
             rd_kafka_conf_set(consumer_conf_, "enable.auto.commit", "false", nullptr, 0);
 
