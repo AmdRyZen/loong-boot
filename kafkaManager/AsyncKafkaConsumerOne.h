@@ -17,7 +17,11 @@ public:
                 rd_kafka_t* consumer = KafkaManager::instance().createNewConsumer();
                 consumers_.push_back(consumer);
                 poolKafkaOne.setThreadCount(4);
-                poolKafkaOne.enqueue(&AsyncKafkaConsumerOne::consumeMessages, this, consumer);
+                //poolKafkaOne.enqueue(&AsyncKafkaConsumerOne::consumeMessages, this, consumer);
+                // 替换为 lambda 更安全、现代
+                poolKafka.enqueue([this, consumer]() {
+                    this->consumeMessages(consumer);
+                });
 
             } catch (const std::exception &ex)
             {

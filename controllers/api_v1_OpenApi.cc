@@ -20,7 +20,7 @@
 #include <glaze/glaze.hpp>
 #include "base/base.h"
 #include "base/vo/data_vo.h"
-#include "mqttManager/MqttManager.h"
+//#include "mqttManager/MqttManager.h"
 
 #if defined(__arm__) || defined(__aarch64__)
     #include <arm_neon.h>
@@ -41,7 +41,7 @@ using namespace rapidjson;
 Task<> OpenApi::mqtt(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
 {
     // 发布消息
-    MqttManager::instance().publish("topic", "Hello, MQTT!");
+    //MqttManager::instance().publish("topic", "Hello, MQTT!");
 
     co_return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
 }

@@ -26,7 +26,11 @@ public:
                 // 创建并启动 Kafka 消费线程
                 //consumerThreads_.emplace_back(&AsyncKafkaConsumer::consumeMessages, this, consumer);
                 poolKafka.setThreadCount(4);
-                poolKafka.enqueue(&AsyncKafkaConsumer::consumeMessages, this, consumer);
+                //poolKafka.enqueue(&AsyncKafkaConsumer::consumeMessages, this, consumer);
+                // 替换为 lambda 更安全、现代
+                poolKafka.enqueue([this, consumer]() {
+                    this->consumeMessages(consumer);
+                });
             }
             LOG_INFO << "AsyncKafkaConsumer consumer started.";
         }
