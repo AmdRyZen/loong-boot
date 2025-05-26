@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.29)
+cmake_minimum_required(VERSION 3.31)
 
 # 检查 CMake 版本，并根据版本设置政策
 if(POLICY CMP0167)
@@ -7,8 +7,8 @@ else()
     message(STATUS "CMake version does not support policy CMP0167")
 endif()
 
-SET(CMAKE_C_COMPILER "/opt/homebrew/Cellar/gcc/14.2.0_1/bin/gcc-14")
-SET(CMAKE_CXX_COMPILER "/opt/homebrew/Cellar/gcc/14.2.0_1/bin/g++-14")
+SET(CMAKE_C_COMPILER "/opt/homebrew/Cellar/gcc/15.1.0/bin/gcc-15")
+SET(CMAKE_CXX_COMPILER "/opt/homebrew/Cellar/gcc/15.1.0/bin/g++-15")
 
 project(loong-boot C CXX)
 
@@ -134,7 +134,7 @@ set(MODEL_SOURCES_VO
 set(MODEL_SOURCES_COMMON
         aop/Application.h
         threadPool/threadPool.h utils/checkloginUtils.h
-        filters/LoginFilter.h utils/printer.h utils/opensslCrypto.h
+        filters/LoginFilter.h utils/opensslCrypto.h
         filters/SqlFilter.h
         kafkaManager/kafkaManager.h
         kafkaManager/AsyncKafkaConsumer.h

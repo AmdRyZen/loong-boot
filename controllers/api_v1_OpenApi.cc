@@ -9,19 +9,15 @@
 #include <taskflow/taskflow.hpp>  // Taskflow is header-only
 #include "boost/version.hpp"
 #include "boost/regex.hpp"
-#include "utils/printer.h"
 #include <boost/random/mersenne_twister.hpp>
 #include <boost/random/uniform_int_distribution.hpp>
 #include <boost/date_time/gregorian/gregorian.hpp>
 #include <boost/format.hpp>
 #include "utils/opensslCrypto.h"
 #include <boost/multiprecision/cpp_dec_float.hpp>
-#include <openssl/evp.h>
-#include <openssl/buffer.h>
 #include <boost/uuid/uuid_io.hpp>
 #include <execution> // 可能需要此头文件
 #include <glaze/glaze.hpp>
-#include "user.pb.h"
 #include "base/base.h"
 #include "base/vo/data_vo.h"
 #include "mqttManager/MqttManager.h"
@@ -48,17 +44,6 @@ Task<> OpenApi::mqtt(const HttpRequestPtr req, std::function<void(const HttpResp
     MqttManager::instance().publish("topic", "Hello, MQTT!");
 
     co_return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
-}
-
-void printerFunc()
-{
-    std::this_thread::sleep_for(std::chrono::seconds(2));
-    // 创建io_service对象
-    io_service io;
-    // 创建printer对象，初始化定时器并启动异步等待操作
-    printer p(io, 5);
-    // 运行io_service对象，处理所有事件（包括回调函数）
-    io.run();
 }
 
 struct Task23
