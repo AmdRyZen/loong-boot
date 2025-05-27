@@ -8,27 +8,32 @@ using namespace drogon;
 class AsyncKafkaConsumerOne
 {
 public:
-    explicit AsyncKafkaConsumerOne(const size_t nemThreads = 4) : stop_(false)
+    explicit AsyncKafkaConsumerOne(const size_t numThreads = 4) : stop_(false)
     {
-        for (size_t i = 0; i < nemThreads; i++)
+        try
         {
-            try
+            // 启动多个后台线程来异步消费消息
+            for (size_t i = 0; i < numThreads; ++i)
             {
+                // 为每个线程创建独立的 Kafka 消费者实例
                 rd_kafka_t* consumer = KafkaManager::instance().createNewConsumer();
                 consumers_.push_back(consumer);
-                poolKafkaOne.setThreadCount(4);
-                //poolKafkaOne.enqueue(&AsyncKafkaConsumerOne::consumeMessages, this, consumer);
+                // 创建并启动 Kafka 消费线程
+                //consumerThreads_.emplace_back(&AsyncKafkaConsumer::consumeMessages, this, consumer);
+                poolKafka.setThreadCount(4);
+                //poolKafka.enqueue(&AsyncKafkaConsumer::consumeMessages, this, consumer);
                 // 替换为 lambda 更安全、现代
                 poolKafka.enqueue([this, consumer]() {
                     this->consumeMessages(consumer);
                 });
-
-            } catch (const std::exception &ex)
-            {
-                LOG_ERROR << "AsyncKafkaConsumerOne Exception in constructor: " << ex.what();
             }
+            LOG_INFO << "AsyncKafkaConsumerOne consumer started.";
         }
-        LOG_INFO << "AsyncKafkaConsumerOne consumer started.";
+        catch (const std::exception& e)
+        {
+            LOG_ERROR << "AsyncKafkaConsumerOne Exception in constructor: " << e.what();
+            // 可能需要进一步处理异常，例如重新尝试初始化
+        }
     }
 
     ~AsyncKafkaConsumerOne()

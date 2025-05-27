@@ -20,6 +20,11 @@ public:
         return instance;
     }
 
+    // 定义 socket_cb 函数
+    static int socket_cb_default(int domain, int type, int protocol, void* opaque) {
+        return socket(domain, type, protocol); // 使用标准 socket() 调用
+    }
+
     void initialize(const std::string &brokers)
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -64,7 +69,11 @@ public:
             // 创建消费者
             consumer_conf_ = rd_kafka_conf_new();
 
-            rd_kafka_conf_set(consumer_conf_, "socket_cb", nullptr, nullptr, 0);
+            // 设置套接字回调
+            // 设置 socket_cb
+            rd_kafka_conf_set_socket_cb(consumer_conf_, socket_cb_default);
+
+            //rd_kafka_conf_set(consumer_conf_, "socket_cb", nullptr, nullptr, 0);
 
             // enable.auto.commit: 自动提交偏移量的开关。生产环境中通常建议手动提交，以更好地控制偏移量的提交。
             rd_kafka_conf_set(consumer_conf_, "enable.auto.commit", "false", nullptr, 0);

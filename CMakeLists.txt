@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.31)
+cmake_minimum_required(VERSION 3.31.6)
 
 # 检查 CMake 版本，并根据版本设置政策
 if(POLICY CMP0167)
@@ -22,12 +22,12 @@ check_include_file_cxx(coroutine HAS_COROUTINE)
 if (NOT "${CMAKE_CXX_STANDARD}" STREQUAL "")
     # Do nothing
 elseif (HAS_ANY AND HAS_STRING_VIEW AND HAS_COROUTINE)
-    set(CMAKE_CXX_STANDARD 23)
+    set(CMAKE_CXX_STANDARD 26)
 
 elseif (HAS_ANY AND HAS_STRING_VIEW)
-    set(CMAKE_CXX_STANDARD 23)
+    set(CMAKE_CXX_STANDARD 26)
 else ()
-    set(CMAKE_CXX_STANDARD 23)
+    set(CMAKE_CXX_STANDARD 26)
 endif ()
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
@@ -178,7 +178,8 @@ FetchContent_MakeAvailable(glaze)
 FetchContent_Declare(
         librdkafka
         GIT_REPOSITORY https://github.com/confluentinc/librdkafka.git
-        GIT_TAG master
+        #GIT_TAG master
+        GIT_TAG v2.10.0  # 使用稳定版本而非 master，master 可能不稳定
         GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(librdkafka)
