@@ -14,170 +14,125 @@
 class KafkaManager
 {
 public:
-    static KafkaManager &instance()
+    // 获取单例实例
+    static KafkaManager& instance()
     {
-        static KafkaManager instance;
-        return instance;
+        static KafkaManager mgr;
+        return mgr;
     }
 
-    // 定义 socket_cb 函数
-    static int socket_cb_default(int domain, int type, int protocol, void* opaque) {
-        return socket(domain, type, protocol); // 使用标准 socket() 调用
+    // 初始化配置（必须先调用一次）
+    void initialize(const std::string& brokers, const std::string& groupId = "default_group")
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (initialized_)
+            return;
+
+        char errStr[512];
+
+        // 生产者配置
+        producer_conf_ = rd_kafka_conf_new();
+
+        if (rd_kafka_conf_set(producer_conf_, "bootstrap.servers", brokers.c_str(), errStr, sizeof(errStr)) != RD_KAFKA_CONF_OK)
+            throw std::runtime_error(std::string("Producer bootstrap.servers config error: ") + errStr);
+
+        // 这里可以根据需要添加生产者更多配置...
+
+        producer_ = rd_kafka_new(RD_KAFKA_PRODUCER, producer_conf_, errStr, sizeof(errStr));
+        if (!producer_)
+            throw std::runtime_error(std::string("Failed to create Kafka producer: ") + errStr);
+
+        // 消费者配置
+        consumer_conf_ = rd_kafka_conf_new();
+
+        // 设置 brokers
+        if (rd_kafka_conf_set(consumer_conf_, "bootstrap.servers", brokers.c_str(), errStr, sizeof(errStr)) != RD_KAFKA_CONF_OK)
+            throw std::runtime_error(std::string("Consumer bootstrap.servers config error: ") + errStr);
+
+        // 设置消费者组ID
+        if (rd_kafka_conf_set(consumer_conf_, "group.id", groupId.c_str(), errStr, sizeof(errStr)) != RD_KAFKA_CONF_OK)
+            throw std::runtime_error(std::string("Consumer group.id config error: ") + errStr);
+
+        // 关闭自动提交，改为手动提交
+        if (rd_kafka_conf_set(consumer_conf_, "enable.auto.commit", "false", errStr, sizeof(errStr)) != RD_KAFKA_CONF_OK)
+            throw std::runtime_error(std::string("Consumer enable.auto.commit config error: ") + errStr);
+
+        // 消费者超时等常用配置
+        rd_kafka_conf_set(consumer_conf_, "auto.offset.reset", "earliest", nullptr, 0);
+        rd_kafka_conf_set(consumer_conf_, "session.timeout.ms", "60000", nullptr, 0);
+        rd_kafka_conf_set(consumer_conf_, "heartbeat.interval.ms", "3000", nullptr, 0);
+
+        // 注意：不设置 socket_cb，采用轮询模式
+
+        initialized_ = true;
+
+        std::cout << "KafkaManager initialized with brokers: " << brokers << std::endl;
     }
 
-    void initialize(const std::string &brokers)
+    // 获取单例生产者实例
+    rd_kafka_t* getProducer() const
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!initialized_)
-        {
-            // 创建生产者
-            producer_conf_ = rd_kafka_conf_new();
-
-            // 	request.timeout.ms: 请求超时。客户端在等待响应时的最大时间。设置为 30s 或更长时间。
-            rd_kafka_conf_set(producer_conf_, "request.timeout.ms", "30000", nullptr, 0);
-
-            // offset.commit.interval.ms: 手动提交偏移量的时间间隔，通常设置为 60s。
-            rd_kafka_conf_set(producer_conf_, "offset.commit.interval.ms", "60000", nullptr, 0);
-
-            // acks: 确定生产者写入操作的确认级别。all 表示所有副本都确认写入后才算成功。
-            rd_kafka_conf_set(producer_conf_, "acks", "all", nullptr, 0);
-
-            // linger.ms: 生产者在发送消息前等待的时间，以便聚集更多的消息。默认值通常为 0，生产环境中可以根据需求调整，建议设置为 5ms 到 100ms 之间。
-            rd_kafka_conf_set(producer_conf_, "linger.ms", "10", nullptr, 0);
-
-            // batch.size: 批量大小。生产者在发送消息时将消息聚集在一起的大小。通常设置为 16KB 到 64KB。
-            rd_kafka_conf_set(producer_conf_, "batch.size", "16384", nullptr, 0);
-
-            // log.level: Kafka 客户端的日志级别。info 或 debug 级别可以帮助调试问题，但生产环境中可能需要设置为 warn 或 error 以减少日志量。
-            rd_kafka_conf_set(producer_conf_, "log.level", "info", nullptr, 0);
-
-            // log.connection.close: 是否记录连接关闭日志。
-            rd_kafka_conf_set(producer_conf_, "log.connection.close", "false", nullptr, 0);
-
-            // 	bootstrap.servers: 指定 Kafka 集群的地址。
-            if (rd_kafka_conf_set(producer_conf_, "bootstrap.servers", brokers.c_str(), err_str_, sizeof(err_str_)) != RD_KAFKA_CONF_OK)
-            {
-                throw std::runtime_error(std::string("Failed to configure Kafka broker: ") + err_str_);
-            }
-
-            producer_ = rd_kafka_new(RD_KAFKA_PRODUCER, producer_conf_, err_str_, sizeof(err_str_));
-            if (!producer_)
-            {
-                throw std::runtime_error(std::string("Failed to create Kafka producer: ") + err_str_);
-            }
-
-            // 创建消费者
-            consumer_conf_ = rd_kafka_conf_new();
-
-            // 设置套接字回调
-            // 设置 socket_cb
-            rd_kafka_conf_set_socket_cb(consumer_conf_, socket_cb_default);
-
-            //rd_kafka_conf_set(consumer_conf_, "socket_cb", nullptr, nullptr, 0);
-
-            // enable.auto.commit: 自动提交偏移量的开关。生产环境中通常建议手动提交，以更好地控制偏移量的提交。
-            rd_kafka_conf_set(consumer_conf_, "enable.auto.commit", "false", nullptr, 0);
-
-            // auto.commit.interval.ms: 自动提交偏移量的时间间隔。如果 enable.auto.commit 设置为 true，则此配置项生效。
-            rd_kafka_conf_set(consumer_conf_, "auto.commit.interval.ms", "5000", nullptr, 0);
-
-            // 	session.timeout.ms: 消费者组会话超时。消费者在多长时间没有发送心跳时，协调器会将其从组中移除。生产环境中通常设置为 60s 或更长。
-            rd_kafka_conf_set(consumer_conf_, "session.timeout.ms", "60000", nullptr, 0);
-
-            // heartbeat.interval.ms: 心跳间隔。消费者发送心跳的频率。建议设置为 session.timeout.ms 的一半或更少，例如 3s。
-            rd_kafka_conf_set(consumer_conf_, "heartbeat.interval.ms", "3000", nullptr, 0);
-
-            // auto.offset.reset: 指定当没有初始偏移量时应该如何开始消费。earliest 表示从最早的消息开始。
-            rd_kafka_conf_set(consumer_conf_, "auto.offset.reset", "earliest", nullptr, 0);
-
-            // max.poll.records：控制每次拉取的记录数量。增加此值可以减少拉取请求的次数，但可能增加每次处理的负担：
-            rd_kafka_conf_set(consumer_conf_, "max.poll.records", "1000", nullptr, 0);
-
-            // fetch.min.bytes 和 fetch.max.wait.ms：这些配置影响消息的拉取频率和批量大小。可以尝试调整这些配置来优化性能：
-            rd_kafka_conf_set(consumer_conf_, "fetch.min.bytes", "4096", nullptr, 0);
-            rd_kafka_conf_set(consumer_conf_, "fetch.max.wait.ms", "200", nullptr, 0);
-
-            if (rd_kafka_conf_set(consumer_conf_, "bootstrap.servers", brokers.c_str(), err_str_, sizeof(err_str_)) != RD_KAFKA_CONF_OK)
-            {
-                throw std::runtime_error(std::string("Failed to configure Kafka consumer: ") + err_str_);
-            }
-
-            if (rd_kafka_conf_set(consumer_conf_, "group.id", "my_consumer_group", err_str_, sizeof(err_str_)) != RD_KAFKA_CONF_OK)
-            {
-                throw std::runtime_error(std::string("Failed to configure Kafka group ID: ") + err_str_);
-            }
-
-            consumer_ = rd_kafka_new(RD_KAFKA_CONSUMER, consumer_conf_, err_str_, sizeof(err_str_));
-            if (!consumer_)
-            {
-                throw std::runtime_error(std::string("Failed to create Kafka consumer: ") + err_str_);
-            }
-
-            initialized_ = true;
-        }
-    }
-
-    rd_kafka_t *getProducer() const
-    {
-        if (!initialized_)
-        {
-            throw std::runtime_error("KafkaManager is not initialized");
-        }
+            throw std::runtime_error("KafkaManager not initialized");
         return producer_;
     }
 
-    rd_kafka_t *getConsumer() const
-    {
-        if (!initialized_)
-        {
-            throw std::runtime_error("KafkaManager is not initialized");
-        }
-        return consumer_;
-    }
-
-    // 创建新消费者：为了支持每个线程创建独立的消费者
-    rd_kafka_t* createNewConsumer()
+    // 创建一个新的消费者实例（线程安全）
+    rd_kafka_t* createNewConsumer() const
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!initialized_)
-        {
-            throw std::runtime_error("KafkaManager is not initialized");
-        }
+            throw std::runtime_error("KafkaManager not initialized");
 
-        // 创建新的消费者实例
-        rd_kafka_t *consumer = rd_kafka_new(RD_KAFKA_CONSUMER, consumer_conf_, err_str_, sizeof(err_str_));
+        char errStr[512];
+        rd_kafka_conf_t* confCopy = rd_kafka_conf_dup(consumer_conf_);
+
+        rd_kafka_t* consumer = rd_kafka_new(RD_KAFKA_CONSUMER, confCopy, errStr, sizeof(errStr));
         if (!consumer)
         {
-            throw std::runtime_error(std::string("Failed to create Kafka consumer: ") + err_str_);
+            rd_kafka_conf_destroy(confCopy); // 确保清理副本
+            throw std::runtime_error(std::string("Failed to create Kafka consumer: ") + errStr);
         }
 
         return consumer;
     }
 
+    // 禁止拷贝和赋值
+    KafkaManager(const KafkaManager&) = delete;
+    KafkaManager& operator=(const KafkaManager&) = delete;
+
 private:
-    KafkaManager() = default;
+    KafkaManager() : producer_conf_(nullptr), producer_(nullptr), consumer_conf_(nullptr), initialized_(false) {}
     ~KafkaManager()
     {
+        std::lock_guard<std::mutex> lock(mutex_);
         if (producer_)
         {
-            rd_kafka_flush(producer_,  1000); // 等待消息传输完成
+            rd_kafka_flush(producer_, 1000);
             rd_kafka_destroy(producer_);
         }
-        if (consumer_)
+        if (consumer_conf_)
         {
-            rd_kafka_consumer_close(consumer_);
-            rd_kafka_flush(consumer_, 1000); // 等待消息传输完成
-            rd_kafka_destroy(consumer_);
+            rd_kafka_conf_destroy(consumer_conf_);
+            consumer_conf_ = nullptr;
         }
+        if (producer_conf_)
+        {
+            rd_kafka_conf_destroy(producer_conf_);
+            producer_conf_ = nullptr;
+        }
+        // 注意每个创建的 consumer 由调用者管理销毁
     }
 
     mutable std::mutex mutex_;
-    rd_kafka_conf_t *producer_conf_ = nullptr;
-    rd_kafka_t *producer_ = nullptr;
-    rd_kafka_conf_t *consumer_conf_ = nullptr;
-    rd_kafka_t *consumer_ = nullptr;
-    char err_str_[512] = {};
-    bool initialized_ = false;
+
+    rd_kafka_conf_t* producer_conf_;
+    rd_kafka_t* producer_;
+
+    rd_kafka_conf_t* consumer_conf_;
+
+    bool initialized_;
 };
 
 #endif //KAFKAMANAGER_H

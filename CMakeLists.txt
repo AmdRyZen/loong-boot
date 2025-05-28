@@ -217,6 +217,12 @@ find_package(Boost 1.86.0 REQUIRED)
 target_link_libraries(${PROJECT_NAME} PRIVATE Drogon::Drogon Boost::boost glaze::glaze rdkafka #[[PahoMqttCpp::paho-mqttpp3]] mimalloc proto_gen_cxx)
 target_compile_definitions(${PROJECT_NAME} PRIVATE MI_MALLOC=1)
 
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+    set(CMAKE_C_COMPILER_LAUNCHER ${CCACHE_PROGRAM})
+    set(CMAKE_CXX_COMPILER_LAUNCHER ${CCACHE_PROGRAM})
+endif()
+
 # ##############################################################################
 
 if (CMAKE_CXX_STANDARD LESS 17)

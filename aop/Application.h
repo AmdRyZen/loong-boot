@@ -126,9 +126,24 @@ Application::Application()
         KafkaManager::instance().initialize(brokers);
 
         // 创建一个消费者实例
-        static AsyncKafkaConsumer asyncKafkaConsumer;
+        // ✅ 正确创建 AsyncKafkaConsumer
+        static AsyncKafkaConsumer asyncKafkaConsumer(
+            {"message_topic"},  // topic list
+            [](const std::string &msg) -> drogon::Task<> {
+                LOG_INFO << "message_topic msg: " << msg;
+                co_return;
+            },
+            4 // 可调线程数
+        );
 
-        static AsyncKafkaConsumerOne asyncKafkaConsumerOne;
+        static AsyncKafkaConsumerOne asyncKafkaConsumerOne(
+            {"message_topic_one"},  // topic list
+            [](const std::string &msg) -> drogon::Task<> {
+                LOG_INFO << "message_topic_one msg: " << msg;
+                co_return;
+            },
+            4 // 可调线程数
+        );
 
         // 初始化 MqttManager 并连接到 MQTT broker  mosquitto/emqx start
         //MqttManager::instance().initialize(app().getCustomConfig()["mqtt_manager"]["servers"].asString(), app().getCustomConfig()["mqtt_manager"]["client_id"].asString());
