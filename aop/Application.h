@@ -16,8 +16,6 @@
 #include "../kafkaManager/kafkaManager.h"
 #include "kafkaManager/AsyncKafkaConsumer.h"
 #include "kafkaManager/AsyncKafkaConsumerOne.h"
-#include "mqttManager/MqttManager.h"
-#include "mqttManager/MqttConsumer.h"
 
 inline TrieService trieService;
 

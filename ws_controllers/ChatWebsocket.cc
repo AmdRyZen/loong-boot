@@ -3,199 +3,230 @@
 #include "user.pb.h"
 #include <glaze/glaze.hpp>
 #include "../kafkaManager/kafkaManager.h"
+#include <drogon/HttpAppFramework.h>
+#include <chrono>
+
 
 struct Subscriber
 {
-    std::string chatRoomName_;
+    std::string topic_;
     SubscriberID id_{};
 };
 
-void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConnPtr, std::string&& message, const WebSocketMessageType& type)
+auto delay(std::chrono::milliseconds duration)
+{
+    struct Awaiter
+    {
+        std::chrono::duration<double> seconds_;
+        [[nodiscard]] bool await_ready() const noexcept { return seconds_.count() <= 0; }
+        void await_suspend(std::coroutine_handle<> handle) const
+        {
+            HttpAppFramework::instance().getLoop()->runAfter(seconds_.count(), [handle]() {
+                handle.resume();
+            });
+        }
+        // NOLINT(clang-analyzer-core.CallAndMessage) // await_resume 不能是 static
+        void await_resume() const noexcept {}  // CLion 会提示“可以设为 static”，但不能设
+    };
+    return Awaiter{std::chrono::duration_cast<std::chrono::duration<double>>(duration)};
+}
+
+void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::string&& msg, const WebSocketMessageType& type)
 {
     try
     {
         if (type == WebSocketMessageType::Ping)
         {
-            wsConnPtr->send("pong", WebSocketMessageType::Pong);
-            LOG_DEBUG << "recv a ping";
+            wsConn->send("pong_ms", WebSocketMessageType::Pong);
+            LOG_DEBUG << "Received a ping";
             return;
         }
 
-        if (!message.empty())
+        if (!msg.empty())
         {
-            chatMessageDto messageDto{};
-            chatMessageVo errMessageVo{};
-
-            if (glz::read_json(messageDto, message))
+            chatMessageDto msg_dto{};
+            if (glz::read_json(msg_dto, msg))
             {
-                std::string buffer{};
-                (void) glz::write_json(errMessageVo, buffer);
-                wsConnPtr->send(buffer, WebSocketMessageType::Text);
+                chatMessageVo err_msg{};
+                std::string json{};
+                (void)glz::write_json(err_msg, json);
+                wsConn->send(json, WebSocketMessageType::Text);
+                LOG_ERROR << "Failed to parse JSON message";
                 return;
             }
 
-            // 在处理用户退出时检查连接状态
-            if (!wsConnPtr->disconnected())
+            if (!wsConn->disconnected())
             {
-                const auto& subscriber = wsConnPtr->getContextRef<Subscriber>();
-                const auto& [chatRoomName, id] = subscriber;
+                const auto& subscriber = wsConn->getContextRef<Subscriber>();
+                const auto& [topic, id] = subscriber;
 
-                //auto sharedThis = shared_from_this();
-                async_run([messageDto, chatRoomName, id, this]() -> Task<>
+                async_run([msg_dto, topic, id, this]() -> Task<>
                 {
                     try
                     {
                         std::string data{};
-                        if (!messageDto.key.empty())
+                        if (!msg_dto.key.empty())
                         {
-                            data = co_await redisUtils::getCoroRedisValue(std::format("get {}",  messageDto.key));
+                            //data = co_await redisUtils::getCoroRedisValue(std::format("get {}", msg_dto.key));
+                            data = "xxxxxx";
                         }
 
-                        if (!messageDto.action.empty())
+                        if (!msg_dto.action.empty() && msg_dto.action == "message")
                         {
-                            if (messageDto.action == "message")
+                            std::string json{};
+                            chatMessageVo msg_vo{};
+                            msg_vo.code = 200;
+                            msg_vo.id = id;
+                            msg_vo.name = data;
+                            msg_vo.message = msg_dto.msgContent;
+                            (void)glz::write_json(msg_vo, json);
+                            chatRooms_.publish(topic, json);
+
+                            rd_kafka_topic_t* topic_ptr = KafkaManager::instance().getTopic("message_topic");
+                            int retry_count = 0;
+                            constexpr int max_retries = 3;
+                            while (retry_count < max_retries)
                             {
-                                // 发送消息到聊天室
-                                std::string buffer{};
-                                // protobuf
-                                /*dto::UserData userData;
-                                userData.set_id(std::to_string(id));
-                                userData.set_name(action);
-                                userData.set_message(msgContent);
-                                userData.SerializeToString(&buffer);
-                                // 清理 Protobuf 库
-                                google::protobuf::ShutdownProtobufLibrary();*/
-
-                                chatMessageVo messageVo{};
-                                messageVo.code = 200;
-                                messageVo.id = id;
-                                messageVo.name = data;
-                                messageVo.message = messageDto.msgContent;
-                                // BEVE
-                                (void) glz::write_json(messageVo, buffer);
-                                chatRooms_.publish(chatRoomName, buffer);
-
+                                if (!KafkaManager::safeProduce(topic_ptr, json))
                                 {
-                                    // 推送kfk 生产消息（异步）
-                                    if (rd_kafka_produce(
-                                           rd_kafka_topic_new(KafkaManager::instance().getProducer(), "message_topic", nullptr),
-                                           RD_KAFKA_PARTITION_UA,
-                                           RD_KAFKA_MSG_F_COPY,
-                                           const_cast<char *>(buffer.data()), buffer.size(),
-                                           nullptr, 0,
-                                           nullptr) == -1)
+                                    const rd_kafka_resp_err_t err = rd_kafka_last_error();
+                                    LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(err);
+                                    if (err == RD_KAFKA_RESP_ERR__QUEUE_FULL && retry_count < max_retries - 1)
                                     {
-                                        LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(rd_kafka_last_error());
+                                        retry_count++;
+                                        co_await delay(std::chrono::milliseconds(100)); // 使用 await_resume
+                                        continue;
                                     }
-                                    // 处理确认和错误事件
-                                     rd_kafka_poll(KafkaManager::instance().getProducer(), 0);
                                 }
+                                break;
                             }
-                            // 其他操作...
                         }
                     }
                     catch (const std::exception& e)
                     {
-                        std::cerr << "Error in async task: " << e.what() << std::endl;
+                        LOG_ERROR << "Error in async task: " << e.what();
                     }
                     co_return;
                 });
             }
         }
     }
-    catch (...)
+    catch (const std::exception& e)
     {
-        std::cout << "handleNewMessage ..." << std::endl;
+        LOG_ERROR << "Error in handleNewMessage: " << e.what();
     }
 }
-void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSocketConnectionPtr& wsConnPtr)
+
+void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSocketConnectionPtr& wsConn)
 {
-    //write your application logic here
-
     Subscriber s;
-    s.chatRoomName_ = req->getHeader("room_name");
-    if (s.chatRoomName_.empty()) {
-        s.chatRoomName_ = "default_room"; // 设置默认的聊天室名称
+    s.topic_ = req->getHeader("room_name");
+    if (s.topic_.empty())
+    {
+        s.topic_ = "default_room";
     }
-    std::string userName_ = req->getHeader("name");
-    if (userName_.empty()) {
-        userName_ = "default_name"; // 设置默认的名称
+    std::string userName = req->getHeader("name");
+    if (userName.empty())
+    {
+        userName = "default_name";
     }
 
-    s.id_ = chatRooms_.subscribe(s.chatRoomName_,
-                                 [wsConnPtr](const std::string& topic,
-                                             const std::string& message) {
-                                     // Supress unused variable warning
-                                     (void)topic;
-                                     wsConnPtr->send(message);
-                                 });
-    LOG_INFO << "id = " << s.id_;
-    LOG_INFO << "chatRoomName = " << s.chatRoomName_;
+    s.id_ = chatRooms_.subscribe(s.topic_, [wsConn](const std::string&, const std::string& msg)
+    {
+        wsConn->send(msg);
+    });
+    LOG_INFO << "Subscriber ID: " << s.id_ << ", Topic: " << s.topic_;
 
-    // 将新连接加入到连接列表
     {
         std::lock_guard<std::mutex> guard(mutex_);
-        connections_.insert(wsConnPtr);
-        // 用户ID
-        userNames_[wsConnPtr] = userName_;
+        connections_.emplace(wsConn);
+        userNames_.emplace(wsConn, userName);
+        LOG_DEBUG << "Added connection for user: " << userName;
     }
 
-    // 处理用户加入聊天室
-    //wsConnPtr->send(std::format("欢迎 {} 加入我们 {}", userName_, s.chatRoomName_));
-    chatRooms_.publish(s.chatRoomName_, std::format("欢迎 {} 加入我们 {}", userName_, s.chatRoomName_));
+    chatMessageVo msg_vo;
+    msg_vo.code = 200;
+    msg_vo.id = s.id_;
+    msg_vo.name = s.topic_;
+    msg_vo.message = std::format("欢迎 {} 加入我们 {}", userName, s.topic_);
+    std::string json{};
+    (void)glz::write_json(msg_vo, json);
+    chatRooms_.publish(s.topic_, json);
 
-    chatMessageVo messageVo{};
-    messageVo.code = 200;
-    messageVo.id = s.id_;
-    messageVo.name = s.chatRoomName_;
-    messageVo.message = std::format("欢迎 {} 加入我们 {}", userName_, s.chatRoomName_);
-    // BEVE
-    std::string buffer{};
-    (void) glz::write_json(messageVo, buffer);
-    // 推送kfk 生产消息（异步）
-    if (rd_kafka_produce(
-           rd_kafka_topic_new(KafkaManager::instance().getProducer(), "message_topic", nullptr),
-           RD_KAFKA_PARTITION_UA,
-           RD_KAFKA_MSG_F_COPY,
-           const_cast<char *>(buffer.data()), buffer.size(),
-           nullptr, 0,
-           nullptr) == -1)
+    rd_kafka_topic_t* topic_ptr = KafkaManager::instance().getTopic("message_topic");
+    int retry_count = 0;
+    constexpr int max_retries = 3;
+    while (retry_count < max_retries)
     {
-        LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(rd_kafka_last_error());
+        if (!KafkaManager::safeProduce(topic_ptr, json))
+        {
+            const rd_kafka_resp_err_t err = rd_kafka_last_error();
+            LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(err);
+            if (err == RD_KAFKA_RESP_ERR__QUEUE_FULL && retry_count < max_retries - 1)
+            {
+                retry_count++;
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+        }
+        break;
     }
-    // 处理确认和错误事件
-    rd_kafka_poll(KafkaManager::instance().getProducer(), 0);
 
-    wsConnPtr->setContext(std::make_shared<Subscriber>(std::move(s)));
+    wsConn->setContext(std::make_shared<Subscriber>(std::move(s)));
 }
-void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConnPtr)
+
+void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
 {
-    //write your application logic here
     try
     {
-        // 从连接列表中移除关闭的连接
+        std::string userName;
         {
             std::lock_guard<std::mutex> guard(mutex_);
-            connections_.erase(wsConnPtr);
-            userNames_.erase(wsConnPtr);
+            if (auto it = userNames_.find(wsConn); it != userNames_.end())
+            {
+                userName = it->second;
+                userNames_.erase(it);
+                LOG_INFO << "Removed user: " << userName;
+            }
+            connections_.erase(wsConn);
+            LOG_DEBUG << "Removed closed connection";
         }
-        // 获取Subscriber引用
-        const auto& subscriber = wsConnPtr->getContextRef<Subscriber>();
-        // 使用结构化绑定提取成员变量
-        const auto& [chatRoomName, id] = subscriber;
-        // 退出所有房间
-        chatRooms_.unsubscribe(chatRoomName, id);
-        // todo 暂时不确定是否需要
-        /*if (chatRooms_.size() == 0)
+
+        const auto& subscriber = wsConn->getContextRef<Subscriber>();
+        const auto& [topic, id] = subscriber;
+        chatRooms_.unsubscribe(topic, id);
+        LOG_INFO << "Unsubscribed from topic: " << topic << ", ID: " << id;
+
+        chatMessageVo msg_vo;
+        msg_vo.code = 200;
+        msg_vo.id = id;
+        msg_vo.name = topic;
+        msg_vo.message = std::format("{} 已离开 {}", userName, topic);
+        std::string json{};
+        (void)glz::write_json(msg_vo, json);
+        chatRooms_.publish(topic, json);
+
+        rd_kafka_topic_t* topic_ptr = KafkaManager::instance().getTopic("message_topic");
+        int retry_count = 0;
+        constexpr int max_retries = 3;
+        while (retry_count < max_retries)
         {
-            std::cout << "chatRooms_.size() = " << chatRooms_.size() << std::endl;
-            chatRooms_.clear();
-        }*/
-        // 清理资源
-        //wsConnPtr->clearContext();
+            if (!KafkaManager::safeProduce(topic_ptr, json))
+            {
+                const rd_kafka_resp_err_t err = rd_kafka_last_error();
+                LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(err);
+                if (err == RD_KAFKA_RESP_ERR__QUEUE_FULL && retry_count < max_retries - 1)
+                {
+                    retry_count++;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    continue;
+                }
+            }
+            break;
+        }
     }
-    catch (...)
+    catch (const std::exception& e)
     {
-        LOG_INFO << "handleConnectionClosed ...";
+        LOG_ERROR << "Error in handleConnectionClosed: " << e.what();
     }
 }
