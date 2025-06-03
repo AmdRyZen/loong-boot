@@ -186,12 +186,16 @@ FetchContent_MakeAvailable(glaze)
 FetchContent_MakeAvailable(librdkafka)]]
 
 # 添加 KafkaCore 子目录
-add_subdirectory(external/kafka-core)
+# add_subdirectory(external/kafka-core)
+find_library(KAFKA_CORE_LIB kafka-core PATHS /usr/local/lib)
+find_path(KAFKA_CORE_INCLUDE_DIR kafka/KafkaManager.h PATHS /usr/local/include)
+target_include_directories(${PROJECT_NAME} PRIVATE ${KAFKA_CORE_INCLUDE_DIR})
+
 find_package(Drogon CONFIG REQUIRED)
 find_package(mimalloc 2.1.7 REQUIRED)
 find_package(Boost 1.86.0 REQUIRED)
 #[[find_package(PahoMqttCpp REQUIRED)]]
-target_link_libraries(${PROJECT_NAME} PRIVATE Drogon::Drogon Boost::boost glaze::glaze kafka-core #[[PahoMqttCpp::paho-mqttpp3]] mimalloc proto_gen_cxx)
+target_link_libraries(${PROJECT_NAME} PRIVATE Drogon::Drogon Boost::boost glaze::glaze ${KAFKA_CORE_LIB} rdkafka #[[kafka-core]] #[[PahoMqttCpp::paho-mqttpp3]] mimalloc proto_gen_cxx)
 target_compile_definitions(${PROJECT_NAME} PRIVATE MI_MALLOC=1)
 
 find_program(CCACHE_PROGRAM ccache)

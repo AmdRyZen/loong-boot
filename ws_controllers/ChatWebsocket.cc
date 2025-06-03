@@ -1,6 +1,6 @@
 #include "ChatWebsocket.h"
 #include "utils/redisUtils.h"
-#include "user.pb.h"
+//#include "user.pb.h"
 #include <glaze/glaze.hpp>
 #include <drogon/HttpAppFramework.h>
 #include "utils/retry_utils.h"
@@ -18,7 +18,13 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
         if (type == WebSocketMessageType::Ping)
         {
             wsConn->send("pong_ms", WebSocketMessageType::Pong);
-            LOG_DEBUG << "Received a ping";
+            LOG_INFO << "Received a ping";
+            return;
+        }
+
+        if (type == WebSocketMessageType::Close)
+        {
+            LOG_INFO << "Received a Close";
             return;
         }
 
