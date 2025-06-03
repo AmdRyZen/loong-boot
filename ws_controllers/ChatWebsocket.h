@@ -4,6 +4,7 @@
 #include "kafka/KafkaManager.h"
 #include <glaze/glaze.hpp>
 #include <drogon/HttpAppFramework.h>
+#include "utils/retry_utils.h"
 
 using namespace drogon;
 
@@ -13,7 +14,7 @@ public:
     ChatWebsocket()
     {
         // 使用 drogon::HttpAppFramework::instance()
-        drogon::HttpAppFramework::instance().getLoop()->runEvery(10.0, [this] {
+        HttpAppFramework::instance().getLoop()->runEvery(10.0, [this] {
             sendHeartbeatToAll();
         });
     }
@@ -38,8 +39,8 @@ private:
 
     void sendHeartbeatToAll() const
     {
-        std::lock_guard<std::mutex> guard(mutex_);
-        rd_kafka_topic_t* topic = kafka::KafkaManager::instance().getTopic("message_topic_one");
+        std::lock_guard guard(mutex_);
+        rd_kafka_topic_t* topic_ptr = kafka::KafkaManager::instance().getTopic("message_topic_one");
         chatRooms_.publish("001", std::format("房间公告消息"));
 
         for (const auto& wsConnPtr : connections_)
@@ -62,24 +63,18 @@ private:
                 (void)glz::write_json(messageVo, buffer);
                 wsConnPtr->send(buffer);
 
-                int retry_count = 0;
-                constexpr int max_retries = 3;
-                while (retry_count < max_retries)
-                {
-
-                    if (!kafka::KafkaManager::safeProduce(topic, buffer))
+                retryWithSleep([&]() {
+                    if (!kafka::KafkaManager::safeProduce(topic_ptr, buffer))
                     {
                         const rd_kafka_resp_err_t err = rd_kafka_last_error();
                         LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(err);
-                        if (err == RD_KAFKA_RESP_ERR__QUEUE_FULL && retry_count < max_retries - 1)
+                        if (err == RD_KAFKA_RESP_ERR__QUEUE_FULL)
                         {
-                            retry_count++;
-                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                            continue;
+                            return false;
                         }
                     }
-                    break;
-                }
+                    return true;
+                });
             }
         }
     }

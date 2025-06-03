@@ -142,6 +142,7 @@ set(MODEL_SOURCES_COMMON
         mqttManager/MqttManager.h
         mqttManager/MqttConsumer.h
         kafkaManager/AsyncKafkaConsumerOne.h
+        utils/retry_utils.h
 )
 
 add_executable(

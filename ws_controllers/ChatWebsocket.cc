@@ -2,34 +2,14 @@
 #include "utils/redisUtils.h"
 #include "user.pb.h"
 #include <glaze/glaze.hpp>
-#include "../kafkaManager/kafkaManager.h"
 #include <drogon/HttpAppFramework.h>
-#include <chrono>
-
+#include "utils/retry_utils.h"
 
 struct Subscriber
 {
     std::string topic_;
     SubscriberID id_{};
 };
-
-auto delay(std::chrono::milliseconds duration)
-{
-    struct Awaiter
-    {
-        std::chrono::duration<double> seconds_;
-        [[nodiscard]] bool await_ready() const noexcept { return seconds_.count() <= 0; }
-        void await_suspend(std::coroutine_handle<> handle) const
-        {
-            HttpAppFramework::instance().getLoop()->runAfter(seconds_.count(), [handle]() {
-                handle.resume();
-            });
-        }
-        // NOLINT(clang-analyzer-core.CallAndMessage) // await_resume 不能是 static
-        void await_resume() const noexcept {}  // CLion 会提示“可以设为 static”，但不能设
-    };
-    return Awaiter{std::chrono::duration_cast<std::chrono::duration<double>>(duration)};
-}
 
 void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::string&& msg, const WebSocketMessageType& type)
 {
@@ -82,24 +62,18 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                             (void)glz::write_json(msg_vo, json);
                             chatRooms_.publish(topic, json);
 
-                            rd_kafka_topic_t* topic_ptr = kafka::KafkaManager::instance().getTopic("message_topic");
-                            int retry_count = 0;
-                            constexpr int max_retries = 3;
-                            while (retry_count < max_retries)
-                            {
-                                if (!kafka::KafkaManager::safeProduce(topic_ptr, json))
+                            co_await retryWithDelayAsync([json]() -> Task<bool> {
+                                if (rd_kafka_topic_t* topic_ptr = kafka::KafkaManager::instance().getTopic("message_topic"); !kafka::KafkaManager::safeProduce(topic_ptr, json))
                                 {
                                     const rd_kafka_resp_err_t err = rd_kafka_last_error();
                                     LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(err);
-                                    if (err == RD_KAFKA_RESP_ERR__QUEUE_FULL && retry_count < max_retries - 1)
+                                    if (err == RD_KAFKA_RESP_ERR__QUEUE_FULL)
                                     {
-                                        retry_count++;
-                                        co_await delay(std::chrono::milliseconds(100)); // 使用 await_resume
-                                        continue;
+                                        co_return false;
                                     }
                                 }
-                                break;
-                            }
+                                co_return true;
+                            });
                         }
                     }
                     catch (const std::exception& e)
@@ -154,23 +128,18 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
     chatRooms_.publish(s.topic_, json);
 
     rd_kafka_topic_t* topic_ptr = kafka::KafkaManager::instance().getTopic("message_topic");
-    int retry_count = 0;
-    constexpr int max_retries = 3;
-    while (retry_count < max_retries)
-    {
+    retryWithSleep([&]() {
         if (!kafka::KafkaManager::safeProduce(topic_ptr, json))
         {
             const rd_kafka_resp_err_t err = rd_kafka_last_error();
             LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(err);
-            if (err == RD_KAFKA_RESP_ERR__QUEUE_FULL && retry_count < max_retries - 1)
+            if (err == RD_KAFKA_RESP_ERR__QUEUE_FULL)
             {
-                retry_count++;
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                continue;
+                return false;
             }
         }
-        break;
-    }
+        return true;
+    });
 
     wsConn->setContext(std::make_shared<Subscriber>(std::move(s)));
 }
@@ -207,23 +176,18 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
         chatRooms_.publish(topic, json);
 
         rd_kafka_topic_t* topic_ptr = kafka::KafkaManager::instance().getTopic("message_topic");
-        int retry_count = 0;
-        constexpr int max_retries = 3;
-        while (retry_count < max_retries)
-        {
+        retryWithSleep([&]() {
             if (!kafka::KafkaManager::safeProduce(topic_ptr, json))
             {
                 const rd_kafka_resp_err_t err = rd_kafka_last_error();
                 LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(err);
-                if (err == RD_KAFKA_RESP_ERR__QUEUE_FULL && retry_count < max_retries - 1)
+                if (err == RD_KAFKA_RESP_ERR__QUEUE_FULL)
                 {
-                    retry_count++;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                    continue;
+                    return false;
                 }
             }
-            break;
-        }
+            return true;
+        });
     }
     catch (const std::exception& e)
     {
