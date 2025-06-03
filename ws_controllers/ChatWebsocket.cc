@@ -82,12 +82,12 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                             (void)glz::write_json(msg_vo, json);
                             chatRooms_.publish(topic, json);
 
-                            rd_kafka_topic_t* topic_ptr = KafkaManager::instance().getTopic("message_topic");
+                            rd_kafka_topic_t* topic_ptr = kafka::KafkaManager::instance().getTopic("message_topic");
                             int retry_count = 0;
                             constexpr int max_retries = 3;
                             while (retry_count < max_retries)
                             {
-                                if (!KafkaManager::safeProduce(topic_ptr, json))
+                                if (!kafka::KafkaManager::safeProduce(topic_ptr, json))
                                 {
                                     const rd_kafka_resp_err_t err = rd_kafka_last_error();
                                     LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(err);
@@ -153,12 +153,12 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
     (void)glz::write_json(msg_vo, json);
     chatRooms_.publish(s.topic_, json);
 
-    rd_kafka_topic_t* topic_ptr = KafkaManager::instance().getTopic("message_topic");
+    rd_kafka_topic_t* topic_ptr = kafka::KafkaManager::instance().getTopic("message_topic");
     int retry_count = 0;
     constexpr int max_retries = 3;
     while (retry_count < max_retries)
     {
-        if (!KafkaManager::safeProduce(topic_ptr, json))
+        if (!kafka::KafkaManager::safeProduce(topic_ptr, json))
         {
             const rd_kafka_resp_err_t err = rd_kafka_last_error();
             LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(err);
@@ -206,12 +206,12 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
         (void)glz::write_json(msg_vo, json);
         chatRooms_.publish(topic, json);
 
-        rd_kafka_topic_t* topic_ptr = KafkaManager::instance().getTopic("message_topic");
+        rd_kafka_topic_t* topic_ptr = kafka::KafkaManager::instance().getTopic("message_topic");
         int retry_count = 0;
         constexpr int max_retries = 3;
         while (retry_count < max_retries)
         {
-            if (!KafkaManager::safeProduce(topic_ptr, json))
+            if (!kafka::KafkaManager::safeProduce(topic_ptr, json))
             {
                 const rd_kafka_resp_err_t err = rd_kafka_last_error();
                 LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(err);

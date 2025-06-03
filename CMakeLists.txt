@@ -136,7 +136,7 @@ set(MODEL_SOURCES_COMMON
         threadPool/threadPool.h utils/checkloginUtils.h
         filters/LoginFilter.h utils/opensslCrypto.h
         filters/SqlFilter.h
-        kafkaManager/kafkaManager.h
+       #[[ kafkaManager/kafkaManager.h]]
         kafkaManager/AsyncKafkaConsumer.h
         base/base.h
         mqttManager/MqttManager.h
@@ -175,46 +175,22 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(glaze)
 
 # 下载和构建 librdkafka
-FetchContent_Declare(
+#[[FetchContent_Declare(
         librdkafka
         GIT_REPOSITORY https://github.com/confluentinc/librdkafka.git
         #GIT_TAG master
         GIT_TAG v2.10.0  # 使用稳定版本而非 master，master 可能不稳定
         GIT_SHALLOW TRUE
 )
-FetchContent_MakeAvailable(librdkafka)
+FetchContent_MakeAvailable(librdkafka)]]
 
-#[[
-set(ABSL_PROPAGATE_CXX_STD ON)
-FetchContent_Declare(
-        abseil
-        GIT_REPOSITORY https://github.com/abseil/abseil-cpp.git
-        GIT_TAG master  # 选择你需要的版本
-        GIT_SHALLOW TRUE
-)
-
-FetchContent_MakeAvailable(abseil)
-
-FetchContent_Declare(
-        protobuf
-        GIT_REPOSITORY https://github.com/protocolbuffers/protobuf.git
-        GIT_TAG v21.12  # 选择你需要的版本
-        GIT_SHALLOW TRUE
-)
-FetchContent_MakeAvailable(protobuf)
-
-# 设置 Protobuf 库目录
-include_directories(${protobuf_SOURCE_DIR}/src)
-add_subdirectory(proto)
-include_directories(${PROTO_GEN_C_INCLUDE_DIRS}) # c
-include_directories(${PROTO_GEN_CXX_INCLUDE_DIRS}) # cpp
-]]
-
+# 添加 KafkaCore 子目录
+add_subdirectory(external/kafka-core)
 find_package(Drogon CONFIG REQUIRED)
 find_package(mimalloc 2.1.7 REQUIRED)
 find_package(Boost 1.86.0 REQUIRED)
 #[[find_package(PahoMqttCpp REQUIRED)]]
-target_link_libraries(${PROJECT_NAME} PRIVATE Drogon::Drogon Boost::boost glaze::glaze rdkafka #[[PahoMqttCpp::paho-mqttpp3]] mimalloc proto_gen_cxx)
+target_link_libraries(${PROJECT_NAME} PRIVATE Drogon::Drogon Boost::boost glaze::glaze kafka-core #[[PahoMqttCpp::paho-mqttpp3]] mimalloc proto_gen_cxx)
 target_compile_definitions(${PROJECT_NAME} PRIVATE MI_MALLOC=1)
 
 find_program(CCACHE_PROGRAM ccache)
@@ -251,7 +227,8 @@ drogon_create_views(${PROJECT_NAME} ${CMAKE_CURRENT_SOURCE_DIR}/views
 
 target_include_directories(${PROJECT_NAME}
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/models)
+        ${CMAKE_CURRENT_SOURCE_DIR}/models
+        ${CMAKE_CURRENT_SOURCE_DIR}/external/kafka-core/include)
 target_sources(${PROJECT_NAME}
         PRIVATE
         ${SRC_DIR}

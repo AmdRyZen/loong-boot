@@ -13,7 +13,7 @@
 #include <drogon/version.h>
 #include <trantor/utils/Utilities.h>
 #include <boost/format.hpp>
-#include "../kafkaManager/kafkaManager.h"
+#include "kafka/KafkaManager.h"
 #include "kafkaManager/AsyncKafkaConsumer.h"
 #include "kafkaManager/AsyncKafkaConsumerOne.h"
 
@@ -121,7 +121,7 @@ Application::Application()
         const std::string brokers = app().getCustomConfig()["kafka_manager"]["bootstrap.servers"].asString();
 
         // 初始化 KafkaManager
-        KafkaManager::instance().initialize(brokers);
+        kafka::KafkaManager::instance().initialize(brokers);
 
         // 创建一个消费者实例
         // ✅ 正确创建 AsyncKafkaConsumer

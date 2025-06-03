@@ -9,6 +9,7 @@
 #include <limits>
 #include <memory>
 #include <functional>
+#include "kafka/KafkaManager.h"
 
 extern ThreadPool poolKafkaOne;
 using namespace drogon;
@@ -54,7 +55,7 @@ private:
 
         for (size_t i = 0; i < numThreads; ++i)
         {
-            rd_kafka_t* consumer = KafkaManager::instance().createNewConsumer();
+            rd_kafka_t* consumer = kafka::KafkaManager::instance().createNewConsumer();
             if (!consumer)
             {
                 throw std::runtime_error("Failed to create Kafka consumer.");

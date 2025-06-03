@@ -1,33 +1,21 @@
-//
-// Created by 神圣•凯莎 on 24-7-30.
-//
-
-#ifndef KAFKAMANAGER_H
-#define KAFKAMANAGER_H
-
-/*#pragma once
-
-#include <rdkafka.h>
-#include <string>
-#include <mutex>
-#include <unordered_map>
-#include <thread>
-#include <atomic>
+// ===== File: src/KafkaManager.cpp =====
+#include "kafka/KafkaManager.h"
 #include <iostream>
-#include <ranges>
+#include <stdexcept>
+#include <cstring>
 #include <algorithm>
-#include <functional>
+#include <ranges>
 
-class KafkaManager
-{
-public:
-    static KafkaManager& instance()
-    {
-        static KafkaManager mgr;
-        return mgr;
-    }
+using namespace kafka;
 
-    void initialize(const std::string& brokers, const std::string& groupId = "default_group")
+KafkaManager::KafkaManager() : producer_conf_(nullptr), producer_(nullptr), consumer_conf_(nullptr), initialized_(false), destroyed_(false), logCallback_(nullptr) {}
+KafkaManager::~KafkaManager() { stop(); }
+KafkaManager& KafkaManager::instance() {
+    static KafkaManager mgr;
+    return mgr;
+}
+
+ void KafkaManager::initialize(const std::string& brokers, const std::string& groupId)
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (initialized_) {
@@ -76,13 +64,13 @@ public:
         std::cout << "KafkaManager initialized with brokers: " << brokers << ", group.id: " << groupId << std::endl;
     }
 
-    bool isHealthy() const
+    bool KafkaManager::isHealthy() const
     {
         std::lock_guard<std::mutex> lock(mutex_);
         return initialized_ && !destroyed_ && producer_;
     }
 
-    rd_kafka_t* getProducer() const
+    rd_kafka_t* KafkaManager::getProducer() const
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!initialized_ || destroyed_)
@@ -90,7 +78,7 @@ public:
         return producer_;
     }
 
-    rd_kafka_t* createNewConsumer() const
+    rd_kafka_t* KafkaManager::createNewConsumer() const
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!initialized_ || destroyed_)
@@ -107,7 +95,7 @@ public:
         return consumer;
     }
 
-    rd_kafka_topic_t* getTopic(const std::string& topicName)
+    rd_kafka_topic_t* KafkaManager::getTopic(const std::string& topicName)
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!initialized_ || destroyed_)
@@ -133,12 +121,11 @@ public:
         return it->second;
     }
 
-    static bool safeProduce(rd_kafka_topic_t* topic, const std::string& message)
+    bool KafkaManager::safeProduce(rd_kafka_topic_t* topic, const std::string& message)
     {
         auto* payload = strdup(message.c_str());
         if (!payload)
         {
-            LOG_ERROR << "strip failed: out of memory";
             return false;
         }
 
@@ -150,8 +137,7 @@ public:
                 nullptr, 0,
                 nullptr) == -1)
         {
-            rd_kafka_resp_err_t err = rd_kafka_last_error();
-            LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(err);
+            //rd_kafka_resp_err_t err = rd_kafka_last_error();
             free(payload);  // 释放内存避免泄漏
             return false;
         }
@@ -159,7 +145,7 @@ public:
         return true;
     }
 
-    void stop()
+    void KafkaManager::stop()
     {
         stopPolling();
         std::lock_guard<std::mutex> lock(mutex_);
@@ -191,17 +177,7 @@ public:
         }
     }
 
-    KafkaManager(const KafkaManager&) = delete;
-    KafkaManager& operator=(const KafkaManager&) = delete;
-
-private:
-    KafkaManager() : producer_conf_(nullptr), producer_(nullptr), consumer_conf_(nullptr), initialized_(false), destroyed_(false), logCallback_(nullptr) {}
-    ~KafkaManager()
-    {
-        stop();
-    }
-
-    void startPolling()
+    void KafkaManager::startPolling()
     {
         running_ = true;
         pollThread_ = std::thread([this]() {
@@ -221,7 +197,7 @@ private:
         std::cout << "Started Kafka polling thread." << std::endl;
     }
 
-    void stopPolling()
+    void KafkaManager::stopPolling()
     {
         running_ = false;
         if (pollThread_.joinable()) {
@@ -230,27 +206,13 @@ private:
         }
     }
 
-    static void deliveryReportCallback(rd_kafka_t* rk, const rd_kafka_message_t* rkmessage, void* opaque)
+    void KafkaManager::deliveryReportCallback(rd_kafka_t* rk, const rd_kafka_message_t* rkmessage, void* opaque)
     {
         if (rkmessage->err) {
             if (instance().logCallback_) instance().logCallback_(std::string("Message delivery failed: ") + rd_kafka_err2str(rkmessage->err));
             else std::cerr << "Message delivery failed: " << rd_kafka_err2str(rkmessage->err) << std::endl;
         } else {
             /*std::cout << "Message delivered to topic " << rd_kafka_topic_name(rkmessage->rkt)
-                      << " [" << rkmessage->partition << "] at offset " << rkmessage->offset << std::endl;#1#
+                      << " [" << rkmessage->partition << "] at offset " << rkmessage->offset << std::endl;*/
         }
     }
-
-    mutable std::mutex mutex_;
-    rd_kafka_conf_t* producer_conf_;
-    rd_kafka_t* producer_;
-    rd_kafka_conf_t* consumer_conf_;
-    bool initialized_;
-    std::atomic_bool destroyed_;
-    std::unordered_map<std::string, rd_kafka_topic_t*> topic_map_;
-    std::atomic_bool running_{false};
-    std::thread pollThread_;
-    std::function<void(const std::string&)> logCallback_;
-};*/
-
-#endif //KAFKAMANAGER_H

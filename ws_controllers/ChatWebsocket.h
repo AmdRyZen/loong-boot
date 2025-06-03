@@ -1,7 +1,7 @@
 #pragma once
 #include <drogon/PubSubService.h>
 #include <drogon/WebSocketController.h>
-#include "../kafkaManager/kafkaManager.h"
+#include "kafka/KafkaManager.h"
 #include <glaze/glaze.hpp>
 #include <drogon/HttpAppFramework.h>
 
@@ -39,7 +39,7 @@ private:
     void sendHeartbeatToAll() const
     {
         std::lock_guard<std::mutex> guard(mutex_);
-        rd_kafka_topic_t* topic = KafkaManager::instance().getTopic("message_topic_one");
+        rd_kafka_topic_t* topic = kafka::KafkaManager::instance().getTopic("message_topic_one");
         chatRooms_.publish("001", std::format("房间公告消息"));
 
         for (const auto& wsConnPtr : connections_)
@@ -67,7 +67,7 @@ private:
                 while (retry_count < max_retries)
                 {
 
-                    if (!KafkaManager::safeProduce(topic, buffer))
+                    if (!kafka::KafkaManager::safeProduce(topic, buffer))
                     {
                         const rd_kafka_resp_err_t err = rd_kafka_last_error();
                         LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(err);
