@@ -194,25 +194,93 @@ Task<> User::getInfo(const HttpRequestPtr req,
     try
     {
         // 基本 SQL 查询语句
-        std::string baseSql = "SELECT * FROM xxl_job_info WHERE 1=1";
-        std::string baseCountSql = "SELECT count(1) FROM xxl_job_info WHERE 1=1";
+        const std::string baseSql = "SELECT * FROM xxl_job_info";
+        const std::string baseCountSql = "SELECT count(1) FROM xxl_job_info";
 
-        // 条件参数
-        std::vector<Condition<std::string>> conditions;
-        conditions.push_back({"author", "!=", "xxx"});
-        conditions.push_back({"id", "<", "3"});
+        try {
 
-        // 构建动态 SQL 查询语句
-        auto [dynamicSql, resultBaseParameters] = buildDynamicQuery(baseSql, conditions);
-        auto [dynamicCountSql, resultBaseCountParameters]  = buildDynamicQuery(baseCountSql, conditions);
+            // 111111
+            std::vector<Condition> conditionsParams = {
+                {"id", ">", 10, LogicOp::And, true},
+                {"id", "<", 100, LogicOp::And, false, true},
+                {"author", "=", "admin", LogicOp::Or}
+            };
 
-        std::cout << "dynamicSql: " << dynamicSql.str() << std::endl;
-        std::cout << "dynamicCountSql: " << dynamicCountSql.str() << std::endl;
-        for (const auto& param : resultBaseParameters)
-            std::cout << "resultBase params: " << param.c_str() << std::endl;
+            auto sql = SqlFilter::BuildConditionsSQLWithParams(conditionsParams);
+            std::cout << "1111111 构建 WHERE 子句: " << sql << std::endl;
+            // sql: " WHERE (id > ? AND id < ?) OR author = ?"
+            // params: ["10", "100", "admin"]
 
-        for (const auto& param : resultBaseCountParameters)
-            std::cout << "resultBaseCount params: " << param.c_str() << std::endl;
+
+
+            // 构造条件表达式树： 2222222
+            // (id > 10 AND id < 100) OR (author = 'admin' AND status = 1)
+            SqlFilter::ConditionExpr rootExpr {
+                .children = {
+                    SqlFilter::ConditionExpr {
+                        .children = {
+                            SqlFilter::ConditionExpr{ .condition = Condition{"id", ">", 10} },
+                            SqlFilter::ConditionExpr{ .condition = Condition{"id", "<", 100} }
+                        },
+                        .logic = LogicOp::And,
+                        .grouped = true
+                    },
+                    SqlFilter::ConditionExpr {
+                        .children = {
+                            SqlFilter::ConditionExpr{ .condition = Condition{"author", "=", std::string("admin")} },
+                            SqlFilter::ConditionExpr{ .condition = Condition{"status", "=", 1} }
+                        },
+                        .logic = LogicOp::And,
+                        .grouped = true
+                    }
+                },
+                .logic = LogicOp::Or
+            };
+
+            // 调用构造 SQL 字符串函数（改造后只返回字符串）
+            std::string sql1 = SqlFilter::BuildSQLFromExprTreeWithValues(rootExpr);
+            std::cout << "2222222 生成的 SQL1 WHERE: " << sql1 << std::endl;
+
+
+
+            // 33333333
+            std::vector<Condition> conditions = {
+                {"id", "<", 3},
+                {"author", "!=", std::string("xxx")}
+            };
+
+            if (MemberInfoDto memberInfoDto{}; !req->getBody().empty() && !glz::read_json(memberInfoDto, req->getBody()))
+            {
+                conditions.push_back({"author", "!=", memberInfoDto.user_name});
+            }
+            // 构建 WHERE 子句
+            const std::string whereClause = SqlFilter::BuildConditionsSQL(conditions);
+            // 拼接完整 SQL
+            const std::string dynamicSql = baseSql + whereClause;
+            const std::string dynamicCountSql = baseCountSql + whereClause;
+            // 输出调试信息
+            std::cout << "构建 WHERE 子句: " << whereClause << std::endl;
+            std::cout << "动态 SQL 查询语句: " << dynamicSql << std::endl;
+            std::cout << "动态 Count 查询语句: " << dynamicCountSql << std::endl;
+
+            auto result = co_await clientPtr->execSqlCoro(dynamicSql);
+            auto count = co_await clientPtr->execSqlCoro(dynamicCountSql);
+
+            std::vector<UserDataItem> list; // 用于存储结果
+            std::for_each(std::execution::par, result.begin(), result.end(), [&list](const auto& row) {
+                UserDataItem data_item;
+                data_item.id = row["id"].template as<std::int64_t>();
+                data_item.author = row["author"].template as<std::string>();
+                data_item.job_desc = row["job_desc"].template as<std::string>();
+                list.push_back(data_item);
+            });
+            user_data_list_vo.list = std::move(list);
+            user_data_list_vo.num_users = count[0][0].as<std::int32_t>();
+
+        } catch (const std::exception& e) {
+            std::cerr << "构建 SQL 失败，原因: " << e.what() << std::endl;
+        }
+
 
         auto transPtr = co_await clientPtr->newTransactionCoro();
         try
@@ -268,20 +336,6 @@ Task<> User::getInfo(const HttpRequestPtr req,
         {
             std::cerr << "error2:" << e.base().what() << std::endl;
         };
-
-        auto result = co_await clientPtr->execSqlCoro(dynamicSql.str());
-        auto count = co_await clientPtr->execSqlCoro(dynamicCountSql.str());
-
-        std::vector<UserDataItem> list; // 用于存储结果
-        std::for_each(std::execution::par, result.begin(), result.end(), [&list](const auto& row) {
-            UserDataItem data_item;
-            data_item.id = row["id"].template as<std::int64_t>();
-            data_item.author = row["author"].template as<std::string>();
-            data_item.job_desc = row["job_desc"].template as<std::string>();
-            list.push_back(data_item);
-        });
-        user_data_list_vo.list = std::move(list);
-        user_data_list_vo.num_users = count[0][0].as<std::int32_t>();
 
         // 创建SqlBinder对象
         std::string sql = "SELECT * FROM xxl_job_info WHERE id = ? and author = ?";
