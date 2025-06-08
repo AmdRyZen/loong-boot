@@ -118,7 +118,9 @@ public:
             }
 
             if (openParen) result += "(";
-            result += field + " " + op + " '" + valStr + "'";
+            std::ostringstream oss;
+            oss << field << " " << op << " '" << valStr << "'";
+            result += oss.str();
             if (closeParen) result += ")";
         }
 
