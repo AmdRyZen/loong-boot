@@ -5,7 +5,6 @@
 #ifndef DATA_VO_H
 #define DATA_VO_H
 
-#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -34,9 +33,19 @@ struct alignas(16) AesResponseDataVo {
 
 struct alignas(16) MemberInfoVo
 {
-    uint64_t user_id;
+    uint64_t user_id = 0;
     std::string name;
     std::string token;
+};
+// Glaze meta 注册，写在 MemberInfoVo 定义之后
+template <>
+struct glz::meta<MemberInfoVo> {
+    using T = MemberInfoVo;
+    static constexpr auto value = glz::object(
+        "user_id", &T::user_id,
+        "name", &T::name,
+        "token", &T::token
+    );
 };
 
 struct alignas(16) MyStruct
