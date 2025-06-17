@@ -1,0 +1,10 @@
+//
+// Created by 天使之王·彦 on 2021/11/13.
+//
+
+#ifndef LEARNING_CPP_CONFIG_H_IN
+#define LEARNING_CPP_CONFIG_H_IN
+
+#define DROGON_PATH ""
+
+#endif //LEARNING_CPP_CONFIG_H_IN

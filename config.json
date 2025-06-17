@@ -1,0 +1,135 @@
+{
+  "app": {
+    "number_of_threads": 8,
+    "enable_session": false,
+    "session_timeout": 0,
+    "document_root": "./",
+    "home_page": "index.html",
+    "use_implicit_page": true,
+    "implicit_page": "index.html",
+    "upload_path": "uploads",
+    "file_types": [
+      "gif",
+      "png",
+      "jpg",
+      "js",
+      "css",
+      "html",
+      "ico",
+      "swf",
+      "xap",
+      "apk",
+      "cur",
+      "xml"
+    ],
+    "locations": [
+      {
+        "default_content_type": "text/plain",
+        "alias": "",
+        "is_case_sensitive": false,
+        "allow_all": true,
+        "is_recursive": true
+      }
+    ],
+    "max_connections": 1000000,
+    "max_connections_per_ip": 0,
+    "load_dynamic_views": false,
+    "dynamic_views_path": [
+      "./views"
+    ],
+    "dynamic_views_output_path": "",
+    "enable_unicode_escaping_in_json": true,
+    "float_precision_in_json": {
+      "precision": 0,
+      "precision_type": "significant"
+    },
+    "log": {
+      "logfile_base_name": "",
+      "log_size_limit": 100000000,
+      "log_level": "INFO"
+    },
+    "run_as_daemon": false,
+    "handle_sig_term": true,
+    "relaunch_on_error": false,
+    "use_sendfile": true,
+    "use_gzip": true,
+    "use_brotli": true,
+    "static_files_cache_time": 5,
+    "simple_controllers_map": [
+      {
+        "path": "/test",
+        "controller": "PlaintextCtrl",
+        "http_methods": [
+          "get",
+          "post"
+        ]
+      }
+    ],
+    "idle_connection_timeout": 60,
+    "server_header_field": "",
+    "enable_server_header": false,
+    "enable_date_header": false,
+    "keepalive_requests": 0,
+    "pipelining_requests": 0,
+    "gzip_static": true,
+    "br_static": true,
+    "client_max_body_size": "1M",
+    "client_max_memory_body_size": "64K",
+    "client_max_websocket_message_size": "128K",
+    "reuse_port": false
+  },
+  "plugins": [
+    {
+      "dependencies": [],
+      "config": {
+        "ssl_redirect_exempt": [
+          ".*\\.jpg"
+        ],
+        "secure_ssl_host": "localhost:8849"
+      }
+    }
+  ],
+  "listeners": [
+    {
+      "address": "0.0.0.0",
+      "port": 9090,
+      "https": false
+    }
+  ],
+  "db_clients": [
+    {
+      "rdbms": "mysql",
+      "host": "127.0.0.1",
+      "port": 3306,
+      "dbname": "xxl_job",
+      "user": "root",
+      "passwd": "",
+      "is_fast": true,
+      "number_of_connections": 3,
+      "timeout": -1.0
+    }
+  ],
+  "redis_clients": [
+    {
+      "host": "127.0.0.1",
+      "port": 6379,
+      "passwd": "",
+      "db": 0,
+      "is_fast": true,
+      "number_of_connections": 3,
+      "timeout": -1.0
+    }
+  ],
+  "custom_config": {
+    "image-default": "https://github.com/an-tao/drogon/wiki/images/drogon-white.jpg",
+    "jwt-secret": "nRvyYC4soFxBdZ-F-5Nnzz5USXstR1YylsTd-mA0aKtI9HUlriGrtkf-TiuDapkLiUCogO3JOK7kwZisrHp6wA",
+    "jwt-sessionTime": 864000,
+    "kafka_manager": {
+      "bootstrap.servers": "localhost:9092,localhost:9092"
+    },
+    "mqtt_manager": {
+      "servers" : "tcp://localhost:1883",
+      "client_id" : "client_id"
+    }
+  }
+}

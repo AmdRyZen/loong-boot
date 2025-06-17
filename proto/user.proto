@@ -1,0 +1,9 @@
+syntax = "proto3";
+
+package dto;
+
+message UserData {
+  string id = 1;
+  string name = 2;
+  string message = 3;
+}
