@@ -468,19 +468,33 @@ void OpenApi::curlPost(const HttpRequestPtr& req, std::function<void(const HttpR
 Task<> OpenApi::getValue(const HttpRequestPtr req,
                          std::function<void(const HttpResponsePtr&)> callback)
 {
-    const std::string command = std::format("get {}", "aa");
-    const bool setCoroRedisValue  = co_await redisUtils::setCoroRedisValue("aa", "qwer1234");
+    MemberInfoVo memberInfoVo{};
+    memberInfoVo.name = "drogon";
+    memberInfoVo.token = "aabbccddeeffrggjgkisghklsngvklnklsvg";
+    memberInfoVo.user_id = 1000;
+    std::string json_output;
+    (void) glz::write_json(memberInfoVo, json_output);
+
+    const bool setCoroRedisValue  = co_await redisUtils::setCoroRedisValue("aa", json_output);
     std::cout << "setCoroRedisValue = " << setCoroRedisValue << std::endl;
     const bool existsCoroRedisKey = co_await redisUtils::existsCoroRedisKey("aa");
     std::cout << "existsCoroRedisKey = " << existsCoroRedisKey << std::endl;
+    std::cout << "ttlCoroRedisKey = " << co_await redisUtils::ttlCoroRedisKey("aa") << std::endl;
     const std::string redis_value = co_await redisUtils::getCoroRedisValue("aa");
+
+    MemberInfoVo memberInfo{};
+    if (glz::read_json(memberInfo, redis_value))
+    {
+        LOG_ERROR << "Failed to parse read_json";
+    }
+
     co_await redisUtils::setExCoroRedisValue("bb", 10, "xxx");
     const std::string redis_value_bb = co_await redisUtils::getCoroRedisValue("bb");
     std::cout << "redis_value_bb = " << redis_value_bb << std::endl;
     const long redis_value_ttl = co_await redisUtils::ttlCoroRedisKey("bb");
     std::cout << "redis_value_ttl = " << redis_value_ttl << std::endl;
 
-    co_return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, redis_value));
+    co_return callback(Base<MemberInfoVo>::createHttpSuccessResponse(StatusOK, Success, memberInfo));
 }
 
 Task<> OpenApi::fastJson(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
