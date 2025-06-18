@@ -193,8 +193,9 @@ find_path(KAFKA_CORE_INCLUDE_DIR kafka/KafkaManager.h PATHS /usr/local/include)
 find_package(Drogon CONFIG REQUIRED)
 find_package(mimalloc 2.1.7 REQUIRED)
 find_package(Boost 1.86.0 REQUIRED)
+find_package(TBB REQUIRED)
 #[[find_package(PahoMqttCpp REQUIRED)]]
-target_link_libraries(${PROJECT_NAME} PRIVATE Drogon::Drogon Boost::boost glaze::glaze kafka-core rdkafka #[[PahoMqttCpp::paho-mqttpp3]] mimalloc proto_gen_cxx)
+target_link_libraries(${PROJECT_NAME} PRIVATE Drogon::Drogon Boost::boost glaze::glaze kafka-core rdkafka TBB::tbb #[[PahoMqttCpp::paho-mqttpp3]] mimalloc proto_gen_cxx)
 target_compile_definitions(${PROJECT_NAME} PRIVATE MI_MALLOC=1)
 
 find_program(CCACHE_PROGRAM ccache)

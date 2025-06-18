@@ -6,21 +6,7 @@
 #define DATA_VO_H
 
 #include <string>
-#include <vector>
-
-// UserDataItem 结构体
-struct alignas(16) UserDataItem {
-    std::int64_t id{};
-    std::string author;
-    std::string job_desc;
-};
-
-// UserDataListVo 结构体
-struct alignas(16) UserDataListVo {
-    std::int64_t num_users{};
-    std::string redis_value;
-    std::vector<UserDataItem> list; // 用于存储结果
-};
+#include <tbb/concurrent_vector.h>
 
 // 定义 AesResponseDataVo 结构体
 struct alignas(16) AesResponseDataVo {
@@ -29,7 +15,6 @@ struct alignas(16) AesResponseDataVo {
     std::string hash;
     std::string md5_hash;
 };
-
 
 struct alignas(16) MemberInfoVo
 {
@@ -46,6 +31,20 @@ struct glz::meta<MemberInfoVo> {
         "name", &T::name,
         "token", &T::token
     );
+};
+
+// UserDataItem 结构体
+struct alignas(16) UserDataItem {
+    std::int64_t id{};
+    std::string author;
+    std::string job_desc;
+};
+
+// UserDataListVo 结构体
+struct alignas(16) UserDataListVo {
+    std::int64_t num_users{};
+    MemberInfoVo redis_value;
+    tbb::concurrent_vector<UserDataItem> list; // 用于存储结果
 };
 
 struct alignas(16) MyStruct

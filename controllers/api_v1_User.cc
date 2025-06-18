@@ -12,6 +12,7 @@
 #include "base/base.h"
 #include "base/vo/data_vo.h"
 #include "base/dto/open_dto.h"
+#include <tbb/concurrent_vector.h>
 
 using namespace api::v1;
 using namespace drogon::orm;
@@ -266,13 +267,14 @@ Task<> User::getInfo(const HttpRequestPtr req,
             auto result = co_await clientPtr->execSqlCoro(dynamicSql);
             auto count = co_await clientPtr->execSqlCoro(dynamicCountSql);
 
-            std::vector<UserDataItem> list; // 用于存储结果
-            std::for_each(std::execution::par, result.begin(), result.end(), [&list](const auto& row) {
+            tbb::concurrent_vector<UserDataItem> list;
+            list.reserve(result.size());
+            tbb::parallel_for(static_cast<size_t>(0), result.size(), [&](const size_t i) {
                 UserDataItem data_item;
-                data_item.id = row["id"].template as<std::int64_t>();
-                data_item.author = row["author"].template as<std::string>();
-                data_item.job_desc = row["job_desc"].template as<std::string>();
-                list.push_back(data_item);
+                data_item.id = result[i]["id"].template as<std::int64_t>();
+                data_item.author = result[i]["author"].template as<std::string>();
+                data_item.job_desc = result[i]["job_desc"].template as<std::string>();
+                list.push_back(std::move(data_item));
             });
             user_data_list_vo.list = std::move(list);
             user_data_list_vo.num_users = count[0][0].as<std::int32_t>();
@@ -280,7 +282,6 @@ Task<> User::getInfo(const HttpRequestPtr req,
         } catch (const std::exception& e) {
             std::cerr << "构建 SQL 失败，原因: " << e.what() << std::endl;
         }
-
 
         auto transPtr = co_await clientPtr->newTransactionCoro();
         try
@@ -361,7 +362,12 @@ Task<> User::getInfo(const HttpRequestPtr req,
         std::cerr << "error3:" << e.what() << std::endl;
     }
 
-    user_data_list_vo.redis_value = co_await redisUtils::getCoroRedisValue("aa");
+    MemberInfoVo memberInfo{};
+    if (glz::read_json(memberInfo, co_await redisUtils::getCoroRedisValue("aa")))
+    {
+        LOG_ERROR << "Failed to parse read_json";
+    }
+    user_data_list_vo.redis_value = std::move(memberInfo);
 
     co_return callback(Base<UserDataListVo>::createHttpSuccessResponse(StatusOK, Success, user_data_list_vo));
 }
