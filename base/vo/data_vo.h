@@ -38,13 +38,27 @@ struct alignas(16) UserDataItem {
     std::int64_t id{};
     std::string author;
     std::string job_desc;
+
+    void fromRow(const orm::Row& row) {
+        id = row["id"].as<std::int64_t>();
+        author = row["author"].as<std::string>();
+        job_desc = row["job_desc"].as<std::string>();
+        // ... 只写一次，复用无限次
+    }
+
+    static UserDataItem from(const orm::Row& row) {
+        UserDataItem item;
+        item.fromRow(row);
+        return item;
+    }
 };
 
 // UserDataListVo 结构体
 struct alignas(16) UserDataListVo {
     std::int64_t num_users{};
     MemberInfoVo redis_value;
-    tbb::concurrent_vector<UserDataItem> list; // 用于存储结果
+    std::vector<UserDataItem> list; // 用于存储结果
+    std::unordered_map<long long, UserDataItem> user_map; // 用于存储结果
 };
 
 struct alignas(16) MyStruct

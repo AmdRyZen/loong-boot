@@ -6,6 +6,7 @@
 #include <fstream>
 #include <drogon/drogon.h>
 #include "utils/sql.h"
+#include "utils/tbbUtils.h"
 #include "service/SbcConvertService.h"
 #include <algorithm>
 #include <execution>
@@ -267,16 +268,33 @@ Task<> User::getInfo(const HttpRequestPtr req,
             auto result = co_await clientPtr->execSqlCoro(dynamicSql);
             auto count = co_await clientPtr->execSqlCoro(dynamicCountSql);
 
-            tbb::concurrent_vector<UserDataItem> list;
-            list.reserve(result.size());
-            tbb::parallel_for(static_cast<size_t>(0), result.size(), [&](const size_t i) {
-                UserDataItem data_item;
-                data_item.id = result[i]["id"].template as<std::int64_t>();
-                data_item.author = result[i]["author"].template as<std::string>();
-                data_item.job_desc = result[i]["job_desc"].template as<std::string>();
-                list.push_back(std::move(data_item));
+            user_data_list_vo.list = smart_parallel_transform<size_t>(result.size(), [&](const size_t i) {
+                auto user = UserDataItem::from(result[i]);
+                return user;
             });
-            user_data_list_vo.list = std::move(list);
+
+            user_data_list_vo.user_map = smart_parallel_transform_to_unordered_map<size_t, int64_t, UserDataItem>(
+                 result.size(),
+                 [&](const size_t i) {
+                     auto user = UserDataItem::from(result[i]);
+                     return std::make_pair(user.id, std::move(user));
+                 }
+            );
+
+            /*auto list = SqlFilter::smart_parallel_transform_to_container<
+               size_t,
+               std::vector<UserDataItem>
+           >(
+               result.size(),
+               [&](const size_t i) {
+                   UserDataItem data_item;
+                   data_item.id = result[i]["id"].template as<std::int64_t>();
+                   data_item.author = result[i]["author"].template as<std::string>();
+                   data_item.job_desc = result[i]["job_desc"].template as<std::string>();
+                   return data_item;
+               }
+           );*/
+
             user_data_list_vo.num_users = count[0][0].as<std::int32_t>();
 
         } catch (const std::exception& e) {

@@ -136,13 +136,13 @@ set(MODEL_SOURCES_COMMON
         threadPool/threadPool.h utils/checkloginUtils.h
         filters/LoginFilter.h utils/opensslCrypto.h
         filters/SqlFilter.h
-       #[[ kafkaManager/kafkaManager.h]]
         kafkaManager/AsyncKafkaConsumer.h
         base/base.h
         mqttManager/MqttManager.h
         mqttManager/MqttConsumer.h
         kafkaManager/AsyncKafkaConsumerOne.h
         utils/retry_utils.h
+        utils/tbbUtils.h
 )
 
 add_executable(
