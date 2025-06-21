@@ -16,6 +16,17 @@ struct alignas(16) AesResponseDataVo {
     std::string md5_hash;
 };
 
+template <>
+struct glz::meta<AesResponseDataVo> {
+    using T = AesResponseDataVo;
+    static constexpr auto value = object(
+        "encrypted", &T::encrypted,
+        "decrypted", &T::decrypted,
+        "hash", &T::hash,
+        "md5_hash", &T::md5_hash
+    );
+};
+
 struct alignas(16) MemberInfoVo
 {
     uint64_t user_id = 0;
@@ -26,7 +37,7 @@ struct alignas(16) MemberInfoVo
 template <>
 struct glz::meta<MemberInfoVo> {
     using T = MemberInfoVo;
-    static constexpr auto value = glz::object(
+    static constexpr auto value = object(
         "user_id", &T::user_id,
         "name", &T::name,
         "token", &T::token
@@ -53,12 +64,33 @@ struct alignas(16) UserDataItem {
     }
 };
 
+template <>
+struct glz::meta<UserDataItem> {
+    using T = UserDataItem;
+    static constexpr auto value = object(
+        "id", &T::id,
+        "author", &T::author,
+        "job_desc", &T::job_desc
+    );
+};
+
 // UserDataListVo 结构体
 struct alignas(16) UserDataListVo {
     std::int64_t num_users{};
     MemberInfoVo redis_value;
     std::vector<UserDataItem> list; // 用于存储结果
     std::unordered_map<long long, UserDataItem> user_map; // 用于存储结果
+};
+
+template <>
+struct glz::meta<UserDataListVo> {
+    using T = UserDataListVo;
+    static constexpr auto value = object(
+        "num_users", &T::num_users,
+        "redis_value", &T::redis_value,
+        "list", &T::list,
+        "user_map", &T::user_map
+    );
 };
 
 struct alignas(16) MyStruct
@@ -69,6 +101,16 @@ struct alignas(16) MyStruct
     std::string message = "我草";
     /*std::array<uint64_t, 3> arr = { 1, 2, 3 };
     std::map<std::string, int> map{{"one", 1}, {"two", 2}};*/
+};
+
+template <>
+struct glz::meta<MyStruct> {
+    using T = MyStruct;
+    static constexpr auto value = object(
+        "id", &T::id,
+        "name", &T::name,
+        "message", &T::message
+    );
 };
 
 #endif //DATA_VO_H

@@ -46,7 +46,7 @@
     "log": {
       "logfile_base_name": "",
       "log_size_limit": 100000000,
-      "log_level": "INFO"
+      "log_level": "ERROR"
     },
     "run_as_daemon": false,
     "handle_sig_term": true,
@@ -76,7 +76,7 @@
     "client_max_body_size": "1M",
     "client_max_memory_body_size": "64K",
     "client_max_websocket_message_size": "128K",
-    "reuse_port": false
+    "reuse_port": true
   },
   "plugins": [
     {

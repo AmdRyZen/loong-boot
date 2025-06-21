@@ -59,7 +59,8 @@ private:
                 messageVo.id = 0;
                 messageVo.name = userName;
                 messageVo.message = std::format("{} 心跳检测 正常 这是定制消息", userName);
-                std::string buffer{};
+                thread_local std::string buffer; // 使用 thread_local 避免频繁分配
+                buffer.clear();
                 (void)glz::write_json(messageVo, buffer);
                 wsConnPtr->send(buffer);
 

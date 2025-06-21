@@ -59,12 +59,13 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
 
                         if (!msg_dto.action.empty() && msg_dto.action == "message")
                         {
-                            std::string json{};
                             chatMessageVo msg_vo{};
                             msg_vo.code = 200;
                             msg_vo.id = id;
                             msg_vo.name = data;
                             msg_vo.message = msg_dto.msgContent;
+                            thread_local std::string json; // 使用 thread_local 避免频繁分配
+                            json.clear();
                             (void)glz::write_json(msg_vo, json);
                             chatRooms_.publish(topic, json);
 
@@ -129,7 +130,8 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
     msg_vo.id = s.id_;
     msg_vo.name = s.topic_;
     msg_vo.message = std::format("欢迎 {} 加入我们 {}", userName, s.topic_);
-    std::string json{};
+    thread_local std::string json; // 使用 thread_local 避免频繁分配
+    json.clear();
     (void)glz::write_json(msg_vo, json);
     chatRooms_.publish(s.topic_, json);
 
@@ -177,7 +179,8 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
         msg_vo.id = id;
         msg_vo.name = topic;
         msg_vo.message = std::format("{} 已离开 {}", userName, topic);
-        std::string json{};
+        thread_local std::string json; // 使用 thread_local 避免频繁分配
+        json.clear();
         (void)glz::write_json(msg_vo, json);
         chatRooms_.publish(topic, json);
 

@@ -30,10 +30,13 @@ inline auto delay(const std::chrono::milliseconds duration)
 }
 
 template<typename Func>
+requires requires(Func f) { { f() } -> std::same_as<Task<bool>>; }
 Task<> retryWithDelayAsync(Func&& func,
                            const int maxRetries = 3,
-                                  std::chrono::milliseconds delayMs = std::chrono::milliseconds(100))
+                           const std::chrono::milliseconds delayMs = std::chrono::milliseconds(100))
 {
+    static_assert(std::is_invocable_r_v<Task<bool>, Func>, "retryWithDelayAsync requires func() to return Task<bool>");
+
     for (int retry = 0; retry < maxRetries; ++retry)
     {
         if (co_await func())
@@ -45,6 +48,7 @@ Task<> retryWithDelayAsync(Func&& func,
             co_await delay(delayMs);
         }
     }
+    // Optional: final failure logging or callback can be added here.
 }
 
 
@@ -53,6 +57,8 @@ void retryWithSleep(Func&& func,
                     const int maxRetries = 3,
                     const std::chrono::milliseconds delayMs = std::chrono::milliseconds(100))
 {
+    static_assert(std::is_invocable_r_v<bool, Func>, "retryWithSleep requires func() to return bool");
+
     for (int retry = 0; retry < maxRetries; ++retry)
     {
         if (func())
@@ -64,6 +70,7 @@ void retryWithSleep(Func&& func,
             std::this_thread::sleep_for(delayMs);
         }
     }
+    // Optional: log or handle failure after final attempt.
 }
 
 #endif //RETRY_UTILS_H
