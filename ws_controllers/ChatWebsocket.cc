@@ -1,5 +1,6 @@
 #include "ChatWebsocket.h"
 #include "utils/redisUtils.h"
+#include "coroutinePool/CoroutinePool.h"
 //#include "user.pb.h"
 #include <glaze/glaze.hpp>
 #include <drogon/HttpAppFramework.h>
@@ -46,14 +47,17 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                 const auto& subscriber = wsConn->getContextRef<Subscriber>();
                 const auto& [topic, id] = subscriber;
 
-                async_run([msg_dto, topic, id, this]() -> Task<>
+                // 提交协程任务给协程池，协程自动启动，无需手动 resume
+                // async_run([msg_dto, topic, id, this]() -> Task<>
+                CoroutinePool::instance().submit([msg_dto, topic, id, this]() -> AsyncTask
                 {
                     try
                     {
                         std::string data{};
                         if (!msg_dto.key.empty())
                         {
-                            //data = co_await redisUtils::getCoroRedisValue(std::format("get {}", msg_dto.key));
+                            // 异步调用 Redis 协程接口，示例用硬编码
+                            // data = co_await redisUtils::getCoroRedisValue(std::format("get {}", msg_dto.key));
                             data = "xxxxxx";
                         }
 
@@ -64,11 +68,14 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                             msg_vo.id = id;
                             msg_vo.name = data;
                             msg_vo.message = msg_dto.msgContent;
-                            thread_local std::string json; // 使用 thread_local 避免频繁分配
+                            thread_local std::string json;
                             json.clear();
                             (void)glz::write_json(msg_vo, json);
+
+                            // 发布消息给订阅的客户端
                             chatRooms_.publish(topic, json);
 
+                            // 异步发送 Kafka 消息，失败自动重试
                             co_await retryWithDelayAsync([json]() -> Task<bool> {
                                 if (rd_kafka_topic_t* topic_ptr = kafka::KafkaManager::instance().getTopic("message_topic"); !kafka::KafkaManager::safeProduce(topic_ptr, json))
                                 {

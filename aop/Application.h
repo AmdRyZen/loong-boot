@@ -17,6 +17,7 @@
 #include "kafkaManager/AsyncKafkaConsumer.h"
 #include "kafkaManager/AsyncKafkaConsumerOne.h"
 #include <tbb/global_control.h>
+#include "coroutinePool/CoroutinePool.h"
 
 inline TrieService trieService;
 
@@ -119,6 +120,8 @@ Application::Application()
 
     try
     {
+        CoroutinePool::instance().init();
+
         // 获取 KafkaManager 的配置
         const std::string brokers = app().getCustomConfig()["kafka_manager"]["bootstrap.servers"].asString();
 

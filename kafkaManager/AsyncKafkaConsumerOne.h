@@ -10,6 +10,7 @@
 #include <memory>
 #include <functional>
 #include "kafka/KafkaManager.h"
+#include "coroutinePool/CoroutinePool.h"
 
 extern ThreadPool poolKafkaOne;
 using namespace drogon;
@@ -91,7 +92,8 @@ private:
             if (rd_kafka_message_t *msg = rd_kafka_consumer_poll(consumer_, 1000)) // Poll every second
             {
                 // 启动协程处理消息
-                async_run([msg, consumer_, this]() -> Task<> {
+                //async_run([msg, consumer_, this]() -> Task<> {
+                CoroutinePool::instance().submit([msg, consumer_, this]() -> AsyncTask {
                     try
                     {
                         if (msg->err)
