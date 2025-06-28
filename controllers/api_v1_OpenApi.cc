@@ -20,6 +20,7 @@
 #include <glaze/glaze.hpp>
 #include "base/base.h"
 #include "base/vo/data_vo.h"
+#include "coroutinePool/CoroutinePool.h"
 //#include "mqttManager/MqttManager.h"
 
 #if defined(__arm__) || defined(__aarch64__)
@@ -46,71 +47,66 @@ Task<> OpenApi::mqtt(const HttpRequestPtr req, std::function<void(const HttpResp
     co_return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
 }
 
-struct Task23
-{
-    struct promise_type
-    {
-        constexpr Task23 get_return_object()
-        {
+struct Task23 {
+    struct promise_type {
+        Task23 get_return_object() {
             return Task23{std::coroutine_handle<promise_type>::from_promise(*this)};
         }
-        static std::suspend_never initial_suspend()
-        {
-            return {};
-        }
+        static std::suspend_never initial_suspend() { return {}; }
         static std::suspend_always final_suspend() noexcept
         {
             return {};
         }
         static void return_void() {}
-        static void unhandled_exception()
-        {
-            std::terminate();
-        }
+        static void unhandled_exception() { std::terminate(); }
     };
 
     std::coroutine_handle<promise_type> coro;
-
-     explicit Task23(std::coroutine_handle<promise_type> const h) : coro(h) {}
+    explicit Task23(std::coroutine_handle<promise_type> h) : coro(h) {}
     ~Task23() { if (coro) coro.destroy(); }
-
     void resume() const {
         if (coro) coro.resume();
     }
 };
 
-Task23 example(const int n) {
+Task23 example(int n) {
     for (int i = 0; i < n; ++i) {
         co_await std::suspend_always{};
     }
 }
 
-void run_test(const int iterations) {
-    const auto start = std::chrono::high_resolution_clock::now();
-    const auto t = example(iterations);
-    for (int i = 0; i < iterations; ++i) {
-        t.resume();
-    }
-    const auto end = std::chrono::high_resolution_clock::now();
-    const std::chrono::duration<double, std::nano> diff = end - start;
-    const double average_time_ns = diff.count() / iterations;
-    std::cout << std::format("Total Duration: {}", diff.count()) << " ns" << std::endl;
-    std::cout << std::format("Average Time per Switch: {}", average_time_ns) << " ns" << std::endl;
-}
-
 Task<> OpenApi::coroutine(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
 {
-    constexpr int num_threads = 8;
-    std::vector<std::thread> threads;
+    constexpr int numTasks = 8;
+    constexpr int resumeCount = 1'000'000;
 
-    for (int i = 0; i < num_threads; ++i) {
-        constexpr int iterations = 10000000;
-        threads.emplace_back(run_test, iterations);
+    std::atomic<int> completedTasks{0};
+    const auto start = std::chrono::steady_clock::now();
+
+    for (int i = 0; i < numTasks; ++i)
+    {
+        CoroutinePool::instance().submit([resumeCount, &completedTasks]() -> AsyncTask {
+            const auto task = example(resumeCount);
+            for (int j = 0; j < resumeCount; ++j)
+            {
+                task.resume();
+            }
+            ++completedTasks;
+            co_return;
+        });
     }
 
-    for (auto& t : threads) {
-        t.join();
+    // 等待所有任务完成
+    while (completedTasks.load() < numTasks)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+
+    const auto end = std::chrono::steady_clock::now();
+    const auto total_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+    constexpr auto totalResumes = static_cast<long long>(numTasks) * resumeCount;
+    std::cout << "CoroutinePool submit benchmark total time: " << total_ns << " ns\n";
+    std::cout << "Average coroutine resume time: " << static_cast<double>(total_ns) / totalResumes << " ns\n";
 
     co_return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
 }
