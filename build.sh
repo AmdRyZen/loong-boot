@@ -25,13 +25,17 @@ function build_loong()
     cd $build_dir || exit
 
     echo "Start building ..."
-    if [ $1 -eq 1 ]; then
-        cmake .. -DCMAKE_BUILD_TYPE=Debug $cmake_gen
-    elif [ $1 -eq 2 ]; then
-        cmake .. -DCMAKE_BUILD_TYPE=Debug -DBUILD_DROGON_SHARED=ON -DCMAKE_CXX_VISIBILITY_PRESET=hidden -DCMAKE_VISIBILITY_INLINES_HIDDEN=1 $cmake_gen
-    else
-        cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14 $cmake_gen
-    fi
+    case "$1" in
+        Debug)
+            cmake .. -DCMAKE_BUILD_TYPE=Debug $cmake_gen
+            ;;
+        DebugShared)
+            cmake .. -DCMAKE_BUILD_TYPE=Debug -DBUILD_DROGON_SHARED=ON -DCMAKE_CXX_VISIBILITY_PRESET=hidden -DCMAKE_VISIBILITY_INLINES_HIDDEN=1 $cmake_gen
+            ;;
+        Release|*)
+            cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-15 $cmake_gen
+            ;;
+    esac
 
     #If errors then exit
     # shellcheck disable=SC2181
@@ -100,9 +104,9 @@ else
 fi
 
 if [ "$1" = "-t" ]; then
-    build_loong 1
+    build_loong Debug
 elif [ "$1" = "-tshared" ]; then
-    build_loong 2
+    build_loong DebugShared
 else
-    build_loong 0
+    build_loong Release
 fi

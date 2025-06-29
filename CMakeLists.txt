@@ -24,7 +24,6 @@ check_include_file_cxx(coroutine HAS_COROUTINE)
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_LINKER mold)
 
 # 架构特定的宏定义
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm)")
@@ -124,7 +123,7 @@ include(FetchContent)
 FetchContent_Declare(
         glaze
         GIT_REPOSITORY https://github.com/stephenberry/glaze.git
-        GIT_TAG v3.5.0  # 请检查 GitHub 获取最新稳定版本
+        GIT_TAG main  # 请检查 GitHub 获取最新稳定版本
         GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(glaze)
@@ -149,6 +148,8 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 
 # 编译定义
 target_compile_definitions(${PROJECT_NAME} PRIVATE MI_MALLOC=1)
+# 适用于 Clang 或 GCC
+add_link_options(-fuse-ld=mold)
 
 # 启用 ccache
 find_program(CCACHE_PROGRAM ccache)
