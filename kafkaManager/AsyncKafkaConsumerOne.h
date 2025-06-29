@@ -85,49 +85,58 @@ private:
         }
     }
 
+    void submitMessageTask(rd_kafka_message_t* msg, rd_kafka_t* consumer)
+    {
+        CoroutinePool::instance().submit([msg, consumer, this]() -> AsyncTask {
+            try
+            {
+                if (msg->err)
+                {
+                    if (msg->err == RD_KAFKA_RESP_ERR__PARTITION_EOF)
+                    {
+                        LOG_ERROR << "AsyncKafkaConsumerOne Reached end of partition.";
+                    }
+                    else
+                    {
+                        LOG_ERROR << "AsyncKafkaConsumerOne Error consuming message: " <<  rd_kafka_err2str(msg->err);
+                    }
+                    ++stats_.errCount;
+                    rd_kafka_message_destroy(msg);
+                    co_return;
+                }
+
+                const std::string message(static_cast<const char*>(msg->payload), msg->len);
+                ++stats_.msgCount;
+                co_await messageHandler_(message);
+                rd_kafka_commit_message(consumer, msg, 0);
+            }
+            catch (const std::exception& ex)
+            {
+                ++stats_.errCount;
+                LOG_ERROR << "AsyncKafkaConsumerOne Exception while processing message: " << ex.what();
+            }
+            rd_kafka_message_destroy(msg);
+        });
+    }
+
     void consumeMessages(rd_kafka_t* consumer_)
     {
         while (!stop_)
         {
-            if (rd_kafka_message_t *msg = rd_kafka_consumer_poll(consumer_, 1000)) // Poll every second
+            if (rd_kafka_message_t* msg = rd_kafka_consumer_poll(consumer_, 50))
             {
-                // 启动协程处理消息
-                //async_run([msg, consumer_, this]() -> Task<> {
-                CoroutinePool::instance().submit([msg, consumer_, this]() -> AsyncTask {
-                    try
-                    {
-                        if (msg->err)
-                        {
-                            if (msg->err == RD_KAFKA_RESP_ERR__PARTITION_EOF)
-                            {
-                                // 当前分区的消息已经消费完毕
-                                LOG_ERROR << "AsyncKafkaConsumer EReached end of partition.";
-                            }
-                            else
-                            {
-                                LOG_ERROR << "AsyncKafkaConsumer Error consuming message: " <<  rd_kafka_err2str(msg->err);
-                            }
-                            ++stats_.errCount;
-                            rd_kafka_message_destroy(msg); // 释放消息资源
-                            co_return;
-                        }
+                constexpr int maxBatchSize = 32;
+                submitMessageTask(msg, consumer_);
 
-                        const std::string message(static_cast<const char*>(msg->payload), msg->len);
+                for (int i = 1; i < maxBatchSize && !stop_; ++i)
+                {
+                    rd_kafka_message_t* nextMsg = rd_kafka_consumer_poll(consumer_, 0);
+                    if (!nextMsg) break;
 
-                        ++stats_.msgCount;
-                        co_await messageHandler_(message);
-
-                        // 处理完消息后手动提交偏移量
-                        rd_kafka_commit_message(consumer_, msg, 0);
-                    }
-                    catch (const std::exception& ex)
-                    {
-                        ++stats_.errCount;
-                        LOG_ERROR << "AsyncKafkaConsumer Exception while processing message: " << ex.what();
-                    }
-                    rd_kafka_message_destroy(msg); // 释放消息资源
-                });
+                    submitMessageTask(nextMsg, consumer_);
+                }
             }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
     }
 
