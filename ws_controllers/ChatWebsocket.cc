@@ -76,7 +76,7 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                             chatRooms_.publish(topic, json);
 
                             // 异步发送 Kafka 消息，失败自动重试
-                            co_await retryWithDelayAsync([json]() -> Task<bool> {
+                            co_await retryWithDelayAsync([&json]() -> Task<bool> {
                                 if (rd_kafka_topic_t* topic_ptr = kafka::KafkaManager::instance().getTopic("message_topic"); !kafka::KafkaManager::safeProduce(topic_ptr, json))
                                 {
                                     const rd_kafka_resp_err_t err = rd_kafka_last_error();

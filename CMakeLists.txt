@@ -143,13 +143,13 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
         rdkafka
         TBB::tbb
         mimalloc
-        proto_gen_cxx
+        #[[proto_gen_cxx]]
 )
 
 # 编译定义
 target_compile_definitions(${PROJECT_NAME} PRIVATE MI_MALLOC=1)
 # 适用于 Clang 或 GCC
-add_link_options(-fuse-ld=mold)
+#add_link_options(-fuse-ld=mold)
 
 # 启用 ccache
 find_program(CCACHE_PROGRAM ccache)

@@ -38,6 +38,28 @@ using namespace boost::gregorian;
 namespace mp = boost::multiprecision;
 using namespace rapidjson;
 
+Task<> OpenApi::tbb(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
+{
+    constexpr std::size_t num_steps = 100000000;
+    constexpr double step = 1.0 / static_cast<double>(num_steps);
+
+    const double pi_tbb = tbb::parallel_reduce(
+        tbb::blocked_range<long>(0, num_steps),
+        0.0,
+        [=](tbb::blocked_range<long> const& r, double sum) -> double {
+            for (long i = r.begin(); i < r.end(); ++i) {
+                const double x = (i + 0.5) * step;
+                sum += 4.0 / (1.0 + x * x);
+            }
+            return sum;
+        },
+        std::plus<>()
+    ) * step;
+
+    std::cout << "tbb π ≈ " << pi_tbb << std::endl;
+
+    co_return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
+}
 
 Task<> OpenApi::mqtt(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
 {
@@ -496,8 +518,6 @@ Task<> OpenApi::getValue(const HttpRequestPtr req,
 Task<> OpenApi::fastJson(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
 {
     std::string buffer{};
-    GOOGLE_PROTOBUF_VERIFY_VERSION;
-    std::cout << "Protocol Buffers version: " << GOOGLE_PROTOBUF_VERSION << std::endl;
 
     /*auto t1 = std::chrono::steady_clock::now();
     for (auto i = 0; i < 1000; i++)
