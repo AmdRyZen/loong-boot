@@ -218,25 +218,29 @@ Task<> User::getInfo(const HttpRequestPtr req,
             // 构造条件表达式树： 2222222
             // (id > 10 AND id < 100) OR (author = 'admin' AND status = 1)
             SqlFilter::ConditionExpr rootExpr {
+                .condition = Condition{},
                 .children = {
                     SqlFilter::ConditionExpr {
+                        .condition = Condition{},
                         .children = {
-                            SqlFilter::ConditionExpr{ .condition = Condition{"id", ">", 10} },
-                            SqlFilter::ConditionExpr{ .condition = Condition{"id", "<", 100} }
+                            SqlFilter::ConditionExpr{ .condition = Condition{"id", ">", 10}, .children = {}, .logic = LogicOp::And, .grouped = false },
+                            SqlFilter::ConditionExpr{ .condition = Condition{"id", "<", 100}, .children = {}, .logic = LogicOp::And, .grouped = false }
                         },
                         .logic = LogicOp::And,
                         .grouped = true
                     },
                     SqlFilter::ConditionExpr {
+                        .condition = Condition{},
                         .children = {
-                            SqlFilter::ConditionExpr{ .condition = Condition{"author", "=", std::string("admin")} },
-                            SqlFilter::ConditionExpr{ .condition = Condition{"status", "=", 1} }
+                            SqlFilter::ConditionExpr{ .condition = Condition{"author", "=", std::string("admin")}, .children = {}, .logic = LogicOp::And, .grouped = false },
+                            SqlFilter::ConditionExpr{ .condition = Condition{"status", "=", 1}, .children = {}, .logic = LogicOp::And, .grouped = false }
                         },
                         .logic = LogicOp::And,
                         .grouped = true
                     }
                 },
-                .logic = LogicOp::Or
+                .logic = LogicOp::Or,
+                .grouped = false
             };
 
             // 调用构造 SQL 字符串函数（改造后只返回字符串）

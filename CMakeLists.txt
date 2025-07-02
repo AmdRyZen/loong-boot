@@ -63,6 +63,8 @@ endif()
 set(FOO_USE_STATIC_LIBS ON)
 
 # 查找 Protobuf
+add_compile_options(-Wno-deprecated-declarations)
+add_compile_options(-Wno-missing-requires)
 find_package(Protobuf REQUIRED)
 if(PROTOBUF_FOUND)
     message(STATUS "Protobuf library found")

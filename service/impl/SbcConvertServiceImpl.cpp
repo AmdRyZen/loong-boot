@@ -3,8 +3,8 @@
 //
 
 #include "../SbcConvertService.h"
-#include "codecvt"
-#include "locale"
+#include <boost/locale.hpp>
+#include "iostream"
 
 // ASCII表中可见字符从!开始，偏移位值为33(Decimal)
 constexpr char kDBCCharStart = 33;  // 半角!
@@ -26,18 +26,50 @@ constexpr wchar_t kDBCSpace = L' ';  // 半角空格
 
 std::wstring SbcConvertService::s2ws(const std::string& str)
 {
-    using convert_typeX = std::codecvt_utf8<wchar_t>;
-    std::wstring_convert<convert_typeX, wchar_t> converterX;
+    if (str.empty()) return {};
 
-    return converterX.from_bytes(str);
+    std::wstring result;
+    result.reserve(str.size()); // 估计最大长度
+
+    auto state = std::mbstate_t();
+    const char* src = str.data();
+    size_t len = str.size();
+    wchar_t wc;
+
+    while (len > 0)
+    {
+        const size_t ret = std::mbrtowc(&wc, src, len, &state);
+        if (ret == static_cast<size_t>(-1) || ret == static_cast<size_t>(-2))
+            throw std::runtime_error("flowchart conversion failed");
+
+        result.push_back(wc);
+        src += ret;
+        len -= ret;
+    }
+    return result;
 }
 
-std::string SbcConvertService::ws2s(const std::wstring& wstring)
+std::string SbcConvertService::ws2s(const std::wstring& wstr)
 {
-    using convert_typeX = std::codecvt_utf8<wchar_t>;
-    std::wstring_convert<convert_typeX, wchar_t> converterX;
+    if (wstr.empty())
+        return {};
 
-    return converterX.to_bytes(wstring);
+    const size_t maxSize = wstr.size() * 4;
+    std::string result;
+    result.reserve(maxSize);
+
+    std::mbstate_t state = std::mbstate_t();
+    char string[MB_LEN_MAX];
+    for (const wchar_t wc : wstr)
+    {
+        const size_t len = std::wcrtomb(string, wc, &state);
+        if (len == static_cast<size_t>(-1)) {
+            std::memset(&state, 0, sizeof(state)); // 重置状态
+            continue;
+        }
+        result.append(string, len);
+    }
+    return result;
 }
 
 int SbcConvertService::qj2bj(const wchar_t& src)

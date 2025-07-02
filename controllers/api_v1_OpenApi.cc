@@ -722,16 +722,8 @@ Task<> OpenApi::threadPool(const HttpRequestPtr req, std::function<void(const Ht
 
     constexpr double foo = 0.0;
     constexpr double bar = 1.0;
-    auto constexpr res = foo <=> bar;
-    if (res < 0) [[likely]]
+    if (auto constexpr res = foo <=> bar; res < nullptr) [[likely]]
         std::cout << "foo 小于 bar" << std::endl;
-    else if (res > 0) [[unlikely]]
-    {
-        [[unreachable]];
-        std::cout << "foo 大于 bar" << std::endl;
-    }
-    else  // (res == 0)
-        std::cout << "foo 与 bar 相等" << std::endl;
 
     co_return callback(Base<bool>::createHttpSuccessResponse(StatusOK, Success, future_ret));
 }
