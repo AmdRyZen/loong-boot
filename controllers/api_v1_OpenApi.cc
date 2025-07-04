@@ -515,123 +515,229 @@ Task<> OpenApi::getValue(const HttpRequestPtr req,
     co_return callback(Base<MemberInfoVo>::createHttpSuccessResponse(StatusOK, Success, memberInfo));
 }
 
+// 计时模板函数
+template <typename Func>
+double measure(Func&& f) {
+    const auto start = std::chrono::steady_clock::now();
+    f();
+    const auto end = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::micro>(end - start).count();
+}
+
+// Glaze JSON 测试
+double testGlazeJson(const MyStruct& s, const int loops) {
+    std::string buffer;
+    buffer.reserve(1024);
+    return measure([&]() {
+        for (int i = 0; i < loops; i++) {
+            buffer.clear();
+            (void) glz::write_json(s, buffer);
+        }
+    });
+}
+
+// Glaze BEVE 测试
+double testGlazeBeve(const MyStruct& s, const int loops) {
+    std::vector<std::byte> buffer;
+    buffer.reserve(1024);
+    return measure([&]() {
+        for (int i = 0; i < loops; i++) {
+            buffer.clear();
+            (void) glz::write_beve(s, buffer);
+        }
+    });
+}
+
+// nlohmann JSON 测试
+double testNlohmannJson(const MyStruct& s, const int loops) {
+    return measure([&]() {
+        for (int i = 0; i < loops; i++) {
+            json j = {
+                {"id", s.id},
+                {"name", s.name},
+                {"message", s.message}};
+            const auto str = j.dump();
+            (void)str;
+        }
+    });
+}
+
+// RapidJSON 测试
+double testRapidJson(const MyStruct& s, const int loops) {
+    return measure([&]() {
+        for (int i = 0; i < loops; i++) {
+            rapidjson::StringBuffer buf;
+            rapidjson::Writer<rapidjson::StringBuffer> writer(buf);
+            writer.StartObject();
+            writer.Key("id");
+            writer.Int(s.id);
+            writer.Key("name");
+            writer.String(s.name.c_str());
+            writer.Key("message");
+            writer.String(s.message.c_str());
+            writer.EndObject();
+            const auto str = buf.GetString();
+            (void)str;
+        }
+    });
+}
+
+// jsonCpp 测试
+double testJsonCpp(const MyStruct& s, const int loops) {
+    return measure([&]() {
+        for (int i = 0; i < loops; i++) {
+            Json::Value root;
+            root["id"] = s.id;
+            root["name"] = s.name;
+            root["message"] = s.message;
+            Json::StreamWriterBuilder writer;
+            const std::string output = Json::writeString(writer, root);
+            (void)output;
+        }
+    });
+}
+
+// Protobuf 测试示例（需根据实际 proto 定义改）
+// double testProtobuf(const MyStruct& s, int loops) {
+//     // 你需要先写一个转换 MyStruct -> Protobuf Message 的函数
+//     dto::UserData pb_msg;
+//     pb_msg.set_id(std::to_string(s.id));
+//     pb_msg.set_name(s.name);
+//     pb_msg.set_message(s.message);
+
+//     std::string buffer;
+//     return measure([&]() {
+//         for (int i = 0; i < loops; i++) {
+//             buffer.clear();
+//             pb_msg.SerializeToString(&buffer);
+//         }
+//     });
+// }
+
+// 反序列化测试
+
+// Glaze JSON 反序列化
+double testGlazeJsonDeserialize(const std::string& json_str, const int loops) {
+    return measure([&]() {
+        for (int i = 0; i < loops; ++i) {
+            MyStruct s{};
+            (void) glz::read_json(s, json_str);
+            (void)s;
+        }
+    });
+}
+
+// Glaze BEVE 反序列化
+double testGlazeBeveDeserialize(const std::vector<std::byte>& buffer, const int loops) {
+    return measure([&]() {
+        for (int i = 0; i < loops; ++i) {
+            MyStruct s{};
+            (void) glz::read_beve(s, buffer);
+            (void)s;
+        }
+    });
+}
+
+// nlohmann JSON 反序列化
+double testNlohmannJsonDeserialize(const std::string& json_str, const int loops) {
+    return measure([&]() {
+        for (int i = 0; i < loops; ++i) {
+            json j = json::parse(json_str);
+            MyStruct s;
+            s.id = j["id"].get<int>();
+            s.name = j["name"].get<std::string>();
+            s.message = j["message"].get<std::string>();
+            (void)s;
+        }
+    });
+}
+
+// RapidJSON 反序列化
+double testRapidJsonDeserialize(const std::string& json_str, const int loops) {
+    return measure([&]() {
+        for (int i = 0; i < loops; ++i) {
+            rapidjson::Document doc;
+            doc.Parse(json_str.c_str());
+            MyStruct s;
+            s.id = doc["id"].GetInt();
+            s.name = doc["name"].GetString();
+            s.message = doc["message"].GetString();
+            (void)s;
+        }
+    });
+}
+
+// jsoncpp 反序列化
+double testJsonCppDeserialize(const std::string& json_str, const int loops) {
+    return measure([&]() {
+        for (int i = 0; i < loops; ++i) {
+            Json::CharReaderBuilder builder;
+            Json::CharReader* reader = builder.newCharReader();
+            Json::Value root;
+            std::string errs;
+            reader->parse(json_str.c_str(), json_str.c_str() + json_str.size(), &root, &errs);
+            delete reader;
+
+            MyStruct s;
+            s.id = root["id"].asInt();
+            s.name = root["name"].asString();
+            s.message = root["message"].asString();
+            (void)s;
+        }
+    });
+}
+
 Task<> OpenApi::fastJson(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
 {
-    std::string buffer{};
-    buffer.reserve(1024);
     GOOGLE_PROTOBUF_VERIFY_VERSION;
     std::cout << "Protocol Buffers version: " << GOOGLE_PROTOBUF_VERSION << std::endl;
 
-    /*auto t1 = std::chrono::steady_clock::now();
-    for (auto i = 0; i < 1000; i++)
-    {
-        // protobuf
-        dto::UserData userData;
-        userData.set_id("999");
-        userData.set_name("protobuf");
-        userData.set_message("message");
-        userData.SerializeToString(&buffer);
-    }
-    auto t2 = std::chrono::steady_clock::now();
-    //纳秒级
-    double dr_ns = std::chrono::duration<double, std::nano>(t2 - t1).count();
-    //微妙级
-    double dr_us = std::chrono::duration<double, std::micro>(t2 - t1).count();
-    std::cout << "[pb cost: " << dr_ns << " ns]" << std::endl;
-    std::cout << "[pb cost: " << dr_us << " us]" << std::endl;*/
+    const MyStruct s{};
+    constexpr int loops = 1000000;
 
-    //------------------解析----------------------
-    /*dto::UserData rsp2{};
-    if (!rsp2.ParseFromString(buffer))
-    {
-        std::cout << "parse error\n";
-    }
-    auto name = rsp2.name();
-    // 清理 Protobuf 库
-    google::protobuf::ShutdownProtobufLibrary();
-    std::cout << "name:" << name << std::endl;*/
+    // 如果有 protobuf proto
+    // auto protobufTime = testProtobuf(s, loops);
+    // std::cout << std::format("Protobuf serialize cost: {:.3f} us\n", protobufTime);
 
-    // jsoncpp
-    const auto t3 = std::chrono::steady_clock::now();
-    for (auto i = 0; i < 10000; i++)
-    {
-        buffer.clear();  // 必须清空，否则后续 write_json 会追加内容
-        Json::Value root;
-        root["id"] = 1;
-        root["name"] = "b";
-        buffer = root.toStyledString();
-    }
-    const auto t4 = std::chrono::steady_clock::now();
-    //纳秒级
-    const double dr_ns1 = std::chrono::duration<double, std::nano>(t4 - t3).count();
-    std::cout << "[jsoncpp cost: " << std::format("{}", dr_ns1) << " ns]" << std::endl;
+    auto glazeJsonTime = testGlazeJson(s, loops);
+    std::cout << std::format("Glaze JSON serialize cost: {:.3f} us\n", glazeJsonTime);
 
-    // rapidjson
-    const auto t5 = std::chrono::steady_clock::now();
-    for (auto i = 0; i < 10000; i++)
-    {
-        buffer.clear();  // 必须清空，否则后续 write_json 会追加内容
-        StringBuffer buf;
-        PrettyWriter writer(buf);  // it can word wrap
-        writer.StartObject();
-        writer.Key("id");
-        writer.Int(1);
-        writer.Key("name");
-        writer.String("a");
-        writer.EndObject();
-        buffer = buf.GetString();
-    }
-    const auto t6 = std::chrono::steady_clock::now();
-    //纳秒级
-    const double dr_ns2 = std::chrono::duration<double, std::nano>(t6 - t5).count();
-    std::cout << "[rapidjson cost: " << std::format("{}", dr_ns2) << " ns]" << std::endl;
+    auto glazeBeveTime = testGlazeBeve(s, loops);
+    std::cout << std::format("Glaze BEVE serialize cost: {:.3f} us\n", glazeBeveTime);
 
-    // onlohmannJson
-    const auto t7 = std::chrono::steady_clock::now();
-    for (auto i = 0; i < 10000; i++)
-    {
-        buffer.clear();  // 必须清空，否则后续 write_json 会追加内容
-        json onlohmannJson;
-        onlohmannJson["id"] = 1;
-        onlohmannJson["name"] = "c";
-        buffer = onlohmannJson.dump();
-    }
-    const auto t8 = std::chrono::steady_clock::now();
-    //纳秒级
-    const double dr_ns3 = std::chrono::duration<double, std::nano>(t8 - t7).count();
-    std::cout << "[onlohmannJson cost: " << std::format("{}", dr_ns3) << " ns]" << std::endl;
+    auto nlohmannTime = testNlohmannJson(s, loops);
+    std::cout << std::format("nlohmann JSON serialize cost: {:.3f} us\n", nlohmannTime);
 
-    // glaze
-    MyStruct s{};
-    const auto t9 = std::chrono::steady_clock::now();
-    for (auto i = 0; i < 1000000; i++)
-    {
-        buffer.clear();  // 必须清空，否则后续 write_json 会追加内容
-        (void) glz::write_json(s, buffer);
-    }
-    const auto t10 = std::chrono::steady_clock::now();
-    //纳秒级
-    const double dr_ns4 = std::chrono::duration<double, std::nano>(t10 - t9).count();
-    std::cout << "[glaze cost: " <<  std::format("{}", dr_ns4) << " ns]" << std::endl;
+    auto rapidjsonTime = testRapidJson(s, loops);
+    std::cout << std::format("RapidJSON serialize cost: {:.3f} us\n", rapidjsonTime);
 
-    // 二进制序列化性能测试
-    std::vector<std::byte> bin_buffer;
-    bin_buffer.reserve(1024);
-    const auto t_bin_start = std::chrono::steady_clock::now();
-    for (int i = 0; i < 1000000; ++i) {
-        bin_buffer.clear();
-         (void) glz::write_beve(s, bin_buffer);
-    }
-    const auto t_bin_end = std::chrono::steady_clock::now();
-    double bin_ns = std::chrono::duration<double, std::nano>(t_bin_end - t_bin_start).count();
-    std::cout << "[glaze binary serialize cost: " << std::format("{} ns", bin_ns) << "]\n";
+    auto jsonCppTime = testJsonCpp(s, loops);
+    std::cout << std::format("jsonCpp serialize cost: {:.3f} us\n", jsonCppTime);
 
-    std::cout << "---------------xx-----------------" << std::endl;
+    // 预先序列化得到字符串和二进制数据，供反序列化测试使用
+    std::string glaze_json_str;
+    (void) glz::write_json(s, glaze_json_str);
 
-    MyStruct my_struct{};
-    (void) glz::read_json(my_struct, buffer);
-    (void) glz::read_beve(my_struct, bin_buffer);
-    //co_return callback(Base<MyStruct>::createHttpSuccessResponse(StatusOK, Success, my_struct));
+    std::vector<std::byte> glaze_beve_buffer;
+    glaze_beve_buffer.reserve(1024);
+    (void) glz::write_beve(s, glaze_beve_buffer);
+
+    // 反序列化测试
+    auto glazeJsonDesTime = testGlazeJsonDeserialize(glaze_json_str, loops);
+    std::cout << std::format("Glaze JSON deserialize cost: {:.3f} us\n", glazeJsonDesTime);
+
+    auto glazeBeveDesTime = testGlazeBeveDeserialize(glaze_beve_buffer, loops);
+    std::cout << std::format("Glaze BEVE deserialize cost: {:.3f} us\n", glazeBeveDesTime);
+
+    auto nlohmannDesTime = testNlohmannJsonDeserialize(glaze_json_str, loops);
+    std::cout << std::format("nlohmann JSON deserialize cost: {:.3f} us\n", nlohmannDesTime);
+
+    auto rapidjsonDesTime = testRapidJsonDeserialize(glaze_json_str, loops);
+    std::cout << std::format("RapidJSON deserialize cost: {:.3f} us\n", rapidjsonDesTime);
+
+    auto jsonCppDesTime = testJsonCppDeserialize(glaze_json_str, loops);
+    std::cout << std::format("jsoncpp deserialize cost: {:.3f} us\n", jsonCppDesTime);
+
 
     // protobuf
     /*dto::UserData protobufResponse;

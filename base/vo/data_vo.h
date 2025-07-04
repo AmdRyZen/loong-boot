@@ -93,53 +93,20 @@ struct glz::meta<UserDataListVo> {
     );
 };
 
-#include <vector>
-#include <map>
-#include <array>
-
-struct NestedStruct {
-    int nested_id = 42;
-    std::string nested_name = "nested";
-};
-
-template <>
-struct glz::meta<NestedStruct> {
-    using T = NestedStruct;
-    static constexpr auto value = object(
-        "nested_id", &T::nested_id,
-        "nested_name", &T::nested_name
-    );
-};
-
-struct alignas(16) MyStruct
-{
+// 测试结构体示例
+struct MyStruct {
     int id = 1;
-    double d = 3.14;
-    bool active = true;
-    std::string name = "Hello, this is a glaze response";
-    std::string message = "我草";
-
-    std::array<uint64_t, 3> arr = { 1, 2, 3 };
-    std::vector<int> vec = {10, 20, 30};
-    std::map<std::string, int> map{{"one", 1}, {"two", 2}};
-
-    NestedStruct nested{};
+    std::string name = "hello glaze";
+    std::string message = "性能测试";
 };
 
 template <>
 struct glz::meta<MyStruct> {
     using T = MyStruct;
-    static constexpr auto value = object(
+    static constexpr auto value = glz::object(
         "id", &T::id,
-        "d", &T::d,
-        "active", &T::active,
         "name", &T::name,
-        "message", &T::message,
-        "arr", &T::arr,
-        "vec", &T::vec,
-        "map", &T::map,
-        "nested", &T::nested
+        "message", &T::message
     );
 };
-
 #endif //DATA_VO_H
