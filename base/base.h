@@ -33,7 +33,7 @@ struct Base {
     // 序列化为 Binary 的方法
     [[nodiscard]] std::vector<std::byte> toBinary() const {
         std::vector<std::byte> binary_output;
-        (void) glz::write_as_binary(*this, binary_output);
+        (void) glz::write_beve(*this, binary_output);
         return binary_output;
     }
 

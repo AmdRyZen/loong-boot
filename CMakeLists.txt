@@ -24,41 +24,6 @@ check_include_file_cxx(coroutine HAS_COROUTINE)
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-
-# 架构特定的宏定义
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm)")
-    add_compile_options(-DARM_ARCH)
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64)")
-    add_compile_options(-DX86_ARCH)
-else()
-    message(WARNING "Unsupported architecture: ${CMAKE_SYSTEM_PROCESSOR}")
-endif()
-
-# 编译选项（极限性能）
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    set(CMAKE_CXX_FLAGS_DEBUG "-pipe -Wall -Wextra -Og -fsanitize=leak -L/usr/local/lib")
-    message(STATUS "Debug mode: ${CMAKE_CXX_FLAGS_DEBUG}")
-elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm)")
-        set(CMAKE_CXX_FLAGS_RELEASE
-                "-pipe -Ofast -mcpu=native -mtune=native -flto=auto -ffat-lto-objects -fopenmp -fipa-pta -freorder-blocks -fmerge-constants -finline-functions -falign-functions=32 -falign-loops=32 -funroll-loops -fgcse-after-reload -fdelete-null-pointer-checks -fweb -fno-stack-protector -L/usr/local/lib -DARM_ARCH -Wall -Wextra -Wno-unused-parameter -Wno-uninitialized -Wno-unused-function --param=max-inline-insns-single=5000 --param=inline-unit-growth=150 --param=large-function-growth=200 --param=max-inline-recursive-depth=10"
-        )
-        message(STATUS "Release mode for ARM: ${CMAKE_CXX_FLAGS_RELEASE}")
-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64)")
-        set(CMAKE_CXX_FLAGS_RELEASE
-                "-pipe -Ofast -march=native -mtune=native -flto=auto -ffat-lto-objects -fipa-pta -freorder-blocks -fmerge-constants -finline-functions -funroll-loops -fgcse-after-reload -fdelete-null-pointer-checks -fweb -fno-stack-protector -mfma -msse4.2 -mpopcnt -mavx2 -L/usr/local/lib -DX86_ARCH -Wall -Wextra -Wno-unused-parameter -Wno-uninitialized -Wno-unused-function --param=max-inline-insns-single=5000 --param=inline-unit-growth=150 --param=large-function-growth=200 --param=max-inline-recursive-depth=10"
-        )
-        message(STATUS "Release mode for x86: ${CMAKE_CXX_FLAGS_RELEASE}")
-    else()
-        set(CMAKE_CXX_FLAGS_RELEASE "-pipe -Ofast -march=native -mtune=native -flto=auto -L/usr/local/lib")
-        message(STATUS "Release mode: ${CMAKE_CXX_FLAGS_RELEASE}")
-    endif()
-else()
-    message(WARNING "CMAKE_BUILD_TYPE not set, defaulting to Release")
-    set(CMAKE_CXX_FLAGS_RELEASE "-pipe -Ofast -march=native -mtune=native -flto=auto -L/usr/local/lib")
-    message(STATUS "Release mode: ${CMAKE_CXX_FLAGS_RELEASE}")
-endif()
-
 # 优先使用静态库
 set(FOO_USE_STATIC_LIBS ON)
 
@@ -66,14 +31,8 @@ set(FOO_USE_STATIC_LIBS ON)
 add_compile_options(-Wno-deprecated-declarations)
 add_compile_options(-Wno-missing-requires)
 find_package(Protobuf REQUIRED)
-if(PROTOBUF_FOUND)
-    message(STATUS "Protobuf library found")
-else()
-    message(FATAL_ERROR "Protobuf library is needed but cannot be found")
-endif()
-link_directories(/usr/local/lib)
 include_directories(${Protobuf_INCLUDE_DIRS})
-add_subdirectory(proto)
+add_subdirectory(proto)  # 保留，如果你有 proto 子目录
 include_directories(${PROTO_GEN_C_INCLUDE_DIRS} ${PROTO_GEN_CXX_INCLUDE_DIRS})
 
 # 源文件
@@ -145,7 +104,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
         rdkafka
         TBB::tbb
         mimalloc
-        #[[proto_gen_cxx]]
+        proto_gen_cxx
 )
 
 # 编译定义
@@ -189,3 +148,37 @@ target_sources(${PROJECT_NAME}
 
 # 测试子目录
 add_subdirectory(test)
+
+# 架构特定的宏定义
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm)")
+    add_compile_options(-DARM_ARCH)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64)")
+    add_compile_options(-DX86_ARCH)
+else()
+    message(WARNING "Unsupported architecture: ${CMAKE_SYSTEM_PROCESSOR}")
+endif()
+
+# 编译选项（极限性能）
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(CMAKE_CXX_FLAGS_DEBUG "-pipe -Wall -Wextra -Og -fsanitize=leak -L/usr/local/lib")
+    message(STATUS "Debug mode: ${CMAKE_CXX_FLAGS_DEBUG}")
+elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm)")
+        set(CMAKE_CXX_FLAGS_RELEASE
+                "-pipe -Ofast -mcpu=native -mtune=native -flto=auto -ffat-lto-objects -fopenmp -fipa-pta -freorder-blocks -fmerge-constants -finline-functions -falign-functions=32 -falign-loops=32 -funroll-loops -fgcse-after-reload -fdelete-null-pointer-checks -fweb -fno-stack-protector -L/usr/local/lib -DARM_ARCH -Wall -Wextra -Wno-unused-parameter -Wno-uninitialized -Wno-unused-function --param=max-inline-insns-single=5000 --param=inline-unit-growth=150 --param=large-function-growth=200 --param=max-inline-recursive-depth=10"
+        )
+        message(STATUS "Release mode for ARM: ${CMAKE_CXX_FLAGS_RELEASE}")
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64)")
+        set(CMAKE_CXX_FLAGS_RELEASE
+                "-pipe -Ofast -march=native -mtune=native -flto=auto -ffat-lto-objects -fipa-pta -freorder-blocks -fmerge-constants -finline-functions -funroll-loops -fgcse-after-reload -fdelete-null-pointer-checks -fweb -fno-stack-protector -mfma -msse4.2 -mpopcnt -mavx2 -L/usr/local/lib -DX86_ARCH -Wall -Wextra -Wno-unused-parameter -Wno-uninitialized -Wno-unused-function --param=max-inline-insns-single=5000 --param=inline-unit-growth=150 --param=large-function-growth=200 --param=max-inline-recursive-depth=10"
+        )
+        message(STATUS "Release mode for x86: ${CMAKE_CXX_FLAGS_RELEASE}")
+    else()
+        set(CMAKE_CXX_FLAGS_RELEASE "-pipe -Ofast -march=native -mtune=native -flto=auto -L/usr/local/lib")
+        message(STATUS "Release mode: ${CMAKE_CXX_FLAGS_RELEASE}")
+    endif()
+else()
+    message(WARNING "CMAKE_BUILD_TYPE not set, defaulting to Release")
+    set(CMAKE_CXX_FLAGS_RELEASE "-pipe -Ofast -march=native -mtune=native -flto=auto -L/usr/local/lib")
+    message(STATUS "Release mode: ${CMAKE_CXX_FLAGS_RELEASE}")
+endif()

@@ -518,6 +518,9 @@ Task<> OpenApi::getValue(const HttpRequestPtr req,
 Task<> OpenApi::fastJson(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
 {
     std::string buffer{};
+    buffer.reserve(1024);
+    GOOGLE_PROTOBUF_VERIFY_VERSION;
+    std::cout << "Protocol Buffers version: " << GOOGLE_PROTOBUF_VERSION << std::endl;
 
     /*auto t1 = std::chrono::steady_clock::now();
     for (auto i = 0; i < 1000; i++)
@@ -550,8 +553,9 @@ Task<> OpenApi::fastJson(const HttpRequestPtr req, std::function<void(const Http
 
     // jsoncpp
     const auto t3 = std::chrono::steady_clock::now();
-    for (auto i = 0; i < 1000; i++)
+    for (auto i = 0; i < 10000; i++)
     {
+        buffer.clear();  // 必须清空，否则后续 write_json 会追加内容
         Json::Value root;
         root["id"] = 1;
         root["name"] = "b";
@@ -564,8 +568,9 @@ Task<> OpenApi::fastJson(const HttpRequestPtr req, std::function<void(const Http
 
     // rapidjson
     const auto t5 = std::chrono::steady_clock::now();
-    for (auto i = 0; i < 1000; i++)
+    for (auto i = 0; i < 10000; i++)
     {
+        buffer.clear();  // 必须清空，否则后续 write_json 会追加内容
         StringBuffer buf;
         PrettyWriter writer(buf);  // it can word wrap
         writer.StartObject();
@@ -583,8 +588,9 @@ Task<> OpenApi::fastJson(const HttpRequestPtr req, std::function<void(const Http
 
     // onlohmannJson
     const auto t7 = std::chrono::steady_clock::now();
-    for (auto i = 0; i < 1000; i++)
+    for (auto i = 0; i < 10000; i++)
     {
+        buffer.clear();  // 必须清空，否则后续 write_json 会追加内容
         json onlohmannJson;
         onlohmannJson["id"] = 1;
         onlohmannJson["name"] = "c";
@@ -596,23 +602,35 @@ Task<> OpenApi::fastJson(const HttpRequestPtr req, std::function<void(const Http
     std::cout << "[onlohmannJson cost: " << std::format("{}", dr_ns3) << " ns]" << std::endl;
 
     // glaze
+    MyStruct s{};
     const auto t9 = std::chrono::steady_clock::now();
-    for (auto i = 0; i < 1000; i++)
+    for (auto i = 0; i < 1000000; i++)
     {
-        MyStruct s{};
-        // BEVE
+        buffer.clear();  // 必须清空，否则后续 write_json 会追加内容
         (void) glz::write_json(s, buffer);
-        // glz::write_binary(s, buffer);
     }
     const auto t10 = std::chrono::steady_clock::now();
     //纳秒级
     const double dr_ns4 = std::chrono::duration<double, std::nano>(t10 - t9).count();
     std::cout << "[glaze cost: " <<  std::format("{}", dr_ns4) << " ns]" << std::endl;
 
+    // 二进制序列化性能测试
+    std::vector<std::byte> bin_buffer;
+    bin_buffer.reserve(1024);
+    const auto t_bin_start = std::chrono::steady_clock::now();
+    for (int i = 0; i < 1000000; ++i) {
+        bin_buffer.clear();
+         (void) glz::write_beve(s, bin_buffer);
+    }
+    const auto t_bin_end = std::chrono::steady_clock::now();
+    double bin_ns = std::chrono::duration<double, std::nano>(t_bin_end - t_bin_start).count();
+    std::cout << "[glaze binary serialize cost: " << std::format("{} ns", bin_ns) << "]\n";
+
     std::cout << "---------------xx-----------------" << std::endl;
 
     MyStruct my_struct{};
     (void) glz::read_json(my_struct, buffer);
+    (void) glz::read_beve(my_struct, bin_buffer);
     //co_return callback(Base<MyStruct>::createHttpSuccessResponse(StatusOK, Success, my_struct));
 
     // protobuf
