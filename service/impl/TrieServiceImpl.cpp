@@ -10,6 +10,21 @@
 
 constexpr wchar_t kEndFlag = L'ﾰ';  // unicode: FFB0
 
+static bool isStopCharacter(const wchar_t ch)
+{
+    const int code = static_cast<int>(static_cast<unsigned char>(ch));
+    // 常见全角标点和符号区间
+    if (code >= 0x3000 && code <= 0x303F)
+        return true;
+    // 常见符号区间
+    if (code >= 0x2000 && code <= 0x206F)
+        return true;
+    // Emoji 区间
+    if (code >= 0x1F300 && code <= 0x1FAFF)
+        return true;
+    return false;
+}
+
 TrieNode::TrieNode() = default;
 
 TrieNode::~TrieNode()
@@ -38,7 +53,7 @@ void TrieService::insert(const std::wstring& word)
     TrieNode* curNode = root_;
     for (wchar_t code : word)
     {
-        int unicode = SbcConvertService::charConvert(code);
+        const int unicode = SbcConvertService::charConvert(code);
         TrieNode* subNode = curNode->getSubNode(unicode);
 
         if (subNode == nullptr)
@@ -48,7 +63,7 @@ void TrieService::insert(const std::wstring& word)
         }
         curNode = subNode;
     }
-    int unicode = SbcConvertService::charConvert(kEndFlag);
+    const int unicode = SbcConvertService::charConvert(kEndFlag);
     curNode->addSubNode(unicode, new TrieNode());
 }
 
@@ -57,8 +72,7 @@ bool TrieService::search(const std::wstring& word)
     bool is_contain = false;
     for (size_t i = 0; i < word.length(); ++i)
     {
-        int wordLen = getSensitiveLength(word, i);
-        if (wordLen > 0)
+        if (const int wordLen = getSensitiveLength(word, i); wordLen > 0)
         {
             is_contain = true;
             break;
@@ -72,7 +86,7 @@ bool TrieService::startsWith(const std::wstring& prefix)
     TrieNode* curNode = root_;
     for (wchar_t item : prefix)
     {
-        int unicode = SbcConvertService::charConvert(item);
+        const int unicode = SbcConvertService::charConvert(item);
         curNode = curNode->getSubNode(unicode);
         if (curNode == nullptr)
         {
@@ -87,8 +101,7 @@ std::set<SensitiveWord> TrieService::getSensitive(const std::wstring& word)
     std::set<SensitiveWord> sensitiveSet;
     for (size_t i = 0; i < word.length(); ++i)
     {
-        const int wordLen = getSensitiveLength(word, i);
-        if (wordLen > 0)
+        if (const int wordLen = getSensitiveLength(word, i); wordLen > 0)
         {
             const std::wstring sensitiveWord = word.substr(i, wordLen);
             SensitiveWord wordObj;
@@ -114,8 +127,7 @@ int TrieService::getSensitiveLength(const std::wstring& word, const size_t start
         const auto subNode = p1->getSubNode(unicode);
         if (subNode == nullptr)
         {
-            // 如果是停顿词，直接往下继续查找
-            if (stop_words_.contains(unicode))
+            if (stop_words_.contains(unicode) || isStopCharacter(word[p3]))
             {
                 ++wordLen;
                 continue;

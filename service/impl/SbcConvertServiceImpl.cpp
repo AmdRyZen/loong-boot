@@ -4,7 +4,6 @@
 
 #include "../SbcConvertService.h"
 #include <boost/locale.hpp>
-#include "iostream"
 
 // ASCII表中可见字符从!开始，偏移位值为33(Decimal)
 constexpr char kDBCCharStart = 33;  // 半角!
@@ -24,50 +23,94 @@ constexpr wchar_t kSBCSpace = 0x508;  // 全角空格
 // 半角空格的值，在ASCII中为32(Decimal)
 constexpr wchar_t kDBCSpace = L' ';  // 半角空格
 
+// 手动实现 UTF-8 -> wstring
 std::wstring SbcConvertService::s2ws(const std::string& str)
 {
-    if (str.empty()) return {};
-
     std::wstring result;
-    result.reserve(str.size()); // 估计最大长度
-
-    auto state = std::mbstate_t();
-    const char* src = str.data();
-    size_t len = str.size();
-    wchar_t wc;
-
-    while (len > 0)
+    size_t i = 0;
+    while (i < str.size())
     {
-        const size_t ret = std::mbrtowc(&wc, src, len, &state);
-        if (ret == static_cast<size_t>(-1) || ret == static_cast<size_t>(-2))
-            throw std::runtime_error("flowchart conversion failed");
+        uint32_t codepoint = 0;
+        unsigned char ch = str[i];
+        size_t extraBytes = 0;
 
-        result.push_back(wc);
-        src += ret;
-        len -= ret;
+        if ((ch & 0x80) == 0x00)
+        {
+            codepoint = ch;
+            extraBytes = 0;
+        }
+        else if ((ch & 0xE0) == 0xC0)
+        {
+            codepoint = ch & 0x1F;
+            extraBytes = 1;
+        }
+        else if ((ch & 0xF0) == 0xE0)
+        {
+            codepoint = ch & 0x0F;
+            extraBytes = 2;
+        }
+        else if ((ch & 0xF8) == 0xF0)
+        {
+            codepoint = ch & 0x07;
+            extraBytes = 3;
+        }
+        else
+        {
+            // invalid byte
+            ++i;
+            continue;
+        }
+
+        if (i + extraBytes >= str.size())
+            break;
+
+        for (size_t j = 1; j <= extraBytes; ++j)
+        {
+            if ((str[i + j] & 0xC0) != 0x80)
+            {
+                codepoint = 0;
+                break;
+            }
+            codepoint = (codepoint << 6) | (str[i + j] & 0x3F);
+        }
+
+        if (codepoint != 0)
+            result += static_cast<wchar_t>(codepoint);
+
+        i += extraBytes + 1;
     }
+
     return result;
 }
 
+// 手动实现 wstring -> UTF-8
 std::string SbcConvertService::ws2s(const std::wstring& wstr)
 {
-    if (wstr.empty())
-        return {};
-
-    const size_t maxSize = wstr.size() * 4;
     std::string result;
-    result.reserve(maxSize);
-
-    std::mbstate_t state = std::mbstate_t();
-    char string[MB_LEN_MAX];
     for (const wchar_t wc : wstr)
     {
-        const size_t len = std::wcrtomb(string, wc, &state);
-        if (len == static_cast<size_t>(-1)) {
-            std::memset(&state, 0, sizeof(state)); // 重置状态
-            continue;
+        if (const auto codepoint = static_cast<uint32_t>(static_cast<unsigned int>(wc)); codepoint <= 0x7F)
+        {
+            result.push_back(static_cast<char>(codepoint));
         }
-        result.append(string, len);
+        else if (codepoint <= 0x7FF)
+        {
+            result.push_back(static_cast<char>(0xC0 | ((codepoint >> 6) & 0x1F)));
+            result.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+        }
+        else if (codepoint <= 0xFFFF)
+        {
+            result.push_back(static_cast<char>(0xE0 | ((codepoint >> 12) & 0x0F)));
+            result.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+            result.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+        }
+        else
+        {
+            result.push_back(static_cast<char>(0xF0 | ((codepoint >> 18) & 0x07)));
+            result.push_back(static_cast<char>(0x80 | ((codepoint >> 12) & 0x3F)));
+            result.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+            result.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+        }
     }
     return result;
 }
@@ -79,7 +122,7 @@ int SbcConvertService::qj2bj(const wchar_t& src)
     {
         return src - kConvertStep;
     }
-    else if (src == kSBCSpace)
+    if (src == kSBCSpace)
     {  // 如果是全角空格
         return kDBCSpace;
     }
