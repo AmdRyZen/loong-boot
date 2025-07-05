@@ -17,7 +17,6 @@
 #include <boost/multiprecision/cpp_dec_float.hpp>
 #include <boost/uuid/uuid_io.hpp>
 #include <execution> // 可能需要此头文件
-#include <glaze/glaze.hpp>
 #include "base/base.h"
 #include "base/vo/data_vo.h"
 #include "coroutinePool/CoroutinePool.h"

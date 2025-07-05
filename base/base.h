@@ -5,6 +5,8 @@
 #ifndef BASE_H
 #define BASE_H
 
+// 在包含 glaze 前取消强制内联
+#define GLZ_ALWAYS_INLINE inline
 #include <glaze/glaze.hpp>
 #include <google/protobuf/stubs/common.h>
 

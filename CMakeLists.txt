@@ -20,19 +20,83 @@ check_include_file_cxx(any HAS_ANY)
 check_include_file_cxx(string_view HAS_STRING_VIEW)
 check_include_file_cxx(coroutine HAS_COROUTINE)
 
-# 设置 C++26 标准
+# 设置 C++26 标
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-# 优先使用静态库
 set(FOO_USE_STATIC_LIBS ON)
+set(CMAKE_BUILD_PARALLEL_LEVEL 8)
+
+# 可配置的优化选项
+option(AGGRESSIVE_OPT "启用激进优化" ON)
+option(USE_LTO "启用链接时优化" ON)
+option(USE_OPENMP "启用 OpenMP 并行化" ON)
+option(USE_WNO "关闭警告" ON)
+
+#关闭警告
+if(USE_WNO)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-stringop-overread")
+    add_compile_options(-Wno-stringop-overread)
+endif()
+
+# 检测目标架构并定义宏
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm)")
+    add_compile_definitions(ARM_ARCH)
+    add_compile_options(-mcpu=native -mtune=native)
+    message(STATUS "为 ARM 架构配置")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64)")
+    add_compile_definitions(DX86_ARCH)
+    add_compile_options(-march=native -mtune=native -mfma -msse4.2 -mpopcnt -mavx2)
+    message(STATUS "为 x86_64 架构配置")
+else()
+    message(WARNING "不支持的架构: ${CMAKE_SYSTEM_PROCESSOR}，使用通用设置")
+endif()
+
+# 激进优化选项
+if(AGGRESSIVE_OPT)
+    add_compile_options(-fno-stack-protector)
+    add_compile_options(-fweb)
+    add_compile_options(-fgcse-after-reload)
+    add_compile_options(-fdelete-null-pointer-checks)
+    add_compile_options(--param=inline-unit-growth=3000)
+    add_compile_options(--param=max-inline-insns-single=5000)
+    add_compile_options(--param=large-function-growth=3000)
+    add_compile_options(--param=max-inline-recursive-depth=12)
+endif()
+
+# 链接时优化（LTO）选项
+if(USE_LTO)
+    add_compile_options(-flto=auto)
+    add_compile_options(-ffat-lto-objects)
+endif()
+
+# OpenMP 并行化选项
+if(USE_OPENMP)
+    set(OPENMP_FLAGS "-fopenmp")
+else()
+    set(OPENMP_FLAGS "")
+endif()
+
+# 针对不同构建类型的编译选项
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_compile_options(-pipe -Wall -Wextra -Wno-unused-parameter -Wno-uninitialized -Wno-unused-function -Wno-deprecated-declarations -Wno-missing-requires -Og -fsanitize=leak)
+    message(STATUS "调试模式: 启用 -Og -fsanitize=leak")
+elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
+    add_compile_options(-pipe -Wall -Wextra -Wno-unused-parameter -Wno-uninitialized -Wno-unused-function -Wno-deprecated-declarations -Wno-missing-requires -Ofast -fipa-pta -freorder-blocks -finline-functions -falign-functions=32 -falign-loops=32 -funroll-loops ${AGGRESSIVE_FLAGS} ${LTO_FLAGS} ${OPENMP_FLAGS})
+    message(STATUS "发布模式: 启用 -Ofast 等优化")
+else()
+    message(WARNING "未设置 CMAKE_BUILD_TYPE，默认使用 Release 模式")
+    add_compile_options(-pipe -Wall -Wextra -Wno-unused-parameter -Wno-uninitialized -Wno-unused-function -Wno-deprecated-declarations -Wno-missing-requires -Ofast ${LTO_FLAGS})
+    message(STATUS "发布模式（默认）: 启用 -Ofast 等优化")
+endif()
+
+# 设置链接路径
+add_link_options(-L/usr/local/lib)
 
 # 查找 Protobuf
-add_compile_options(-Wno-deprecated-declarations)
-add_compile_options(-Wno-missing-requires)
 find_package(Protobuf REQUIRED)
 include_directories(${Protobuf_INCLUDE_DIRS})
-add_subdirectory(proto)  # 保留，如果你有 proto 子目录
+add_subdirectory(proto)
 include_directories(${PROTO_GEN_C_INCLUDE_DIRS} ${PROTO_GEN_CXX_INCLUDE_DIRS})
 
 # 源文件
@@ -84,7 +148,7 @@ include(FetchContent)
 FetchContent_Declare(
         glaze
         GIT_REPOSITORY https://github.com/stephenberry/glaze.git
-        GIT_TAG main  # 请检查 GitHub 获取最新稳定版本
+        GIT_TAG main  # 替换为最新版本，例如 v6.0.0
         GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(glaze)
@@ -109,8 +173,6 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 
 # 编译定义
 target_compile_definitions(${PROJECT_NAME} PRIVATE MI_MALLOC=1)
-# 适用于 Clang 或 GCC
-#add_link_options(-fuse-ld=mold)
 
 # 启用 ccache
 find_program(CCACHE_PROGRAM ccache)
@@ -148,37 +210,3 @@ target_sources(${PROJECT_NAME}
 
 # 测试子目录
 add_subdirectory(test)
-
-# 架构特定的宏定义
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm)")
-    add_compile_options(-DARM_ARCH)
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64)")
-    add_compile_options(-DX86_ARCH)
-else()
-    message(WARNING "Unsupported architecture: ${CMAKE_SYSTEM_PROCESSOR}")
-endif()
-
-# 编译选项（极限性能）
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    set(CMAKE_CXX_FLAGS_DEBUG "-pipe -Wall -Wextra -Og -fsanitize=leak -L/usr/local/lib")
-    message(STATUS "Debug mode: ${CMAKE_CXX_FLAGS_DEBUG}")
-elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm)")
-        set(CMAKE_CXX_FLAGS_RELEASE
-                "-pipe -Ofast -mcpu=native -mtune=native -flto=auto -ffat-lto-objects -fopenmp -fipa-pta -freorder-blocks -fmerge-constants -finline-functions -falign-functions=32 -falign-loops=32 -funroll-loops -fgcse-after-reload -fdelete-null-pointer-checks -fweb -fno-stack-protector -L/usr/local/lib -DARM_ARCH -Wall -Wextra -Wno-unused-parameter -Wno-uninitialized -Wno-unused-function --param=max-inline-insns-single=5000 --param=inline-unit-growth=150 --param=large-function-growth=200 --param=max-inline-recursive-depth=10"
-        )
-        message(STATUS "Release mode for ARM: ${CMAKE_CXX_FLAGS_RELEASE}")
-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64)")
-        set(CMAKE_CXX_FLAGS_RELEASE
-                "-pipe -Ofast -march=native -mtune=native -flto=auto -ffat-lto-objects -fipa-pta -freorder-blocks -fmerge-constants -finline-functions -funroll-loops -fgcse-after-reload -fdelete-null-pointer-checks -fweb -fno-stack-protector -mfma -msse4.2 -mpopcnt -mavx2 -L/usr/local/lib -DX86_ARCH -Wall -Wextra -Wno-unused-parameter -Wno-uninitialized -Wno-unused-function --param=max-inline-insns-single=5000 --param=inline-unit-growth=150 --param=large-function-growth=200 --param=max-inline-recursive-depth=10"
-        )
-        message(STATUS "Release mode for x86: ${CMAKE_CXX_FLAGS_RELEASE}")
-    else()
-        set(CMAKE_CXX_FLAGS_RELEASE "-pipe -Ofast -march=native -mtune=native -flto=auto -L/usr/local/lib")
-        message(STATUS "Release mode: ${CMAKE_CXX_FLAGS_RELEASE}")
-    endif()
-else()
-    message(WARNING "CMAKE_BUILD_TYPE not set, defaulting to Release")
-    set(CMAKE_CXX_FLAGS_RELEASE "-pipe -Ofast -march=native -mtune=native -flto=auto -L/usr/local/lib")
-    message(STATUS "Release mode: ${CMAKE_CXX_FLAGS_RELEASE}")
-endif()
