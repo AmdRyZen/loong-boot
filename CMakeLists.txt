@@ -11,7 +11,14 @@ endif()
 set(CMAKE_C_COMPILER "/opt/homebrew/Cellar/gcc/15.1.0/bin/gcc-15")
 set(CMAKE_CXX_COMPILER "/opt/homebrew/Cellar/gcc/15.1.0/bin/g++-15")
 
+
 project(loong-boot C CXX)
+
+# 确保始终设置 CMAKE_BUILD_TYPE
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type (default Release)" FORCE)
+    message(WARNING "未设置 CMAKE_BUILD_TYPE，默认使用 Release 模式")
+endif()
 
 include(CheckIncludeFileCXX)
 
@@ -33,62 +40,8 @@ option(USE_LTO "启用链接时优化" ON)
 option(USE_OPENMP "启用 OpenMP 并行化" ON)
 option(USE_WNO "关闭警告" ON)
 
-#关闭警告
-if(USE_WNO)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-stringop-overread")
-    add_compile_options(-Wno-stringop-overread)
-endif()
-
-# 检测目标架构并定义宏
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm)")
-    add_compile_definitions(ARM_ARCH)
-    add_compile_options(-mcpu=native -mtune=native)
-    message(STATUS "为 ARM 架构配置")
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64)")
-    add_compile_definitions(DX86_ARCH)
-    add_compile_options(-march=native -mtune=native -mfma -msse4.2 -mpopcnt -mavx2)
-    message(STATUS "为 x86_64 架构配置")
-else()
-    message(WARNING "不支持的架构: ${CMAKE_SYSTEM_PROCESSOR}，使用通用设置")
-endif()
-
-# 激进优化选项
-if(AGGRESSIVE_OPT)
-    add_compile_options(-fno-stack-protector)
-    add_compile_options(-fweb)
-    add_compile_options(-fgcse-after-reload)
-    add_compile_options(-fdelete-null-pointer-checks)
-    add_compile_options(--param=inline-unit-growth=3000)
-    add_compile_options(--param=max-inline-insns-single=5000)
-    add_compile_options(--param=large-function-growth=3000)
-    add_compile_options(--param=max-inline-recursive-depth=12)
-endif()
-
-# 链接时优化（LTO）选项
-if(USE_LTO)
-    add_compile_options(-flto=auto)
-    add_compile_options(-ffat-lto-objects)
-endif()
-
-# OpenMP 并行化选项
-if(USE_OPENMP)
-    set(OPENMP_FLAGS "-fopenmp")
-else()
-    set(OPENMP_FLAGS "")
-endif()
-
-# 针对不同构建类型的编译选项
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    add_compile_options(-pipe -Wall -Wextra -Wno-unused-parameter -Wno-uninitialized -Wno-unused-function -Wno-deprecated-declarations -Wno-missing-requires -Og -fsanitize=leak)
-    message(STATUS "调试模式: 启用 -Og -fsanitize=leak")
-elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
-    add_compile_options(-pipe -Wall -Wextra -Wno-unused-parameter -Wno-uninitialized -Wno-unused-function -Wno-deprecated-declarations -Wno-missing-requires -Ofast -fipa-pta -freorder-blocks -finline-functions -falign-functions=32 -falign-loops=32 -funroll-loops ${AGGRESSIVE_FLAGS} ${LTO_FLAGS} ${OPENMP_FLAGS})
-    message(STATUS "发布模式: 启用 -Ofast 等优化")
-else()
-    message(WARNING "未设置 CMAKE_BUILD_TYPE，默认使用 Release 模式")
-    add_compile_options(-pipe -Wall -Wextra -Wno-unused-parameter -Wno-uninitialized -Wno-unused-function -Wno-deprecated-declarations -Wno-missing-requires -Ofast ${LTO_FLAGS})
-    message(STATUS "发布模式（默认）: 启用 -Ofast 等优化")
-endif()
+option(USE_PGO_GEN "启用 PGO 生成阶段" OFF)
+option(USE_PGO_USE "启用 PGO 使用阶段" OFF)
 
 # 设置链接路径
 add_link_options(-L/usr/local/lib)
@@ -143,6 +96,84 @@ add_executable(
         service/impl/TrieServiceImpl.cpp
 )
 
+if(NOT USE_PGO_GEN)
+    set_target_properties(${PROJECT_NAME} PROPERTIES INTERPROCEDURAL_OPTIMIZATION ${USE_LTO})
+endif()
+
+# 对于 PGO 使用阶段：
+if(USE_PGO_USE)
+    target_compile_options(${PROJECT_NAME} PRIVATE
+            -fprofile-use
+    )
+    target_link_options(${PROJECT_NAME} PRIVATE -fprofile-use)
+endif()
+
+# 对于 PGO 生成阶段：
+if(USE_PGO_GEN)
+    target_compile_options(${PROJECT_NAME} PRIVATE
+            -fprofile-generate
+    )
+    target_link_options(${PROJECT_NAME} PRIVATE -fprofile-generate)
+endif()
+
+#关闭警告
+if(USE_WNO)
+    add_compile_options(
+            -Wno-missing-requires
+            -Wno-deprecated-declarations
+            -Wno-stringop-overread
+    )
+endif()
+
+# 检测目标架构并定义宏
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm)")
+    add_compile_definitions(ARM_ARCH)
+    target_compile_options(${PROJECT_NAME} PRIVATE -mcpu=native -mtune=native)
+    message(STATUS "为 ARM 架构配置")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64)")
+    add_compile_definitions(DX86_ARCH)
+    target_compile_options(${PROJECT_NAME} PRIVATE -march=native -mtune=native -mfma -msse4.2 -mpopcnt -mavx2)
+    message(STATUS "为 x86_64 架构配置")
+else()
+    message(WARNING "不支持的架构: ${CMAKE_SYSTEM_PROCESSOR}，使用通用设置")
+endif()
+
+# 激进优化选项
+if(AGGRESSIVE_OPT)
+    target_compile_options(${PROJECT_NAME} PRIVATE
+        -fno-stack-protector
+        -fweb
+        -fgcse-after-reload
+        -fdelete-null-pointer-checks
+        --param=inline-unit-growth=3000
+        --param=max-inline-insns-single=5000
+        --param=large-function-growth=3000
+        --param=max-inline-recursive-depth=12
+    )
+endif()
+
+# 链接时优化（LTO）选项
+if(USE_LTO AND NOT USE_PGO_GEN)
+    target_compile_options(${PROJECT_NAME} PRIVATE -flto=auto -ffat-lto-objects)
+endif()
+
+# OpenMP 并行化选项
+if(USE_OPENMP)
+    set(OPENMP_FLAGS "-fopenmp")
+else()
+    set(OPENMP_FLAGS "")
+endif()
+
+# 针对不同构建类型的编译选项
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    target_compile_options(${PROJECT_NAME} PRIVATE -pipe -Wall -Wextra -Wno-unused-parameter -Wno-uninitialized -Wno-unused-function -Wno-deprecated-declarations -Wno-missing-requires -Og -fsanitize=leak)
+    message(STATUS "调试模式: 启用 -Og -fsanitize=leak")
+elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
+    target_compile_options(${PROJECT_NAME} PRIVATE -pipe -Wall -Wextra -Wno-unused-parameter -Wno-uninitialized -Wno-unused-function -Wno-deprecated-declarations -Wno-missing-requires -Ofast -fipa-pta -freorder-blocks -finline-functions -falign-functions=32 -falign-loops=32 -funroll-loops ${AGGRESSIVE_FLAGS} ${LTO_FLAGS} ${OPENMP_FLAGS})
+    message(STATUS "发布模式: 启用 -Ofast 等优化")
+# 这里不再有 else 分支，因为 CMAKE_BUILD_TYPE 已确保被设置
+endif()
+
 # 拉取 Glaze 稳定版本
 include(FetchContent)
 FetchContent_Declare(
@@ -155,8 +186,8 @@ FetchContent_MakeAvailable(glaze)
 
 # 查找其他依赖
 find_package(Drogon CONFIG REQUIRED)
-find_package(mimalloc 2.1.7 REQUIRED)
-find_package(Boost 1.86.0 REQUIRED)
+find_package(mimalloc 3.1.5 REQUIRED)
+find_package(Boost 1.88.0 REQUIRED)
 find_package(TBB REQUIRED)
 
 # 链接库
@@ -207,6 +238,12 @@ target_sources(${PROJECT_NAME}
         ${PLUGIN_SRC}
         ${MODEL_SRC}
 )
+
+# === 构建脚本提示（PGO） ===
+# 使用如下命令手动构建生成 profile 数据：
+# sh ./build.sh gen             # 使用 Release 模式生成 PGO 数据
+# ./build-pgo-gen/loong-boot # 运行一次完整业务
+# sh ./build.sh use             # 使用 Release 模式构建优化版本
 
 # 测试子目录
 add_subdirectory(test)

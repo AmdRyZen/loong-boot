@@ -25,7 +25,7 @@ class DROGON_EXPORT LoginFilter final : public HttpFilter<LoginFilter>
 };
 }  // namespace drogon
 
-[[gnu::always_inline]] inline void LoginFilter::doFilter(const HttpRequestPtr& req, FilterCallback&& fcb, FilterChainCallback&& fccb)
+inline void LoginFilter::doFilter(const HttpRequestPtr& req, FilterCallback&& fcb, FilterChainCallback&& fccb)
 {
     //Edit your logic here
     if (checkloginUtils::checklogin(req).has_value())
