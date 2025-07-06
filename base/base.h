@@ -25,11 +25,24 @@ struct Base {
     T data; // 泛型数据
     std::string message = Success; // 默认消息
 
+private:
+    // 静态线程本地缓冲区用于高性能 JSON 序列化
+    static inline thread_local std::string sharedBuf;
+
+public:
     // 序列化为 JSON 的方法
     [[nodiscard]] std::string toJson() const {
         std::string json_output;
         (void) glz::write_json(*this, json_output);
         return json_output;
+    }
+
+    // 高性能 JSON 序列化方法，使用静态缓冲区，避免重复分配
+    [[nodiscard]] std::string toJsonFast() const {
+        sharedBuf.clear();
+        sharedBuf.reserve(8192); // 避免重复分配
+        (void) glz::write_json(*this, sharedBuf);
+        return sharedBuf;
     }
 
     // 序列化为 Binary 的方法
@@ -50,7 +63,7 @@ struct Base {
         auto resp = HttpResponse::newHttpResponse();
         resp->setStatusCode(k200OK);
         resp->setContentTypeCode(CT_APPLICATION_JSON);
-        resp->setBody(response.toJson());
+        resp->setBody(response.toJsonFast());
         return resp;
     }
 
@@ -65,7 +78,7 @@ struct Base {
         auto resp = HttpResponse::newHttpResponse();
         resp->setStatusCode(k400BadRequest);
         resp->setContentTypeCode(CT_APPLICATION_JSON);
-        resp->setBody(response.toJson());
+        resp->setBody(response.toJsonFast());
         return resp;
     }
 
@@ -80,7 +93,7 @@ struct Base {
         auto resp = HttpResponse::newHttpResponse();
         resp->setStatusCode(k401Unauthorized);
         resp->setContentTypeCode(CT_APPLICATION_JSON);
-        resp->setBody(response.toJson());
+        resp->setBody(response.toJsonFast());
         return resp;
     }
 

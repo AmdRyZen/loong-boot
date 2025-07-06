@@ -43,11 +43,11 @@ Task<> OpenApi::tbb(const HttpRequestPtr req, std::function<void(const HttpRespo
     constexpr double step = 1.0 / static_cast<double>(num_steps);
 
     const double pi_tbb = tbb::parallel_reduce(
-        tbb::blocked_range<long>(0, num_steps),
+        tbb::blocked_range<int>(0, num_steps),
         0.0,
-        [=](tbb::blocked_range<long> const& r, double sum) -> double {
+        [=](tbb::blocked_range<int> const& r, double sum) -> double {
             for (long i = r.begin(); i < r.end(); ++i) {
-                const double x = (i + 0.5) * step;
+                const double x = (static_cast<double>(i) + 0.5) * step;
                 sum += 4.0 / (1.0 + x * x);
             }
             return sum;
@@ -524,26 +524,61 @@ double measure(Func&& f) {
 }
 
 // Glaze JSON 测试
-double testGlazeJson(const MyStruct& s, const int loops) {
-    std::string buffer;
+template <typename T>
+double testGlazeJson(const T& s, const int loops) {
+    thread_local std::string buffer;
+    buffer.clear();
     buffer.reserve(1024);
     return measure([&]() {
-        for (int i = 0; i < loops; i++) {
+        for (int i = 0; i < loops; ++i) {
             buffer.clear();
             (void) glz::write_json(s, buffer);
         }
     });
 }
 
-// Glaze BEVE 测试
-double testGlazeBeve(const MyStruct& s, const int loops) {
-    std::vector<std::byte> buffer;
-    buffer.reserve(1024);
+template <typename T>
+double testGlazeJsonTbb(const T& s, const int loops) {
     return measure([&]() {
-        for (int i = 0; i < loops; i++) {
+        tbb::parallel_for(tbb::blocked_range<int>(0, loops), [&](const tbb::blocked_range<int>& r) {
+            thread_local std::string buffer;
+            buffer.reserve(1024);
+            for (int i = r.begin(); i < r.end(); ++i) {
+                buffer.clear();
+                glz::write_json(s, buffer);
+            }
+        });
+    });
+}
+
+// Glaze BEVE 测试
+template <typename T>
+double testGlazeBeve(const T& s, const int loops) {
+    thread_local std::vector<std::byte> buffer;
+    buffer.clear();
+    if (buffer.capacity() < 4096) {
+        buffer.reserve(4096);
+    }
+    return measure([s, loops]() {
+        for (int i = 0; i < loops; ++i) {
             buffer.clear();
-            (void) glz::write_beve(s, buffer);
+            glz::write_beve(s, buffer);
         }
+    });
+}
+
+template <typename T>
+double testGlazeBeveTbb(const T& s, const int loops) {
+    return measure([&]() {
+        tbb::parallel_for(tbb::blocked_range<int>(0, loops), [&](const tbb::blocked_range<int>& r) {
+            thread_local std::vector<std::byte> buffer;
+            buffer.reserve(4096);
+
+            for (int i = r.begin(); i < r.end(); ++i) {
+                buffer.clear();
+                glz::write_beve(s, buffer);
+            }
+        });
     });
 }
 
@@ -701,8 +736,14 @@ Task<> OpenApi::fastJson(const HttpRequestPtr req, std::function<void(const Http
     auto glazeJsonTime = testGlazeJson(s, loops);
     std::cout << std::format("Glaze JSON serialize cost: {:.3f} us\n", glazeJsonTime);
 
+    auto glazeJsonTbbTime = testGlazeJsonTbb(s, loops);
+    std::cout << std::format("Glaze JSON TBB serialize cost: {:.3f} us\n", glazeJsonTbbTime);
+
     auto glazeBeveTime = testGlazeBeve(s, loops);
     std::cout << std::format("Glaze BEVE serialize cost: {:.3f} us\n", glazeBeveTime);
+
+    auto glazeBeveTbbTime = testGlazeBeveTbb(s, loops);
+    std::cout << std::format("Glaze BEVE TBB serialize cost: {:.3f} us\n", glazeBeveTbbTime);
 
     auto nlohmannTime = testNlohmannJson(s, loops);
     std::cout << std::format("nlohmann JSON serialize cost: {:.3f} us\n", nlohmannTime);
