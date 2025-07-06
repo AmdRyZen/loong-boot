@@ -545,7 +545,7 @@ double testGlazeJsonTbb(const T& s, const int loops) {
             buffer.reserve(1024);
             for (int i = r.begin(); i < r.end(); ++i) {
                 buffer.clear();
-                glz::write_json(s, buffer);
+                (void) glz::write_json(s, buffer);
             }
         });
     });
@@ -562,7 +562,7 @@ double testGlazeBeve(const T& s, const int loops) {
     return measure([s, loops]() {
         for (int i = 0; i < loops; ++i) {
             buffer.clear();
-            glz::write_beve(s, buffer);
+            (void) glz::write_beve(s, buffer);
         }
     });
 }
@@ -576,7 +576,7 @@ double testGlazeBeveTbb(const T& s, const int loops) {
 
             for (int i = r.begin(); i < r.end(); ++i) {
                 buffer.clear();
-                glz::write_beve(s, buffer);
+                (void) glz::write_beve(s, buffer);
             }
         });
     });
