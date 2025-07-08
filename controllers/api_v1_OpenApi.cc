@@ -36,6 +36,7 @@ using json = nlohmann::json;
 using namespace boost::gregorian;
 namespace mp = boost::multiprecision;
 using namespace rapidjson;
+using namespace std::chrono;
 
 Task<> OpenApi::tbb(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
 {
@@ -68,66 +69,59 @@ Task<> OpenApi::mqtt(const HttpRequestPtr req, std::function<void(const HttpResp
     co_return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
 }
 
-struct Task23 {
-    struct promise_type {
-        Task23 get_return_object() {
-            return Task23{std::coroutine_handle<promise_type>::from_promise(*this)};
-        }
-        static std::suspend_never initial_suspend() { return {}; }
-        static std::suspend_always final_suspend() noexcept
-        {
-            return {};
-        }
-        static void return_void() {}
-        static void unhandled_exception() { std::terminate(); }
-    };
-
-    std::coroutine_handle<promise_type> coro;
-    explicit Task23(std::coroutine_handle<promise_type> h) : coro(h) {}
-    ~Task23() { if (coro) coro.destroy(); }
-    void resume() const {
-        if (coro) coro.resume();
+// 切换测试协程，模拟 Rust 的 yield_now
+Task<> switchCoroutine(int switchCount) {
+    for (int i = 0; i < switchCount; ++i) {
+        co_await std::suspend_always{}; // 模拟挂起/恢复
     }
-};
+    co_return;
+}
 
-Task23 example(int n) {
-    for (int i = 0; i < n; ++i) {
-        co_await std::suspend_always{};
+// 同步运行协程的辅助函数
+void runSync(const Task<>& task, std::mutex& mtx, std::condition_variable& cv, int& completed) {
+    while (!task.coro_.done()) {
+        task.coro_.resume(); // 直接恢复协程
     }
+    std::lock_guard<std::mutex> lock(mtx);
+    completed++;
+    cv.notify_one();
 }
 
 Task<> OpenApi::coroutine(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
 {
-    constexpr int numTasks = 8;
-    constexpr int resumeCount = 1'000'000;
+    constexpr int NUM_TASKS = 8;
+    constexpr int RESUME_COUNT = 1'000'000;
 
-    std::atomic<int> completedTasks{0};
-    const auto start = std::chrono::steady_clock::now();
+    std::mutex mtx;
+    std::condition_variable cv;
+    int completed = 0;
 
-    for (int i = 0; i < numTasks; ++i)
-    {
-        CoroutinePool::instance().submit([resumeCount, &completedTasks]() -> AsyncTask {
-            const auto task = example(resumeCount);
-            for (int j = 0; j < resumeCount; ++j)
-            {
-                task.resume();
-            }
-            ++completedTasks;
-            co_return;
+    const auto start = high_resolution_clock::now();
+    std::vector<std::function<void()>> tasks;
+
+    // 提交协程任务
+    for (int i = 0; i < NUM_TASKS; ++i) {
+        tasks.emplace_back([&]() {
+            const auto task = switchCoroutine(RESUME_COUNT);
+            runSync(task, mtx, cv, completed); // 同步运行每个协程
         });
+        app().getLoop()->queueInLoop(tasks.back()); // 异步调度
     }
 
     // 等待所有任务完成
-    while (completedTasks.load() < numTasks)
     {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        std::unique_lock<std::mutex> lock(mtx);
+        cv.wait(lock, [&] {
+            return completed >= NUM_TASKS;
+        });
     }
 
-    const auto end = std::chrono::steady_clock::now();
-    const auto total_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-    constexpr auto totalResumes = static_cast<long long>(numTasks) * resumeCount;
-    std::cout << "CoroutinePool submit benchmark total time: " << total_ns << " ns\n";
-    std::cout << "Average coroutine resume time: " << static_cast<double>(total_ns) / totalResumes << " ns\n";
+    const auto end = high_resolution_clock::now();
+    const auto total_ns = duration_cast<nanoseconds>(end - start).count();
+    constexpr auto total_resumes = static_cast<uint64_t>(NUM_TASKS) * RESUME_COUNT;
+
+    std::cout << "Drogon coroutine benchmark total time: " << total_ns << " ns\n";
+    std::cout << "Average coroutine resume time: " << static_cast<double>(total_ns) / static_cast<double>(total_resumes) << " ns\n";
 
     co_return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
 }
