@@ -35,9 +35,9 @@ set(FOO_USE_STATIC_LIBS ON)
 set(CMAKE_BUILD_PARALLEL_LEVEL 8)
 
 # 可配置的优化选项
-option(AGGRESSIVE_OPT "启用激进优化" ON)
-option(USE_LTO "启用链接时优化" ON)
-option(USE_OPENMP "启用 OpenMP 并行化" ON)
+option(AGGRESSIVE_OPT "启用激进优化" OFF)
+option(USE_LTO "启用链接时优化" OFF)
+option(USE_OPENMP "启用 OpenMP 并行化" OFF)
 option(USE_WNO "关闭警告" ON)
 
 option(USE_PGO_GEN "启用 PGO 生成阶段" OFF)
@@ -145,9 +145,9 @@ if(AGGRESSIVE_OPT)
         -fweb
         -fgcse-after-reload
         -fdelete-null-pointer-checks
-        --param=inline-unit-growth=3000
-        --param=max-inline-insns-single=5000
-        --param=large-function-growth=3000
+        --param=inline-unit-growth=1500
+        --param=max-inline-insns-single=2500
+        --param=large-function-growth=1500
         --param=max-inline-recursive-depth=12
     )
 endif()
@@ -169,7 +169,7 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     target_compile_options(${PROJECT_NAME} PRIVATE -pipe -Wall -Wextra -Wno-unused-parameter -Wno-uninitialized -Wno-unused-function -Wno-deprecated-declarations -Wno-missing-requires -Og -fsanitize=leak)
     message(STATUS "调试模式: 启用 -Og -fsanitize=leak")
 elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
-    target_compile_options(${PROJECT_NAME} PRIVATE -pipe -Wall -Wextra -Wno-unused-parameter -Wno-uninitialized -Wno-unused-function -Wno-deprecated-declarations -Wno-missing-requires -Ofast -fipa-pta -freorder-blocks -finline-functions -falign-functions=32 -falign-loops=32 -funroll-loops ${AGGRESSIVE_FLAGS} ${LTO_FLAGS} ${OPENMP_FLAGS})
+    target_compile_options(${PROJECT_NAME} PRIVATE -pipe -Wno-unused-parameter -Wno-uninitialized -Wno-unused-function -Wno-deprecated-declarations -Wno-missing-requires -Ofast -fipa-pta -freorder-blocks -finline-functions -falign-functions=32 -falign-loops=32 -funroll-loops ${AGGRESSIVE_FLAGS} ${LTO_FLAGS} ${OPENMP_FLAGS})
     message(STATUS "发布模式: 启用 -Ofast 等优化")
 # 这里不再有 else 分支，因为 CMAKE_BUILD_TYPE 已确保被设置
 endif()
