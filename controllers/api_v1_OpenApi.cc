@@ -73,10 +73,10 @@ Task<> OpenApi::mqtt(const HttpRequestPtr req, std::function<void(const HttpResp
 // 切换测试协程，模拟 Rust 的 yield_now
 Task<> switchCoroutine(const int count) {
     for (int i = 0; i < count; ++i) {
-        //co_await std::suspend_never{}; // 不挂起，直接继续
-        co_await retryWithDelayAsync([]() -> Task<bool> {
+        co_await std::suspend_never{}; // 不挂起，直接继续
+        /*co_await retryWithDelayAsync([]() -> Task<bool> {
             co_return true;
-        }, 1, milliseconds(1));
+        }, 1, milliseconds(1));*/
     }
     co_return;
 }
@@ -93,8 +93,8 @@ Task<> OpenApi::coroutine(const HttpRequestPtr req, std::function<void(const Htt
     const auto start = high_resolution_clock::now();
     std::vector<std::function<void()>> tasks;
 
-    // 提交协程任务
-    for (int i = 0; i < NUM_TASKS; ++i) {
+    // 提交协程任务 TbbCoroutinePool  CPU密集更好
+    /*for (int i = 0; i < NUM_TASKS; ++i) {
         TbbCoroutinePool::instance().submit([&]() -> AsyncTask {
             co_await switchCoroutine(RESUME_COUNT);
             {
@@ -104,6 +104,20 @@ Task<> OpenApi::coroutine(const HttpRequestPtr req, std::function<void(const Htt
             }
             co_return;
         });
+    }*/
+
+    // drogon 的事件循环 io性能更好
+    for (int i = 0; i < NUM_TASKS; ++i)
+    {
+        async_run([&]() -> Task<> {
+          co_await switchCoroutine(RESUME_COUNT);
+              {
+                  std::lock_guard<std::mutex> lock(mtx);
+                  completed++;
+                  cv.notify_one();
+              }
+              co_return;
+          });
     }
 
     // 等待所有任务完成
