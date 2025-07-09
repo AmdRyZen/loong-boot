@@ -19,7 +19,7 @@
 #include <execution> // 可能需要此头文件
 #include "base/base.h"
 #include "base/vo/data_vo.h"
-#include "coroutinePool/CoroutinePool.h"
+#include "coroutinePool/TbbCoroutinePool.h"
 //#include "mqttManager/MqttManager.h"
 
 #if defined(__arm__) || defined(__aarch64__)
@@ -69,22 +69,16 @@ Task<> OpenApi::mqtt(const HttpRequestPtr req, std::function<void(const HttpResp
     co_return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
 }
 
+#include "utils/retry_utils.h"
 // 切换测试协程，模拟 Rust 的 yield_now
-Task<> switchCoroutine(int switchCount) {
-    for (int i = 0; i < switchCount; ++i) {
-        co_await std::suspend_always{}; // 模拟挂起/恢复
+Task<> switchCoroutine(const int count) {
+    for (int i = 0; i < count; ++i) {
+        //co_await std::suspend_never{}; // 不挂起，直接继续
+        co_await retryWithDelayAsync([]() -> Task<bool> {
+            co_return true;
+        }, 1, milliseconds(1));
     }
     co_return;
-}
-
-// 同步运行协程的辅助函数
-void runSync(const Task<>& task, std::mutex& mtx, std::condition_variable& cv, int& completed) {
-    while (!task.coro_.done()) {
-        task.coro_.resume(); // 直接恢复协程
-    }
-    std::lock_guard<std::mutex> lock(mtx);
-    completed++;
-    cv.notify_one();
 }
 
 Task<> OpenApi::coroutine(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
@@ -101,11 +95,15 @@ Task<> OpenApi::coroutine(const HttpRequestPtr req, std::function<void(const Htt
 
     // 提交协程任务
     for (int i = 0; i < NUM_TASKS; ++i) {
-        tasks.emplace_back([&]() {
-            const auto task = switchCoroutine(RESUME_COUNT);
-            runSync(task, mtx, cv, completed); // 同步运行每个协程
+        TbbCoroutinePool::instance().submit([&]() -> AsyncTask {
+            co_await switchCoroutine(RESUME_COUNT);
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                completed++;
+                cv.notify_one();
+            }
+            co_return;
         });
-        app().getLoop()->queueInLoop(tasks.back()); // 异步调度
     }
 
     // 等待所有任务完成
@@ -826,16 +824,16 @@ inline void threadF1()
 
 Task<> OpenApi::threadPool(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
 {
-    const auto result = pool.enqueue([] {
+    TbbCoroutinePool::instance().submit([] {
         threadF();
         threadF1();
     });
-    const auto result1 = pool.enqueue([] {
+    TbbCoroutinePool::instance().submit([] {
         threadF();
         threadF1();
     });
-    result.wait();
-    result1.wait();
+    TbbCoroutinePool::instance().waitAll();
+
     std::cout << "value = " << value << std::endl;
     std::cout << "value1 = " << value1 << std::endl;
 

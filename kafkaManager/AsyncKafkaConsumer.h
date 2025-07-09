@@ -10,9 +10,8 @@
 #include <memory>
 #include <functional>
 #include "kafka/KafkaManager.h"
-#include "coroutinePool/CoroutinePool.h"
+#include "coroutinePool/TbbCoroutinePool.h"
 
-extern ThreadPool poolKafka;
 using namespace drogon;
 class AsyncKafkaConsumer
 {
@@ -52,8 +51,6 @@ private:
 
     void initializeConsumers(const size_t numThreads)
     {
-        poolKafka.setThreadCount(numThreads);
-
         for (size_t i = 0; i < numThreads; ++i)
         {
             rd_kafka_t* consumer = kafka::KafkaManager::instance().createNewConsumer();
@@ -78,16 +75,17 @@ private:
 
             consumers_.emplace_back(consumer);
 
-            // 消费线程任务入队
-            poolKafka.enqueue([this, consumer]() {
+            // 消费线程任务入队，改用 TbbCoroutinePool
+            TbbCoroutinePool::instance().submit([this, consumer]() -> AsyncTask {
                 this->consumeMessages(consumer);
+                co_return;
             });
         }
     }
 
     void submitMessageTask(rd_kafka_message_t* msg, rd_kafka_t* consumer)
     {
-        CoroutinePool::instance().submit([msg, consumer, this]() -> AsyncTask {
+        TbbCoroutinePool::instance().submit([msg, consumer, this]() -> AsyncTask {
             try
             {
                 if (msg->err)

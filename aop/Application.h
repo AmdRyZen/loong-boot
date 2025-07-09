@@ -17,14 +17,9 @@
 #include "kafkaManager/AsyncKafkaConsumer.h"
 #include "kafkaManager/AsyncKafkaConsumerOne.h"
 #include <tbb/global_control.h>
-#include "coroutinePool/CoroutinePool.h"
+#include "coroutinePool/TbbCoroutinePool.h"
 
 inline TrieService trieService;
-
-inline ThreadPool pool(2);
-inline ThreadPool poolKafka(2);
-inline ThreadPool poolKafkaOne(2);
-inline ThreadPool poolMqtt(2);
 static tbb::global_control tbb_limit(tbb::global_control::max_allowed_parallelism, std::thread::hardware_concurrency()); // 限制最大线程数
 
 namespace App {
@@ -120,7 +115,7 @@ Application::Application()
 
     try
     {
-        CoroutinePool::instance().init();
+        //TbbCoroutinePool::instance().init();
 
         // 获取 KafkaManager 的配置
         const std::string brokers = app().getCustomConfig()["kafka_manager"]["bootstrap.servers"].asString();

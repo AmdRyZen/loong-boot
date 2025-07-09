@@ -1,6 +1,6 @@
 #include "ChatWebsocket.h"
 #include "utils/redisUtils.h"
-#include "coroutinePool/CoroutinePool.h"
+#include "coroutinePool/TbbCoroutinePool.h"
 //#include "user.pb.h"
 #include <glaze/glaze.hpp>
 #include <drogon/HttpAppFramework.h>
@@ -49,7 +49,7 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
 
                 // 提交协程任务给协程池，协程自动启动，无需手动 resume
                 // async_run([msg_dto, topic, id, this]() -> Task<>
-                CoroutinePool::instance().submit([msg_dto, topic, id, this]() -> AsyncTask
+                TbbCoroutinePool::instance().submit([msg_dto, topic, id, this]() -> AsyncTask
                 {
                     try
                     {
@@ -87,7 +87,7 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                                     }
                                 }
                                 co_return true;
-                            });
+                            },3, std::chrono::milliseconds(100));
                         }
                     }
                     catch (const std::exception& e)

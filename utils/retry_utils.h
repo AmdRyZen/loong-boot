@@ -12,7 +12,8 @@
 using namespace drogon;
 
 
-inline auto delay(const std::chrono::milliseconds duration)
+template<typename Duration>
+auto delay(Duration duration)
 {
     struct Awaiter
     {
@@ -29,11 +30,11 @@ inline auto delay(const std::chrono::milliseconds duration)
     return Awaiter{std::chrono::duration_cast<std::chrono::duration<double>>(duration)};
 }
 
-template<typename Func>
+template<typename Func, typename Duration>
 requires requires(Func f) { { f() } -> std::same_as<Task<bool>>; }
 Task<> retryWithDelayAsync(Func&& func,
                            const int maxRetries = 3,
-                           const std::chrono::milliseconds delayMs = std::chrono::milliseconds(100))
+                           Duration delayMs = Duration(100))
 {
     static_assert(std::is_invocable_r_v<Task<bool>, Func>, "retryWithDelayAsync requires func() to return Task<bool>");
 

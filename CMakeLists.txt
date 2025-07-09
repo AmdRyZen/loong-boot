@@ -69,8 +69,8 @@ set(MODEL_SOURCES_COMMON
         kafkaManager/AsyncKafkaConsumerOne.h
         utils/retry_utils.h
         utils/tbbUtils.h
-        coroutinePool/CoroutinePool.h
-        coroutinePool/CoroutinePool.cc
+        coroutinePool/TbbCoroutinePool.h
+        coroutinePool/TbbCoroutinePool.cc
 )
 
 add_executable(
