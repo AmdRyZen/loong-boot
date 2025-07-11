@@ -73,13 +73,24 @@ Task<> OpenApi::mqtt(const HttpRequestPtr req, std::function<void(const HttpResp
 // 切换测试协程，模拟 Rust 的 yield_now
 Task<> switchCoroutine(const int count) {
     for (int i = 0; i < count; ++i) {
-        co_await std::suspend_never{}; // 不挂起，直接继续
-        /*co_await retryWithDelayAsync([]() -> Task<bool> {
+        //co_await std::suspend_never{}; // 不挂起，直接继续
+        co_await retryWithDelayAsync([]() -> Task<bool> {
             co_return true;
-        }, 1, milliseconds(1));*/
+        }, 1, milliseconds(1));
     }
     co_return;
 }
+
+// 同步运行协程的辅助函数
+void runSync(const Task<>& task, std::mutex& mtx, std::condition_variable& cv, int& completed) {
+    while (!task.coro_.done()) {
+        task.coro_.resume(); // 直接恢复协程
+    }
+    std::lock_guard<std::mutex> lock(mtx);
+    completed++;
+    cv.notify_one();
+}
+
 
 Task<> OpenApi::coroutine(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
 {
@@ -94,7 +105,7 @@ Task<> OpenApi::coroutine(const HttpRequestPtr req, std::function<void(const Htt
     std::vector<std::function<void()>> tasks;
 
     // 提交协程任务 TbbCoroutinePool  CPU密集更好
-    /*for (int i = 0; i < NUM_TASKS; ++i) {
+    for (int i = 0; i < NUM_TASKS; ++i) {
         TbbCoroutinePool::instance().submit([&]() -> AsyncTask {
             co_await switchCoroutine(RESUME_COUNT);
             {
@@ -104,10 +115,10 @@ Task<> OpenApi::coroutine(const HttpRequestPtr req, std::function<void(const Htt
             }
             co_return;
         });
-    }*/
+    }
 
-    // drogon 的事件循环 io性能更好
-    for (int i = 0; i < NUM_TASKS; ++i)
+    // drogon async_run
+    /*for (int i = 0; i < NUM_TASKS; ++i)
     {
         async_run([&]() -> Task<> {
           co_await switchCoroutine(RESUME_COUNT);
@@ -118,7 +129,17 @@ Task<> OpenApi::coroutine(const HttpRequestPtr req, std::function<void(const Htt
               }
               co_return;
           });
-    }
+    }*/
+
+    //  drogon 的事件循环
+    /*for (int i = 0; i < NUM_TASKS; ++i) {
+        tasks.emplace_back([&]() {
+            const auto task = switchCoroutine(RESUME_COUNT);
+            runSync(task, mtx, cv, completed); // 同步运行每个协程
+        });
+        app().getLoop()->queueInLoop(tasks.back()); // 异步调度
+    }*/
+
 
     // 等待所有任务完成
     {
