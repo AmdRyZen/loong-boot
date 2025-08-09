@@ -7,6 +7,8 @@
 
 #include <string>
 #include <tbb/concurrent_vector.h>
+#include <drogon/orm/Result.h>
+using namespace drogon; // 或者只用 using drogon::orm::Row;
 
 // 定义 AesResponseDataVo 结构体
 struct alignas(16) AesResponseDataVo {

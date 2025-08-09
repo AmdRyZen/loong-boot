@@ -7,6 +7,7 @@ export let options = {
 };
 
 export default function() {
-    http.get('http://127.0.0.1:9090/'); // 发起HTTP GET请求
+    http.get('http://127.0.0.1:9090/api/v1/openapi/getValue'); // 发起HTTP GET请求
+    //http.get('http://127.0.0.1:9090/'); // 发起HTTP GET请求
     //sleep(1); // 可选：模拟用户思考时间，避免过度加载服务器
 }
