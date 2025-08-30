@@ -47,10 +47,10 @@ option(USE_PGO_USE "启用 PGO 使用阶段" OFF)
 add_link_options(-L/usr/local/lib)
 
 # 查找 Protobuf
-find_package(Protobuf REQUIRED)
+#[[find_package(Protobuf REQUIRED)
 include_directories(${Protobuf_INCLUDE_DIRS})
 add_subdirectory(proto)
-include_directories(${PROTO_GEN_C_INCLUDE_DIRS} ${PROTO_GEN_CXX_INCLUDE_DIRS})
+include_directories(${PROTO_GEN_C_INCLUDE_DIRS} ${PROTO_GEN_CXX_INCLUDE_DIRS})]]
 
 # 源文件
 set(MODEL_SOURCES_DTO base/dto/open_dto.h)
@@ -199,7 +199,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
         rdkafka
         TBB::tbb
         mimalloc
-        proto_gen_cxx
+        #[[proto_gen_cxx]]
 )
 
 # 编译定义

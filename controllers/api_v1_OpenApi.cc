@@ -750,8 +750,8 @@ double testJsonCppDeserialize(const std::string& json_str, const int loops) {
 
 Task<> OpenApi::fastJson(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
 {
-    GOOGLE_PROTOBUF_VERIFY_VERSION;
-    std::cout << "Protocol Buffers version: " << GOOGLE_PROTOBUF_VERSION << std::endl;
+    /*GOOGLE_PROTOBUF_VERIFY_VERSION;
+    std::cout << "Protocol Buffers version: " << GOOGLE_PROTOBUF_VERSION << std::endl;*/
 
     const MyStruct s{};
     constexpr int loops = 1000000;
