@@ -125,12 +125,12 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
     });
     LOG_INFO << "Subscriber ID: " << s.id_ << ", Topic: " << s.topic_;
 
-    {
-        std::lock_guard<std::mutex> guard(mutex_);
-        connections_.emplace(wsConn);
-        userNames_.emplace(wsConn, userName);
-        LOG_DEBUG << "Added connection for user: " << userName;
-    }
+
+    std::lock_guard<std::mutex> guard(mutex_);
+    //connections_.emplace(wsConn);
+    userNameConnections_.emplace(userName, wsConn);
+    LOG_DEBUG << "Added connection for user: " << userName;
+
 
     chatMessageVo msg_vo;
     msg_vo.code = 200;
@@ -166,13 +166,19 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
         std::string userName;
         {
             std::lock_guard<std::mutex> guard(mutex_);
-            if (auto it = userNames_.find(wsConn); it != userNames_.end())
+            for (auto it = userNameConnections_.begin(); it != userNameConnections_.end(); )
             {
-                userName = it->second;
-                userNames_.erase(it);
+                userName = it->first;
+                it = userNameConnections_.erase(it); // erase 返回下一个有效的迭代器
                 LOG_INFO << "Removed user: " << userName;
             }
-            connections_.erase(wsConn);
+            if (userNameConnections_.empty())
+            {
+                // std::unordered_map 在元素删除后可能不会立即释放内存，导致内存占用较高。可以使用以下方法尝试释放未使用的内存
+                userNameConnections_.clear();
+                userNameConnections_.rehash(0);
+            }
+            //connections_.erase(wsConn);
             LOG_DEBUG << "Removed closed connection";
         }
 
