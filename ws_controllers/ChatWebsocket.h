@@ -36,61 +36,49 @@ private:
     PubSubService<std::string> chatRooms_;
     //std::unordered_set<WebSocketConnectionPtr> connections_;
     //std::unordered_map<WebSocketConnectionPtr, std::string> userNames_;
-    std::unordered_map<std::string, WebSocketConnectionPtr> userNameConnections_;
-    std::unordered_set<std::string> excludedUsers_ = {"dog", "mouse"};
+    std::unordered_map<std::string, WebSocketConnectionPtr::element_type*> userNameConnections_;
+    std::unordered_set<std::string> excludedUsers_ = {"dog", "cat", "mouse"};
     mutable std::mutex mutex_;
 
     void sendHeartbeatToAll() const
     {
+        LOG_INFO << "sendHeartbeatToAll begin";
         std::lock_guard guard(mutex_);
         rd_kafka_topic_t* topic_ptr = kafka::KafkaManager::instance().getTopic("message_topic_one");
         chatRooms_.publish("001", std::format("房间公告消息"));
 
-        for (const auto& wsConnPtr : userNameConnections_ | std::views::values)
+        for (const auto& [userName, wsConnPtr] : userNameConnections_)
         {
-            if (wsConnPtr->connected())
-            {
-                // 获取当前连接对应的用户名
-                auto it = std::ranges::find_if(userNameConnections_,
-                    [&](const auto& pair) { return pair.second == wsConnPtr; });
+            if (!wsConnPtr->connected())
+                continue;
 
-                if (it == userNameConnections_.end()) {
-                    LOG_ERROR << "User not found for connection in sendHeartbeatToAll";
-                    continue;
-                }
+            // 检查是否需要排除
+            if (!excludedUsers_.contains(userName))
+                continue;
 
-                std::string userName = it->first;
+            chatMessageVo messageVo{};
+            messageVo.code = 200;
+            messageVo.id = 0;
+            messageVo.name = userName;
+            messageVo.message = std::format("{} 心跳检测 正常 这是定制消息", userName);
+            thread_local std::string buffer; // 使用 thread_local 避免频繁分配
+            buffer.clear();
+            (void)glz::write_json(messageVo, buffer);
+            // 找到目标用户的连接，发送消息
+            wsConnPtr->send(buffer);
 
-                // 检查用户名是否在 excludedUsers_ 中
-                if (!excludedUsers_.contains(userName))
+            retryWithSleep([&]() {
+                if (!kafka::KafkaManager::safeProduce(topic_ptr, buffer))
                 {
-                    continue;
-                }
-
-                chatMessageVo messageVo{};
-                messageVo.code = 200;
-                messageVo.id = 0;
-                messageVo.name = userName;
-                messageVo.message = std::format("{} 心跳检测 正常 这是定制消息", userName);
-                thread_local std::string buffer; // 使用 thread_local 避免频繁分配
-                buffer.clear();
-                (void)glz::write_json(messageVo, buffer);
-                // 找到目标用户的连接，发送消息
-                wsConnPtr->send(buffer);
-
-                retryWithSleep([&]() {
-                    if (!kafka::KafkaManager::safeProduce(topic_ptr, buffer))
+                    const rd_kafka_resp_err_t err = rd_kafka_last_error();
+                    LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(err);
+                    if (err == RD_KAFKA_RESP_ERR__QUEUE_FULL)
                     {
-                        const rd_kafka_resp_err_t err = rd_kafka_last_error();
-                        LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(err);
-                        if (err == RD_KAFKA_RESP_ERR__QUEUE_FULL)
-                        {
-                            return false;
-                        }
+                        return false;
                     }
-                    return true;
-                });
-            }
+                }
+                return true;
+            });
         }
     }
 

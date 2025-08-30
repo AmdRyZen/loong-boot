@@ -119,16 +119,19 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
         userName = "default_name";
     }
 
-    s.id_ = chatRooms_.subscribe(s.topic_, [wsConn](const std::string&, const std::string& msg)
+    s.id_ = chatRooms_.subscribe(s.topic_, [weakWs = std::weak_ptr<WebSocketConnection>(wsConn)](const std::string&, const std::string& msg)
     {
-        wsConn->send(msg);
+        if (const auto web_socket_connection = weakWs.lock())
+        {
+            web_socket_connection->send(msg);
+        }
     });
     LOG_INFO << "Subscriber ID: " << s.id_ << ", Topic: " << s.topic_;
 
 
     std::lock_guard<std::mutex> guard(mutex_);
     //connections_.emplace(wsConn);
-    userNameConnections_.emplace(userName, wsConn);
+    userNameConnections_.emplace(userName, wsConn.get());
     LOG_DEBUG << "Added connection for user: " << userName;
 
 
@@ -166,10 +169,13 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
         std::string userName;
         {
             std::lock_guard<std::mutex> guard(mutex_);
-            for (auto it = userNameConnections_.begin(); it != userNameConnections_.end(); )
+            if (const auto it = std::ranges::find_if(userNameConnections_, [&wsConn](const auto& pair) {
+                    return pair.second == wsConn.get();
+                });
+                it != userNameConnections_.end())
             {
                 userName = it->first;
-                it = userNameConnections_.erase(it); // erase 返回下一个有效的迭代器
+                userNameConnections_.erase(it);
                 LOG_INFO << "Removed user: " << userName;
             }
             if (userNameConnections_.empty())
@@ -179,7 +185,7 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
                 userNameConnections_.rehash(0);
             }
             //connections_.erase(wsConn);
-            LOG_DEBUG << "Removed closed connection";
+            LOG_INFO << "Removed closed connection";
         }
 
         const auto& subscriber = wsConn->getContextRef<Subscriber>();
