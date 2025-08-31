@@ -16,6 +16,7 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
 {
     try
     {
+        // 处理 ping/pong 消息
         if (type == WebSocketMessageType::Ping)
         {
             wsConn->send("pong_ms", WebSocketMessageType::Pong);
@@ -31,11 +32,16 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
 
         if (!msg.empty())
         {
-            chatMessageDto msg_dto{};
+            // 使用 thread_local 对象池减少 heap 分配
+            thread_local chatMessageDto msg_dto;
+            msg_dto = {};  // 重置内容
+
             if (glz::read_json(msg_dto, msg))
             {
-                chatMessageVo err_msg{};
-                std::string json{};
+                thread_local chatMessageVo err_msg{};
+                thread_local std::string json{};
+                err_msg = {};
+                json.clear();
                 (void)glz::write_json(err_msg, json);
                 wsConn->send(json, WebSocketMessageType::Text);
                 LOG_ERROR << "Failed to parse JSON message";
@@ -47,37 +53,37 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                 const auto& subscriber = wsConn->getContextRef<Subscriber>();
                 const auto& [topic, id] = subscriber;
 
-                // 提交协程任务给协程池，协程自动启动，无需手动 resume
-                // async_run([msg_dto, topic, id, this]() -> Task<>
-                TbbCoroutinePool::instance().submit([msg_dto, topic, id, this, wsConn]() -> AsyncTask
+                // 提交协程任务到协程池
+                TbbCoroutinePool::instance().submit([topic, id, this, wsConn]() -> AsyncTask
                 {
                     try
                     {
                         std::string data{};
                         if (!msg_dto.key.empty())
                         {
-                            // 异步调用 Redis 协程接口，示例用硬编码
-                            // data = co_await redisUtils::getCoroRedisValue(std::format("get {}", msg_dto.key));
+                            // Redis 异步调用可改为协程 await
                             data = "xxxxxx";
                         }
 
                         if (!msg_dto.action.empty() && msg_dto.action == "message")
                         {
-                            chatMessageVo msg_vo{};
+                            // 使用 thread_local 减少频繁分配
+                            thread_local chatMessageVo msg_vo{};
+                            thread_local std::string json{};
+                            msg_vo = {};
                             msg_vo.code = 200;
                             msg_vo.id = id;
                             msg_vo.name = data;
                             msg_vo.message = msg_dto.msgContent;
-                            thread_local std::string json;
                             json.clear();
                             (void)glz::write_json(msg_vo, json);
 
-                            // 发布消息给订阅的客户端
+                            // 广播消息
                             chatRooms_.publish(topic, json);
                             wsConn->send(json);
 
                             // 异步发送 Kafka 消息，失败自动重试
-                            co_await retryWithDelayAsync([]() -> Task<bool> {
+                            co_await retryWithDelayAsync([json]() -> Task<bool> {
                                 if (rd_kafka_topic_t* topic_ptr = kafka::KafkaManager::instance().getTopic("message_topic"); !kafka::KafkaManager::safeProduce(topic_ptr, json))
                                 {
                                     const rd_kafka_resp_err_t err = rd_kafka_last_error();
@@ -88,7 +94,7 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                                     }
                                 }
                                 co_return true;
-                            },3, std::chrono::milliseconds(100));
+                            }, 3, std::chrono::milliseconds(100));
                         }
                     }
                     catch (const std::exception& e)
