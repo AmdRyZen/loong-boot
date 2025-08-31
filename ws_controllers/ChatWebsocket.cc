@@ -127,10 +127,12 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
         }
     });
 
-    std::lock_guard guard(mutex_);
-    //connections_.emplace(wsConn);
-    userNameConnections_.emplace(userName, wsConn.get());
-    LOG_INFO << "Added connection for user: " << userName << "Subscriber ID: " << s.id_ << ", Topic: " << s.topic_;
+    {
+        std::lock_guard guard(mutex_);
+        userNameToConn_.emplace(userName, wsConn);
+        connToUser_.emplace(wsConn, userName);
+    }
+    LOG_INFO << "Added connection for user: " << userName << " Subscriber ID: " << s.id_ << ", Topic: " << s.topic_;
 
     chatMessageVo msg_vo;
     msg_vo.code = 200;
@@ -166,22 +168,21 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
         std::string userName;
         {
             std::lock_guard<std::mutex> guard(mutex_);
-            if (const auto it = std::ranges::find_if(userNameConnections_, [&wsConn](const auto& pair) {
-                    return pair.second == wsConn.get();
-                });
-                it != userNameConnections_.end())
+            if (const auto it = connToUser_.find(wsConn); it != connToUser_.end())
             {
-                userName = it->first;
-                userNameConnections_.erase(it);
+                userName = it->second;
+                connToUser_.erase(it);
+                userNameToConn_.erase(userName);
                 LOG_INFO << "Removed user: " << userName;
             }
-            if (userNameConnections_.empty())
+            if (userNameToConn_.empty() && connToUser_.empty())
             {
                 // std::unordered_map 在元素删除后可能不会立即释放内存，导致内存占用较高。可以使用以下方法尝试释放未使用的内存
-                userNameConnections_.clear();
-                userNameConnections_.rehash(0);
+                userNameToConn_.clear();
+                userNameToConn_.rehash(0);
+                connToUser_.clear();
+                connToUser_.rehash(0);
             }
-            //connections_.erase(wsConn);
             LOG_INFO << "Removed closed connection";
         }
 

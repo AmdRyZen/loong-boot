@@ -5,6 +5,8 @@
 #include <glaze/glaze.hpp>
 #include <drogon/HttpAppFramework.h>
 #include "utils/retry_utils.h"
+#include <boost/unordered_map.hpp>
+#include <boost/unordered_set.hpp>
 
 using namespace drogon;
 
@@ -17,7 +19,8 @@ public:
         HttpAppFramework::instance().getLoop()->runEvery(10.0, [this] {
             sendHeartbeatToAll();
         });
-        //userNameConnections_.reserve(1000);
+        connToUser_.reserve(1000);
+        userNameToConn_.reserve(1000);
     }
 
     void handleNewMessage(const WebSocketConnectionPtr&,
@@ -35,9 +38,9 @@ public:
 private:
     PubSubService<std::string> chatRooms_;
     //std::unordered_set<WebSocketConnectionPtr> connections_;
-    //std::unordered_map<WebSocketConnectionPtr, std::string> userNames_;
-    std::unordered_map<std::string, WebSocketConnectionPtr::element_type*> userNameConnections_;
-    std::unordered_set<std::string> excludedUsers_ = {"dog", "cat", "mouse"};
+    boost::unordered_map<std::string, WebSocketConnectionPtr> userNameToConn_;
+    boost::unordered_map<WebSocketConnectionPtr, std::string> connToUser_;
+    boost::unordered_set<std::string> excludedUsers_ = {"dog", "cat", "mouse"};
     mutable std::mutex mutex_;
 
     void sendHeartbeatToAll() const
@@ -47,7 +50,7 @@ private:
         rd_kafka_topic_t* topic_ptr = kafka::KafkaManager::instance().getTopic("message_topic_one");
         chatRooms_.publish("001", std::format("房间公告消息"));
 
-        for (const auto& [userName, wsConnPtr] : userNameConnections_)
+        for (const auto& [userName, wsConnPtr] : userNameToConn_)
         {
             if (!wsConnPtr->connected())
                 continue;
