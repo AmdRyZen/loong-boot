@@ -49,7 +49,7 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
 
                 // 提交协程任务给协程池，协程自动启动，无需手动 resume
                 // async_run([msg_dto, topic, id, this]() -> Task<>
-                TbbCoroutinePool::instance().submit([msg_dto, topic, id, this]() -> AsyncTask
+                TbbCoroutinePool::instance().submit([msg_dto, topic, id, this, wsConn]() -> AsyncTask
                 {
                     try
                     {
@@ -74,6 +74,7 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
 
                             // 发布消息给订阅的客户端
                             chatRooms_.publish(topic, json);
+                            wsConn->send(json);
 
                             // 异步发送 Kafka 消息，失败自动重试
                             co_await retryWithDelayAsync([]() -> Task<bool> {
@@ -127,11 +128,10 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
         }
     });
 
-    {
-        std::lock_guard guard(mutex_);
-        userNameToConn_.emplace(userName, wsConn);
-        connToUser_.emplace(wsConn, userName);
-    }
+    //std::lock_guard guard(mutex_);
+    // 如果使用 phmap::parallel_flat_hash_map，它内部已经支持分段锁并发插入，你可以去掉外部 mutex：
+    userNameToConn_.emplace(userName, wsConn);
+    connToUser_.emplace(wsConn, userName);
     LOG_INFO << "Added connection for user: " << userName << " Subscriber ID: " << s.id_ << ", Topic: " << s.topic_;
 
     chatMessageVo msg_vo;

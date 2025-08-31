@@ -17,7 +17,6 @@
 #include "kafkaManager/AsyncKafkaConsumer.h"
 #include "kafkaManager/AsyncKafkaConsumerOne.h"
 #include <tbb/global_control.h>
-#include "coroutinePool/TbbCoroutinePool.h"
 
 inline TrieService trieService;
 static tbb::global_control tbb_limit(tbb::global_control::max_allowed_parallelism, std::thread::hardware_concurrency()); // 限制最大线程数

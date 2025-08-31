@@ -189,6 +189,7 @@ find_package(Drogon CONFIG REQUIRED)
 find_package(mimalloc 3.1.5 REQUIRED)
 find_package(Boost 1.88.0 REQUIRED)
 find_package(TBB REQUIRED)
+include_directories(/opt/homebrew/include)
 
 # 链接库
 target_link_libraries(${PROJECT_NAME} PRIVATE
