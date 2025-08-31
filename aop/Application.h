@@ -128,7 +128,7 @@ Application::Application()
         static AsyncKafkaConsumer asyncKafkaConsumer(
             {"message_topic"},  // topic list
             [](const std::string &msg) -> drogon::Task<> {
-                LOG_INFO << "message_topic msg: " << msg;
+                //LOG_INFO << "message_topic msg: " << msg;
                 co_return;
             },
             4 // 可调线程数
@@ -137,7 +137,7 @@ Application::Application()
         static AsyncKafkaConsumerOne asyncKafkaConsumerOne(
             {"message_topic_one"},  // topic list
             [](const std::string &msg) -> drogon::Task<> {
-                LOG_INFO << "message_topic_one msg: " << msg;
+                //LOG_INFO << "message_topic_one msg: " << msg;
                 co_return;
             },
             4 // 可调线程数

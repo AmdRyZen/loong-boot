@@ -126,14 +126,11 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
             web_socket_connection->send(msg);
         }
     });
-    LOG_INFO << "Subscriber ID: " << s.id_ << ", Topic: " << s.topic_;
 
-
-    std::lock_guard<std::mutex> guard(mutex_);
+    std::lock_guard guard(mutex_);
     //connections_.emplace(wsConn);
     userNameConnections_.emplace(userName, wsConn.get());
-    LOG_DEBUG << "Added connection for user: " << userName;
-
+    LOG_INFO << "Added connection for user: " << userName << "Subscriber ID: " << s.id_ << ", Topic: " << s.topic_;
 
     chatMessageVo msg_vo;
     msg_vo.code = 200;

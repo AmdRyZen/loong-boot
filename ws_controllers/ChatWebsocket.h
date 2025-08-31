@@ -42,7 +42,7 @@ private:
 
     void sendHeartbeatToAll() const
     {
-        LOG_INFO << "sendHeartbeatToAll begin";
+        //LOG_INFO << "sendHeartbeatToAll begin";
         std::lock_guard guard(mutex_);
         rd_kafka_topic_t* topic_ptr = kafka::KafkaManager::instance().getTopic("message_topic_one");
         chatRooms_.publish("001", std::format("房间公告消息"));
