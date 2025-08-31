@@ -1,10 +1,10 @@
 import ws from 'k6/ws';
 import { check } from 'k6';
 
-// k6 run -u 100 ./websocket.js
+// k6 run -u 10 ./websocket.js
 export let options = {
     vus: 10, // 同时运行的虚拟用户数量
-    duration: '30s', // 测试持续时间，这里设置为30秒
+    duration: '15s', // 测试持续时间，这里设置为30秒
 };
 
 export default function () {
