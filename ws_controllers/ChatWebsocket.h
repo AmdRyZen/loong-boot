@@ -6,6 +6,7 @@
 #include <drogon/HttpAppFramework.h>
 #include "utils/retry_utils.h"
 #include "parallel_hashmap/phmap.h"
+#include <memory_resource>
 
 using namespace drogon;
 
@@ -56,23 +57,24 @@ private:
             if (!wsConnPtr->connected() || !excludedUsers_.contains(userName))
                 continue;
 
-            chatMessageVo messageVo{};
-            messageVo.code = 200;
-            messageVo.id = 0;
-            messageVo.name = userName;
-            messageVo.message = std::format("{} 心跳检测 正常 这是定制消息", userName);
+            thread_local std::pmr::monotonic_buffer_resource pool(1024 * 1024);
+            chatMessageVo messageVo{
+                .code = 200,
+                .id = 0,
+                .name = std::pmr::string(userName, &pool),
+                .message = std::pmr::string(std::format("{} 心跳检测 正常 这是定制消息", userName), &pool)
+            };
 
-            thread_local std::string buffer;
-            buffer.clear();
-            (void)glz::write_json(messageVo, buffer);
+            std::pmr::string json(&pool);
+            (void)glz::write_json(messageVo, json);
 
             // 发送给客户端
-            wsConnPtr->send(buffer);
+            wsConnPtr->send(json);
 
             // Kafka 异步发送，避免阻塞心跳循环
-            auto kafkaTask = [topic_ptr]() {
+            auto kafkaTask = [topic_ptr, json]() {
                 retryWithSleep([&]() {
-                    if (!kafka::KafkaManager::safeProduce(topic_ptr, buffer))
+                    if (!kafka::KafkaManager::safeProduce(topic_ptr, json.data()))
                     {
                         const rd_kafka_resp_err_t err = rd_kafka_last_error();
                         LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(err);
@@ -89,16 +91,16 @@ private:
 
     struct chatMessageDto
     {
-        std::string key;
-        std::string action;
-        std::string msgContent;
+        std::pmr::string key;
+        std::pmr::string action;
+        std::pmr::string msgContent;
     };
 
     struct chatMessageVo
     {
         int code = -1;
-        uint64_t id;
-        std::string name;
-        std::string message;
+        uint64_t id = 0;
+        std::pmr::string name;
+        std::pmr::string message;
     };
 };

@@ -5,6 +5,7 @@
 #include <glaze/glaze.hpp>
 #include <drogon/HttpAppFramework.h>
 #include "utils/retry_utils.h"
+#include <memory_resource>
 
 struct Subscriber
 {
@@ -63,22 +64,22 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
 
                         if (!msg_dto.action.empty() && msg_dto.action == "message")
                         {
+                            thread_local std::pmr::monotonic_buffer_resource pool(1024 * 1024);
+
                             chatMessageVo msg_vo{};
                             msg_vo.code = 200;
                             msg_vo.id = id;
-                            msg_vo.name = data;
-                            msg_vo.message = msg_dto.msgContent;
-                            thread_local std::string json;
-                            json.clear();
+                            msg_vo.name = std::pmr::string(data.data(), data.size(), &pool);
+                            msg_vo.message = std::pmr::string(msg_dto.msgContent.data(), msg_dto.msgContent.size(), &pool);
+                            std::pmr::string json(&pool);
                             (void)glz::write_json(msg_vo, json);
 
                             // 发布消息给订阅的客户端
-                            chatRooms_.publish(topic, json);
-                            //wsConn->send(json);
+                            chatRooms_.publish(topic, json.data());
 
                             // 异步发送 Kafka 消息，失败自动重试
-                            co_await retryWithDelayAsync([]() -> Task<bool> {
-                                if (rd_kafka_topic_t* topic_ptr = kafka::KafkaManager::instance().getTopic("message_topic"); !kafka::KafkaManager::safeProduce(topic_ptr, json))
+                            /*co_await retryWithDelayAsync([json]() -> Task<bool> {
+                                if (rd_kafka_topic_t* topic_ptr = kafka::KafkaManager::instance().getTopic("message_topic"); !kafka::KafkaManager::safeProduce(topic_ptr, json.data()))
                                 {
                                     const rd_kafka_resp_err_t err = rd_kafka_last_error();
                                     LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(err);
@@ -88,7 +89,7 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                                     }
                                 }
                                 co_return true;
-                            },3, std::chrono::milliseconds(100));
+                            },3, std::chrono::milliseconds(100));*/
                         }
                     }
                     catch (const std::exception& e)

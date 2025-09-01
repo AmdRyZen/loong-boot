@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.31.6)
+cmake_minimum_required(VERSION 4.0)
 
 # 检查 CMake 版本，设置政策
 if(POLICY CMP0167)
@@ -187,7 +187,7 @@ FetchContent_MakeAvailable(glaze)
 # 查找其他依赖
 find_package(Drogon CONFIG REQUIRED)
 find_package(mimalloc 3.1.5 REQUIRED)
-find_package(Boost 1.88.0 REQUIRED)
+find_package(Boost 1.89.0 REQUIRED)
 find_package(TBB REQUIRED)
 include_directories(/opt/homebrew/include)
 
