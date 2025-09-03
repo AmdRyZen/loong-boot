@@ -21,6 +21,11 @@
 #include "base/vo/data_vo.h"
 #include "coroutinePool/TbbCoroutinePool.h"
 //#include "mqttManager/MqttManager.h"
+#include <iostream>
+#include <map>
+#include <chrono>
+#include <random>
+#include "parallel_hashmap/phmap.h"
 
 #if defined(__arm__) || defined(__aarch64__)
     #include <arm_neon.h>
@@ -37,6 +42,127 @@ using namespace boost::gregorian;
 namespace mp = boost::multiprecision;
 using namespace rapidjson;
 using namespace std::chrono;
+using namespace std;
+
+Task<> OpenApi::phmap(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
+{
+    constexpr size_t N = 2'000'000;  // 测试数据量
+    vector<int> keys;
+    keys.reserve(N);
+
+    // 随机生成 key
+    std::mt19937 rng(12345);
+    std::uniform_int_distribution<int> dist(1, N*10);
+    for (size_t i = 0; i < N; i++) {
+        keys.push_back(dist(rng));
+    }
+
+    // -------- std::map --------
+    {
+        map<int, int> m;
+
+        auto start = chrono::high_resolution_clock::now();
+        for (auto k : keys) {
+            m[k] = k;
+        }
+        auto end = chrono::high_resolution_clock::now();
+        cout << "std::map 插入耗时: "
+             << chrono::duration_cast<chrono::milliseconds>(end - start).count()
+             << " ms" << endl;
+
+        start = chrono::high_resolution_clock::now();
+        size_t found = 0;
+        for (auto k : keys) {
+            if (m.contains(k)) found++;
+        }
+        end = chrono::high_resolution_clock::now();
+        cout << "std::map 查找耗时: "
+             << chrono::duration_cast<chrono::milliseconds>(end - start).count()
+             << " ms" << endl;
+
+        start = chrono::high_resolution_clock::now();
+        long long sum = 0;
+        for (const auto& v : m | views::values) sum += v;
+        end = chrono::high_resolution_clock::now();
+        cout << "std::map 遍历耗时: "
+             << chrono::duration_cast<chrono::milliseconds>(end - start).count()
+             << " ms, sum=" << sum << endl;
+    }
+
+    // -------- phmap::parallel_flat_hash_map --------
+    {
+        phmap::parallel_flat_hash_map<int, int> m;
+        m.reserve(N);   // 提前分配容量，避免扩容
+
+        auto start = chrono::high_resolution_clock::now();
+        for (auto k : keys) {
+            m[k] = k;
+        }
+        auto end = chrono::high_resolution_clock::now();
+        cout << "phmap 插入耗时: "
+             << chrono::duration_cast<chrono::milliseconds>(end - start).count()
+             << " ms" << endl;
+
+        start = chrono::high_resolution_clock::now();
+        size_t found = 0;
+        for (auto k : keys) {
+            if (m.find(k) != m.end()) found++;
+        }
+        end = chrono::high_resolution_clock::now();
+        cout << "phmap 查找耗时: "
+             << chrono::duration_cast<chrono::milliseconds>(end - start).count()
+             << " ms" << endl;
+
+        start = chrono::high_resolution_clock::now();
+        long long sum = 0;
+        for (const auto& v : m | views::values) sum += v;
+        end = chrono::high_resolution_clock::now();
+        cout << "phmap 遍历耗时: "
+             << chrono::duration_cast<chrono::milliseconds>(end - start).count()
+             << " ms, sum=" << sum << endl;
+    }
+
+    // -------- phmap::parallel_flat_hash_map 多线程 (TBB) --------
+    {
+        phmap::parallel_flat_hash_map<int, int> m;
+        m.reserve(N);   // 提前分配容量，避免扩容
+
+        auto start = chrono::high_resolution_clock::now();
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, N, 10000), [&](const tbb::blocked_range<size_t>& r) {
+            for (size_t i = r.begin(); i < r.end(); ++i) {
+                m[keys[i]] = keys[i];
+            }
+        });
+        auto end = chrono::high_resolution_clock::now();
+        cout << "phmap 多线程插入耗时: "
+             << chrono::duration_cast<chrono::milliseconds>(end - start).count()
+             << " ms" << endl;
+
+        start = chrono::high_resolution_clock::now();
+        std::atomic<size_t> found{0};
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, N), [&](const tbb::blocked_range<size_t>& r) {
+            size_t local = 0;
+            for (size_t i = r.begin(); i < r.end(); ++i) {
+                if (m.find(keys[i]) != m.end()) local++;
+            }
+            found += local;
+        });
+        end = chrono::high_resolution_clock::now();
+        cout << "phmap 多线程查找耗时: "
+             << chrono::duration_cast<chrono::milliseconds>(end - start).count()
+             << " ms" << endl;
+
+        start = chrono::high_resolution_clock::now();
+        long long sum = 0;
+        for (const auto& v : m | views::values) sum += v;
+        end = chrono::high_resolution_clock::now();
+        cout << "phmap 多线程遍历耗时: "
+             << chrono::duration_cast<chrono::milliseconds>(end - start).count()
+             << " ms, sum=" << sum << endl;
+    }
+
+    co_return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
+}
 
 Task<> OpenApi::tbb(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
 {
