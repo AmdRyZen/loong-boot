@@ -8,8 +8,8 @@ else()
 endif()
 
 # 设置编译器
-set(CMAKE_C_COMPILER "/opt/homebrew/Cellar/gcc/15.1.0/bin/gcc-15")
-set(CMAKE_CXX_COMPILER "/opt/homebrew/Cellar/gcc/15.1.0/bin/g++-15")
+set(CMAKE_C_COMPILER "/opt/homebrew/Cellar/gcc/15.2.0/bin/gcc-15")
+set(CMAKE_CXX_COMPILER "/opt/homebrew/Cellar/gcc/15.2.0/bin/g++-15")
 
 
 project(loong-boot C CXX)
