@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 4.0)
+cmake_minimum_required(VERSION 4.1)
 
 # 检查 CMake 版本，设置政策
 if(POLICY CMP0167)
@@ -7,10 +7,13 @@ else()
     message(STATUS "CMake version does not support policy CMP0167")
 endif()
 
-# 设置编译器
-set(CMAKE_C_COMPILER "/opt/homebrew/Cellar/gcc/15.2.0/bin/gcc-15")
-set(CMAKE_CXX_COMPILER "/opt/homebrew/Cellar/gcc/15.2.0/bin/g++-15")
-
+# 设置编译器（移除硬编码路径，允许用户自定义）
+if(NOT CMAKE_C_COMPILER)
+    set(CMAKE_C_COMPILER "/opt/homebrew/Cellar/gcc/15.2.0/bin/gcc-15")
+endif()
+if(NOT CMAKE_CXX_COMPILER)
+    set(CMAKE_CXX_COMPILER "/opt/homebrew/Cellar/gcc/15.2.0/bin/g++-15")
+endif()
 
 project(loong-boot C CXX)
 
@@ -20,41 +23,102 @@ if(NOT CMAKE_BUILD_TYPE)
     message(WARNING "未设置 CMAKE_BUILD_TYPE，默认使用 Release 模式")
 endif()
 
-include(CheckIncludeFileCXX)
-
-# 检查 C++ 特性支持
-check_include_file_cxx(any HAS_ANY)
-check_include_file_cxx(string_view HAS_STRING_VIEW)
-check_include_file_cxx(coroutine HAS_COROUTINE)
-
-# 设置 C++26 标
+# 设置 C++26 标准
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-set(FOO_USE_STATIC_LIBS ON)
 set(CMAKE_BUILD_PARALLEL_LEVEL 8)
+
+# 检查特性支持
+include(CheckIncludeFileCXX)
+check_include_file_cxx(any HAS_ANY)
+check_include_file_cxx(string_view HAS_STRING_VIEW)
+check_include_file_cxx(coroutine HAS_COROUTINE)
 
 # 可配置的优化选项
 option(AGGRESSIVE_OPT "启用激进优化" OFF)
 option(USE_LTO "启用链接时优化" OFF)
 option(USE_OPENMP "启用 OpenMP 并行化" OFF)
-option(USE_WNO "关闭警告" ON)
-
+option(USE_WNO "关闭特定警告" ON)
 option(USE_PGO_GEN "启用 PGO 生成阶段" OFF)
 option(USE_PGO_USE "启用 PGO 使用阶段" OFF)
 
-# 设置链接路径
-add_link_options(-L/usr/local/lib)
+# 设置编译选项
+set(COMMON_COMPILE_OPTIONS
+        $<$<CONFIG:Debug>:-pipe;-Wall;-Wextra;-Wno-unused-parameter;-Wno-uninitialized;-Wno-unused-function;-Wno-deprecated-declarations;-Wno-missing-requires;-Og;-fsanitize=leak>
+        $<$<CONFIG:Release>:-pipe;-Wno-unused-parameter;-Wno-uninitialized;-Wno-unused-function;-Wno-deprecated-declarations;-Wno-missing-requires;-Ofast;-fipa-pta;-freorder-blocks;-finline-functions;-falign-functions=32;-falign-loops=32;-funroll-loops>
+)
 
-# 查找 Protobuf
-#[[find_package(Protobuf REQUIRED)
-include_directories(${Protobuf_INCLUDE_DIRS})
-add_subdirectory(proto)
-include_directories(${PROTO_GEN_C_INCLUDE_DIRS} ${PROTO_GEN_CXX_INCLUDE_DIRS})]]
+# 关闭警告选项
+if(USE_WNO)
+    list(APPEND COMMON_COMPILE_OPTIONS
+            -Wno-missing-requires
+            -Wno-deprecated-declarations
+            -Wno-stringop-overread
+    )
+endif()
 
-# 源文件
-set(MODEL_SOURCES_DTO base/dto/open_dto.h)
-set(MODEL_SOURCES_VO base/vo/data_vo.h)
+# 检测目标架构并定义宏
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|arm)")
+    add_compile_definitions(ARM_ARCH)
+    list(APPEND COMMON_COMPILE_OPTIONS -mcpu=native -mtune=native)
+    message(STATUS "为 ARM 架构配置")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64)")
+    add_compile_definitions(X86_64_ARCH)
+    list(APPEND COMMON_COMPILE_OPTIONS -march=native -mtune=native -mfma -msse4.2 -mpopcnt -mavx2)
+    message(STATUS "为 x86_64 架构配置")
+else()
+    message(WARNING "不支持的架构: ${CMAKE_SYSTEM_PROCESSOR}，使用通用设置")
+endif()
+
+# 激进优化选项
+if(AGGRESSIVE_OPT)
+    set(AGGRESSIVE_FLAGS
+            -fno-stack-protector
+            -fweb
+            -fgcse-after-reload
+            -fdelete-null-pointer-checks
+            --param=inline-unit-growth=1500
+            --param=max-inline-insns-single=2500
+            --param=large-function-growth=1500
+            --param=max-inline-recursive-depth=12
+    )
+    list(APPEND COMMON_COMPILE_OPTIONS ${AGGRESSIVE_FLAGS})
+endif()
+
+# OpenMP 支持
+if(USE_OPENMP)
+    find_package(OpenMP REQUIRED)
+    set(OPENMP_FLAGS ${OpenMP_CXX_FLAGS})
+else()
+    set(OPENMP_FLAGS "")
+endif()
+
+# LTO 选项
+if(USE_LTO AND NOT USE_PGO_GEN)
+    list(APPEND COMMON_COMPILE_OPTIONS -flto=auto -ffat-lto-objects)
+    set(LTO_LINK_OPTIONS -flto=auto)
+endif()
+
+# PGO 选项
+if(USE_PGO_GEN)
+    list(APPEND COMMON_COMPILE_OPTIONS -fprofile-generate)
+    list(APPEND LTO_LINK_OPTIONS -fprofile-generate)
+elseif(USE_PGO_USE)
+    list(APPEND COMMON_COMPILE_OPTIONS -fprofile-use)
+    list(APPEND LTO_LINK_OPTIONS -fprofile-use)
+endif()
+
+# 创建目标
+add_executable(${PROJECT_NAME})
+
+# 设置源文件
+set(MODEL_SOURCES_DTO
+        base/dto/open_dto.h
+)
+set(MODEL_SOURCES_VO
+        base/vo/data_vo.h
+)
 set(MODEL_SOURCES_COMMON
         aop/Application.h
         threadPool/threadPool.h
@@ -73,11 +137,8 @@ set(MODEL_SOURCES_COMMON
         coroutinePool/TbbCoroutinePool.cc
 )
 
-add_executable(
-        ${PROJECT_NAME}
-        ${MODEL_SOURCES_DTO}
-        ${MODEL_SOURCES_VO}
-        ${MODEL_SOURCES_COMMON}
+# 添加源文件到目标
+target_sources(${PROJECT_NAME} PRIVATE
         main.cc
         utils/sql.h
         controllers/PlaintextCtrl.cc
@@ -94,92 +155,41 @@ add_executable(
         service/impl/SbcConvertServiceImpl.cpp
         service/TrieService.h
         service/impl/TrieServiceImpl.cpp
+        ${MODEL_SOURCES_DTO}
+        ${MODEL_SOURCES_VO}
+        ${MODEL_SOURCES_COMMON}
 )
 
-if(NOT USE_PGO_GEN)
-    set_target_properties(${PROJECT_NAME} PROPERTIES INTERPROCEDURAL_OPTIMIZATION ${USE_LTO})
+# 收集其他源文件
+file(GLOB_RECURSE CTL_SOURCES "controllers/*.cc" "controllers/*.h")
+file(GLOB_RECURSE FILTER_SOURCES "filters/*.cc" "filters/*.h")
+file(GLOB_RECURSE PLUGIN_SOURCES "plugins/*.cc" "plugins/*.h")
+file(GLOB_RECURSE MODEL_SOURCES "models/*.cc" "models/*.h")
+
+target_sources(${PROJECT_NAME} PRIVATE
+        ${CTL_SOURCES}
+        ${FILTER_SOURCES}
+        ${PLUGIN_SOURCES}
+        ${MODEL_SOURCES}
+)
+
+# 设置编译选项
+target_compile_options(${PROJECT_NAME} PRIVATE ${COMMON_COMPILE_OPTIONS})
+
+# 设置链接选项
+if(DEFINED LTO_LINK_OPTIONS)
+    target_link_options(${PROJECT_NAME} PRIVATE ${LTO_LINK_OPTIONS})
 endif()
 
-# 对于 PGO 使用阶段：
-if(USE_PGO_USE)
-    target_compile_options(${PROJECT_NAME} PRIVATE
-            -fprofile-use
-    )
-    target_link_options(${PROJECT_NAME} PRIVATE -fprofile-use)
-endif()
-
-# 对于 PGO 生成阶段：
-if(USE_PGO_GEN)
-    target_compile_options(${PROJECT_NAME} PRIVATE
-            -fprofile-generate
-    )
-    target_link_options(${PROJECT_NAME} PRIVATE -fprofile-generate)
-endif()
-
-#关闭警告
-if(USE_WNO)
-    add_compile_options(
-            -Wno-missing-requires
-            -Wno-deprecated-declarations
-            -Wno-stringop-overread
-    )
-endif()
-
-# 检测目标架构并定义宏
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm)")
-    add_compile_definitions(ARM_ARCH)
-    target_compile_options(${PROJECT_NAME} PRIVATE -mcpu=native -mtune=native)
-    message(STATUS "为 ARM 架构配置")
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64)")
-    add_compile_definitions(DX86_ARCH)
-    target_compile_options(${PROJECT_NAME} PRIVATE -march=native -mtune=native -mfma -msse4.2 -mpopcnt -mavx2)
-    message(STATUS "为 x86_64 架构配置")
-else()
-    message(WARNING "不支持的架构: ${CMAKE_SYSTEM_PROCESSOR}，使用通用设置")
-endif()
-
-# 激进优化选项
-if(AGGRESSIVE_OPT)
-    target_compile_options(${PROJECT_NAME} PRIVATE
-        -fno-stack-protector
-        -fweb
-        -fgcse-after-reload
-        -fdelete-null-pointer-checks
-        --param=inline-unit-growth=1500
-        --param=max-inline-insns-single=2500
-        --param=large-function-growth=1500
-        --param=max-inline-recursive-depth=12
-    )
-endif()
-
-# 链接时优化（LTO）选项
-if(USE_LTO AND NOT USE_PGO_GEN)
-    target_compile_options(${PROJECT_NAME} PRIVATE -flto=auto -ffat-lto-objects)
-endif()
-
-# OpenMP 并行化选项
-if(USE_OPENMP)
-    set(OPENMP_FLAGS "-fopenmp")
-else()
-    set(OPENMP_FLAGS "")
-endif()
-
-# 针对不同构建类型的编译选项
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    target_compile_options(${PROJECT_NAME} PRIVATE -pipe -Wall -Wextra -Wno-unused-parameter -Wno-uninitialized -Wno-unused-function -Wno-deprecated-declarations -Wno-missing-requires -Og -fsanitize=leak)
-    message(STATUS "调试模式: 启用 -Og -fsanitize=leak")
-elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
-    target_compile_options(${PROJECT_NAME} PRIVATE -pipe -Wno-unused-parameter -Wno-uninitialized -Wno-unused-function -Wno-deprecated-declarations -Wno-missing-requires -Ofast -fipa-pta -freorder-blocks -finline-functions -falign-functions=32 -falign-loops=32 -funroll-loops ${AGGRESSIVE_FLAGS} ${LTO_FLAGS} ${OPENMP_FLAGS})
-    message(STATUS "发布模式: 启用 -Ofast 等优化")
-# 这里不再有 else 分支，因为 CMAKE_BUILD_TYPE 已确保被设置
-endif()
+# 添加链接路径
+target_link_directories(${PROJECT_NAME} PRIVATE /usr/local/lib)
 
 # 拉取 Glaze 稳定版本
 include(FetchContent)
 FetchContent_Declare(
         glaze
         GIT_REPOSITORY https://github.com/stephenberry/glaze.git
-        GIT_TAG main  # 替换为最新版本，例如 v6.0.0
+        GIT_TAG main  # 建议替换为具体稳定版本号
         GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(glaze)
@@ -189,7 +199,11 @@ find_package(Drogon CONFIG REQUIRED)
 find_package(mimalloc 3.1.5 REQUIRED)
 find_package(Boost 1.89.0 REQUIRED)
 find_package(TBB REQUIRED)
-include_directories(/opt/homebrew/include)
+
+# 检查 Homebrew 路径是否存在
+if(EXISTS "/opt/homebrew/include")
+    target_include_directories(${PROJECT_NAME} PRIVATE /opt/homebrew/include)
+endif()
 
 # 链接库
 target_link_libraries(${PROJECT_NAME} PRIVATE
@@ -200,7 +214,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
         rdkafka
         TBB::tbb
         mimalloc
-        #[[proto_gen_cxx]]
+        $<$<BOOL:${USE_OPENMP}>:OpenMP::OpenMP_CXX>
 )
 
 # 编译定义
@@ -213,38 +227,29 @@ if(CCACHE_PROGRAM)
     set(CMAKE_CXX_COMPILER_LAUNCHER ${CCACHE_PROGRAM})
 endif()
 
-# 添加其他源文件
-aux_source_directory(controllers CTL_SRC)
-aux_source_directory(filters FILTER_SRC)
-aux_source_directory(plugins PLUGIN_SRC)
-aux_source_directory(models MODEL_SRC)
-
-# Drogon 视图
-drogon_create_views(${PROJECT_NAME} ${CMAKE_CURRENT_SOURCE_DIR}/views ${CMAKE_CURRENT_BINARY_DIR})
-
 # 包含目录
-target_include_directories(${PROJECT_NAME}
-        PRIVATE
+target_include_directories(${PROJECT_NAME} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/models
         ${CMAKE_CURRENT_SOURCE_DIR}/external/kafka-core/include
 )
 
-# 源文件
-target_sources(${PROJECT_NAME}
-        PRIVATE
-        ${SRC_DIR}
-        ${CTL_SRC}
-        ${FILTER_SRC}
-        ${PLUGIN_SRC}
-        ${MODEL_SRC}
+# 处理测试子目录
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/CMakeLists.txt")
+    add_subdirectory(test)
+endif()
+
+# 可选：为不同构建类型设置属性
+set_target_properties(${PROJECT_NAME} PROPERTIES
+        CXX_STANDARD ${CMAKE_CXX_STANDARD}
+        CXX_STANDARD_REQUIRED ${CMAKE_CXX_STANDARD_REQUIRED}
+        CXX_EXTENSIONS ${CMAKE_CXX_EXTENSIONS}
 )
 
-# === 构建脚本提示（PGO） ===
-# 使用如下命令手动构建生成 profile 数据：
-# sh ./build.sh gen             # 使用 Release 模式生成 PGO 数据
-# ./build-pgo-gen/loong-boot # 运行一次完整业务
-# sh ./build.sh use             # 使用 Release 模式构建优化版本
-
-# 测试子目录
-add_subdirectory(test)
+# 显示构建信息
+message(STATUS "Project: ${PROJECT_NAME}")
+message(STATUS "Build Type: ${CMAKE_BUILD_TYPE}")
+message(STATUS "Architecture: ${CMAKE_SYSTEM_PROCESSOR}")
+message(STATUS "Compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
+message(STATUS "Optimizations: AGGRESSIVE_OPT=${AGGRESSIVE_OPT}, LTO=${USE_LTO}, OPENMP=${USE_OPENMP}")
+message(STATUS "PGO: GEN=${USE_PGO_GEN}, USE=${USE_PGO_USE}")

@@ -6,6 +6,7 @@
 #include <drogon/HttpAppFramework.h>
 #include "utils/retry_utils.h"
 #include <memory_resource>
+#include <thread>
 
 struct Subscriber
 {
@@ -48,8 +49,8 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                 const auto& subscriber = wsConn->getContextRef<Subscriber>();
                 const auto& [topic, id] = subscriber;
 
-                // 提交协程任务给协程池，协程自动启动，无需手动 resume
-                // async_run([msg_dto, topic, id, this]() -> Task<>
+                // 不在协程中使用thread_local的monotonic_buffer_resource
+                // 改为使用标准字符串
                 TbbCoroutinePool::instance().submit([msg_dto, topic, id, this]() -> AsyncTask
                 {
                     try
@@ -64,22 +65,22 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
 
                         if (!msg_dto.action.empty() && msg_dto.action == "message")
                         {
-                            thread_local std::pmr::monotonic_buffer_resource pool(1024 * 1024);
-
+                            // 使用标准字符串，避免pmr相关问题
                             chatMessageVo msg_vo{};
                             msg_vo.code = 200;
                             msg_vo.id = id;
-                            msg_vo.name = std::pmr::string(data.data(), data.size(), &pool);
-                            msg_vo.message = std::pmr::string(msg_dto.msgContent.data(), msg_dto.msgContent.size(), &pool);
-                            std::pmr::string json(&pool);
+                            msg_vo.name = data;  // 使用普通string
+                            msg_vo.message = msg_dto.msgContent;  // 使用普通string
+
+                            std::string json{};  // 使用普通string
                             (void)glz::write_json(msg_vo, json);
 
                             // 发布消息给订阅的客户端
-                            chatRooms_.publish(topic, json.data());
+                            chatRooms_.publish(topic, json);
 
                             // 异步发送 Kafka 消息，失败自动重试
                             /*co_await retryWithDelayAsync([json]() -> Task<bool> {
-                                if (rd_kafka_topic_t* topic_ptr = kafka::KafkaManager::instance().getTopic("message_topic"); !kafka::KafkaManager::safeProduce(topic_ptr, json.data()))
+                                if (rd_kafka_topic_t* topic_ptr = kafka::KafkaManager::instance().getTopic("message_topic"); !kafka::KafkaManager::safeProduce(topic_ptr, json))
                                 {
                                     const rd_kafka_resp_err_t err = rd_kafka_last_error();
                                     LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(err);
@@ -129,10 +130,13 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
         }
     });
 
-    //std::lock_guard guard(mutex_);
-    // 如果使用 phmap::parallel_flat_hash_map，它内部已经支持分段锁并发插入，你可以去掉外部 mutex：
-    userNameToConn_.emplace(userName, wsConn);
-    connToUser_.emplace(wsConn, userName);
+    // 使用原子操作或无锁数据结构来减少锁竞争
+    {
+        std::lock_guard guard(mutex_);
+        userNameToConn_.emplace(userName, wsConn);
+        connToUser_.emplace(wsConn, userName);
+    }
+
     LOG_INFO << "Added connection for user: " << userName << " Subscriber ID: " << s.id_ << ", Topic: " << s.topic_;
 
     chatMessageVo msg_vo;
@@ -140,9 +144,11 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
     msg_vo.id = s.id_;
     msg_vo.name = s.topic_;
     msg_vo.message = std::format("欢迎 {} 加入我们 {}", userName, s.topic_);
-    thread_local std::string json; // 使用 thread_local 避免频繁分配
-    json.clear();
+
+    // 使用普通string避免thread_local问题
+    std::string json{};
     (void)glz::write_json(msg_vo, json);
+
     chatRooms_.publish(s.topic_, json);
 
     rd_kafka_topic_t* topic_ptr = kafka::KafkaManager::instance().getTopic("message_topic");
@@ -176,14 +182,15 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
                 userNameToConn_.erase(userName);
                 LOG_INFO << "Removed user: " << userName;
             }
-            if (userNameToConn_.empty() && connToUser_.empty())
-            {
-                // std::unordered_map 在元素删除后可能不会立即释放内存，导致内存占用较高。可以使用以下方法尝试释放未使用的内存
-                userNameToConn_.clear();
-                userNameToConn_.rehash(0);
-                connToUser_.clear();
+
+            // 仅在容器很大时才尝试收缩内存
+            if (userNameToConn_.size() > 1000) {
+                userNameToConn_.rehash(0); // 尝试释放多余内存
+            }
+            if (connToUser_.size() > 1000) {
                 connToUser_.rehash(0);
             }
+
             LOG_INFO << "Removed closed connection";
         }
 
@@ -197,9 +204,11 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
         msg_vo.id = id;
         msg_vo.name = topic;
         msg_vo.message = std::format("{} 已离开 {}", userName, topic);
-        thread_local std::string json; // 使用 thread_local 避免频繁分配
-        json.clear();
+
+        // 使用普通string避免thread_local问题
+        std::string json{};
         (void)glz::write_json(msg_vo, json);
+
         chatRooms_.publish(topic, json);
 
         rd_kafka_topic_t* topic_ptr = kafka::KafkaManager::instance().getTopic("message_topic");

@@ -10,6 +10,8 @@ function build_loong()
 
     #Update the submodule and initialize
     #git submodule update --init
+    # swiftc -O test.swift -o bench_swift
+    # cjc -O2 --experimental --target-cpu=native test.cj -o bench_cj
 
 
     if [ -z "$1" ]; then
