@@ -7,6 +7,7 @@ extern "C" {
 #include "base64Utils.h"
 }
 #include "cipherUtils.h"
+#include <algorithm>
 
 //get the bit length after zero padding (one of 128, 192, 256), skey.length() must be <= 32.
 int keybits(const std::string& skey)
@@ -43,10 +44,10 @@ inline void XOR(const uint8 a[16], const uint8 b[16], uint8 c[16])
 std::string cipherUtils::encrypt_cbc(const std::string& plaintext, const std::string& skey, const std::string& siv)
 {
     uint8 iv[16] = {0};  //zero padding
-    memcpy(iv, siv.c_str(), siv.length());
+    memcpy(iv, siv.c_str(), std::min(siv.length(), sizeof(iv)));
     aes_context ctx;
     uint8 key[32] = {0};  //zero padding
-    memcpy(key, skey.c_str(), skey.length());
+    memcpy(key, skey.c_str(), std::min(skey.length(), sizeof(key)));
     aes_set_key(&ctx, key, keybits(skey));
 
     size_t outlen = (plaintext.length() / BLOCK_SIZE + 1) * BLOCK_SIZE;  //padding之后plaintext的长度
@@ -71,10 +72,10 @@ std::string cipherUtils::encrypt_cbc(const std::string& plaintext, const std::st
 std::string cipherUtils::decrypt_cbc(const std::string& basestr, const std::string& skey, const std::string& siv)
 {
     uint8 iv[16] = {0};  //zero padding
-    memcpy(iv, siv.c_str(), siv.length());
+    memcpy(iv, siv.c_str(), std::min(siv.length(), sizeof(iv)));
     aes_context ctx;
     uint8 key[32] = {0};
-    memcpy(key, skey.c_str(), skey.length());
+    memcpy(key, skey.c_str(), std::min(skey.length(), sizeof(key)));
     aes_set_key(&ctx, key, keybits(skey));
 
     size_t outlen = basestr.length() / 4 * 3;

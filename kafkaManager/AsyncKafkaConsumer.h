@@ -39,6 +39,13 @@ public:
     ~AsyncKafkaConsumer()
     {
         stop_ = true;
+        for (auto& thread : pollThreads_)
+        {
+            if (thread.joinable())
+            {
+                thread.join();
+            }
+        }
         consumers_.clear();
         LOG_INFO << "AsyncKafkaConsumer consumer stopped.";
     }
@@ -78,10 +85,8 @@ private:
 
             consumers_.emplace_back(consumer);
 
-            // 消费线程任务入队，改用 TbbCoroutinePool
-            TbbCoroutinePool::instance().submit([this, consumer]() -> drogon::AsyncTask {
+            pollThreads_.emplace_back([this, consumer] {
                 this->consumeMessages(consumer);
-                co_return;
             });
         }
     }
@@ -141,6 +146,7 @@ private:
     }
 
     std::vector<std::unique_ptr<rd_kafka_t, KafkaDeleter>> consumers_; // Kafka 消费者实例
+    std::vector<std::thread> pollThreads_;
     std::atomic<bool> stop_{false}; // 控制消费线程的停止
 
     std::vector<std::string> topics_;

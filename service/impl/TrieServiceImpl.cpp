@@ -64,7 +64,10 @@ void TrieService::insert(const std::wstring& word)
         curNode = subNode;
     }
     const int unicode = SbcConvertService::charConvert(kEndFlag);
-    curNode->addSubNode(unicode, new TrieNode());
+    if (curNode->getSubNode(unicode) == nullptr)
+    {
+        curNode->addSubNode(unicode, new TrieNode());
+    }
 }
 
 bool TrieService::search(const std::wstring& word)

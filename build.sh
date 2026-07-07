@@ -1,8 +1,17 @@
+#!/usr/bin/env bash
+
 #cmake - DCMAKE_BUILD_TYPE = Release - B./ build && cmake-- build build - j4-- config Release
 
-# PGO options
+# PGO and performance options
 use_pgo=OFF
 gen_pgo=OFF
+aggressive_opt=OFF
+use_lto=OFF
+use_native=ON
+use_fast_linker=OFF
+run_after_build=ON
+build_dir='./build'
+profile_dir=''
 
 function build_loong()
 {
@@ -23,16 +32,8 @@ function build_loong()
     #Save current directory
     current_dir="${PWD}"
 
-    #The folder in which we will build
-    if [[ "$gen_pgo" == "ON" ]]; then
-        build_dir='./build-pgo-gen'
-    else
-        build_dir='./build'
-    fi
-    # 只有在 gen 阶段时，才清除 build 目录
-    if [[ "$gen_pgo" == "ON" && -d $build_dir ]]; then
-        echo "Deleted folder: ${build_dir}"
-        rm -rf $build_dir
+    if [[ -z "$profile_dir" ]]; then
+        profile_dir="${current_dir}/build-pgo-gen/pgo-data"
     fi
 
     #Create building folder
@@ -42,32 +43,26 @@ function build_loong()
     echo "Entering folder: ${build_dir}"
     cd $build_dir || exit
 
-    if [[ "$use_pgo" == "ON" ]]; then
-        echo "复制 .gcda 文件用于 PGO..."
-        gen_dir="../build-pgo-gen"
-        use_dir="."
-        if [ -d "$gen_dir" ]; then
-            find "$gen_dir" -name "*.gcda" | while read -r src; do
-                dst="${src/$gen_dir/$use_dir}"
-                dst_dir=$(dirname "$dst")
-                mkdir -p "$dst_dir"
-                cp "$src" "$dst"
-            done
-        else
-            echo "警告：未找到 PGO 生成目录 $gen_dir"
-        fi
-    fi
+    cmake_common_options=(
+        -DUSE_PGO_GEN=${gen_pgo}
+        -DUSE_PGO_USE=${use_pgo}
+        -DAGGRESSIVE_OPT=${aggressive_opt}
+        -DUSE_LTO=${use_lto}
+        -DUSE_NATIVE_ARCH=${use_native}
+        -DUSE_FAST_LINKER=${use_fast_linker}
+        -DPGO_PROFILE_DIR="${profile_dir}"
+    )
 
     echo "Start building ..."
     case "$1" in
         Debug)
-            cmake .. -DCMAKE_BUILD_TYPE=Debug -DUSE_PGO_GEN=${gen_pgo} -DUSE_PGO_USE=${use_pgo} $cmake_gen
+            cmake .. -DCMAKE_BUILD_TYPE=Debug "${cmake_common_options[@]}" $cmake_gen
             ;;
         DebugShared)
-            cmake .. -DCMAKE_BUILD_TYPE=Debug -DBUILD_DROGON_SHARED=ON -DCMAKE_CXX_VISIBILITY_PRESET=hidden -DCMAKE_VISIBILITY_INLINES_HIDDEN=1 -DUSE_PGO_GEN=${gen_pgo} -DUSE_PGO_USE=${use_pgo} $cmake_gen
+            cmake .. -DCMAKE_BUILD_TYPE=Debug -DBUILD_DROGON_SHARED=ON -DCMAKE_CXX_VISIBILITY_PRESET=hidden -DCMAKE_VISIBILITY_INLINES_HIDDEN=1 "${cmake_common_options[@]}" $cmake_gen
             ;;
         Release|*)
-            cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-16 -DUSE_PGO_GEN=${gen_pgo} -DUSE_PGO_USE=${use_pgo} $cmake_gen
+            cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-16 "${cmake_common_options[@]}" $cmake_gen
             ;;
     esac
 
@@ -93,8 +88,12 @@ function build_loong()
     #Go back to the current directory
     cd $current_dir || exit
 
-    echo "Starting ..."
-    $build_dir/loong-boot
+    if [[ "$run_after_build" == "ON" ]]; then
+        echo "Starting ..."
+        $build_dir/loong-boot
+    else
+        echo "Build done: ${build_dir}/loong-boot"
+    fi
     #Ok!
 }
 
@@ -118,7 +117,7 @@ esac
 
 # simulate ninja's parallelism
 # shellcheck disable=SC2194
-case nproc in
+case "$nproc" in
  1)
     parallel=$(( nproc + 1 ))
     ;;
@@ -130,7 +129,7 @@ case nproc in
     ;;
 esac
 
-if [ -f /bin/ninja ]; then
+if command -v ninja >/dev/null 2>&1; then
     make_program=ninja
     cmake_gen='-GNinja'
 else
@@ -140,6 +139,9 @@ fi
 # Parse extra arguments for PGO
 for arg in "$@"; do
     case "$arg" in
+        --no-run)
+            run_after_build=OFF
+            ;;
         gen)
             gen_pgo=ON
             ;;
@@ -159,19 +161,46 @@ elif [[ "$1" == "-tshared" ]]; then
     shift
 elif [[ "$1" == "-trelease" ]]; then
     build_type="Release"
+    build_dir='./build-release'
+    shift
+elif [[ "$1" == "-tperf" ]]; then
+    build_type="Release"
+    aggressive_opt=ON
+    build_dir='./build-perf'
+    shift
+elif [[ "$1" == "-tlto" ]]; then
+    build_type="Release"
+    aggressive_opt=ON
+    use_lto=ON
+    build_dir='./build-perf-lto'
+    shift
+elif [[ "$1" == "-tpgo-gen" ]]; then
+    build_type="Release"
+    aggressive_opt=ON
+    gen_pgo=ON
+    build_dir='./build-pgo-gen'
+    profile_dir="${PWD}/build-pgo-gen/pgo-data"
+    shift
+elif [[ "$1" == "-tpgo-use" ]]; then
+    build_type="Release"
+    aggressive_opt=ON
+    use_lto=ON
+    use_pgo=ON
+    build_dir='./build-pgo-use'
+    profile_dir="${PWD}/build-pgo-gen/pgo-data"
     shift
 fi
 
-# 检查 gen/use 同时出现且类型不一致
-if [[ "$*" == *gen* && "$*" == *use* ]]; then
-    if [[ "$build_type" != "Release" ]]; then
-        echo "警告：gen 和 use 同时指定时，建议构建类型保持一致（当前为 $build_type，建议为 Release）"
-    fi
+if [[ "$*" == *"--no-native"* ]]; then
+    use_native=OFF
+fi
+if [[ "$*" == *"--fast-linker"* ]]; then
+    use_fast_linker=ON
 fi
 
-# ./build.sh gen 或 ./build.sh use 时，默认使用 Release 保持一致
-if [[ "$*" == *gen* || "$*" == *use* ]]; then
-    build_type="Release"
+if [[ "$gen_pgo" == "ON" && "$use_pgo" == "ON" ]]; then
+    echo "错误：PGO gen 和 use 不能同时开启"
+    exit 1
 fi
 
 build_loong "$build_type" "$@"

@@ -37,6 +37,7 @@ cmake-build-release
 cmake-build-debug-gcc
 build
 build-pgo-gen
+build-perf-lto
 .idea
 fprofile
 log
