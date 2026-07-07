@@ -14,6 +14,22 @@ struct Subscriber
     SubscriberID id_{};
 };
 
+void ChatWebsocket::produceKafkaAsync(std::string topicName, std::string payload)
+{
+    TbbCoroutinePool::instance().submit([topicName = std::move(topicName), payload = std::move(payload)] {
+        rd_kafka_topic_t* topicPtr = kafka::KafkaManager::instance().getTopic(topicName);
+        retryWithSleep([&]() {
+            if (!kafka::KafkaManager::safeProduce(topicPtr, payload))
+            {
+                const rd_kafka_resp_err_t err = rd_kafka_last_error();
+                LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(err);
+                return err != RD_KAFKA_RESP_ERR__QUEUE_FULL;
+            }
+            return true;
+        });
+    });
+}
+
 void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::string&& msg, const WebSocketMessageType& type)
 {
     try
@@ -151,19 +167,7 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
 
     chatRooms_.publish(s.topic_, json);
 
-    rd_kafka_topic_t* topic_ptr = kafka::KafkaManager::instance().getTopic("message_topic");
-    retryWithSleep([&]() {
-        if (!kafka::KafkaManager::safeProduce(topic_ptr, json))
-        {
-            const rd_kafka_resp_err_t err = rd_kafka_last_error();
-            LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(err);
-            if (err == RD_KAFKA_RESP_ERR__QUEUE_FULL)
-            {
-                return false;
-            }
-        }
-        return true;
-    });
+    produceKafkaAsync("message_topic", json);
 
     wsConn->setContext(std::make_shared<Subscriber>(std::move(s)));
 }
@@ -211,19 +215,7 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
 
         chatRooms_.publish(topic, json);
 
-        rd_kafka_topic_t* topic_ptr = kafka::KafkaManager::instance().getTopic("message_topic");
-        retryWithSleep([&]() {
-            if (!kafka::KafkaManager::safeProduce(topic_ptr, json))
-            {
-                const rd_kafka_resp_err_t err = rd_kafka_last_error();
-                LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(err);
-                if (err == RD_KAFKA_RESP_ERR__QUEUE_FULL)
-                {
-                    return false;
-                }
-            }
-            return true;
-        });
+        produceKafkaAsync("message_topic", json);
     }
     catch (const std::exception& e)
     {

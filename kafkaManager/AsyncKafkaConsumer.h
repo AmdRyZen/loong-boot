@@ -6,18 +6,21 @@
 #include <rdkafka.h>
 #include <atomic>
 #include <cassert>
+#include <functional>
 #include <limits>
 #include <memory>
-#include <functional>
+#include <string>
+#include <thread>
+#include <vector>
+#include <drogon/utils/coroutine.h>
 #include "kafka/KafkaManager.h"
 #include "coroutinePool/TbbCoroutinePool.h"
 
-using namespace drogon;
 class AsyncKafkaConsumer
 {
 public:
     AsyncKafkaConsumer(std::vector<std::string> topics,
-                       std::function<Task<>(const std::string&)> handler,
+                       std::function<drogon::Task<>(const std::string&)> handler,
                        const size_t numThreads = std::thread::hardware_concurrency())
         : stop_(false), topics_(std::move(topics)), messageHandler_(std::move(handler))
     {
@@ -76,7 +79,7 @@ private:
             consumers_.emplace_back(consumer);
 
             // 消费线程任务入队，改用 TbbCoroutinePool
-            TbbCoroutinePool::instance().submit([this, consumer]() -> AsyncTask {
+            TbbCoroutinePool::instance().submit([this, consumer]() -> drogon::AsyncTask {
                 this->consumeMessages(consumer);
                 co_return;
             });
@@ -85,7 +88,7 @@ private:
 
     void submitMessageTask(rd_kafka_message_t* msg, rd_kafka_t* consumer)
     {
-        TbbCoroutinePool::instance().submit([msg, consumer, this]() -> AsyncTask {
+        TbbCoroutinePool::instance().submit([msg, consumer, this]() -> drogon::AsyncTask {
             try
             {
                 if (msg->err)
@@ -121,7 +124,7 @@ private:
     {
         while (!stop_)
         {
-            if (rd_kafka_message_t* msg = rd_kafka_consumer_poll(consumer_, 50))
+            if (rd_kafka_message_t* msg = rd_kafka_consumer_poll(consumer_, 100))
             {
                 constexpr int maxBatchSize = 32;
                 submitMessageTask(msg, consumer_);
@@ -134,7 +137,6 @@ private:
                     submitMessageTask(nextMsg, consumer_);
                 }
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
     }
 
@@ -142,7 +144,7 @@ private:
     std::atomic<bool> stop_{false}; // 控制消费线程的停止
 
     std::vector<std::string> topics_;
-    std::function<Task<>(const std::string&)> messageHandler_;
+    std::function<drogon::Task<>(const std::string&)> messageHandler_;
     struct KafkaStats {
         std::atomic<size_t> msgCount{0};
         std::atomic<size_t> errCount{0};

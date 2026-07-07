@@ -9,10 +9,10 @@ endif()
 
 # 设置编译器（移除硬编码路径，允许用户自定义）
 if(NOT CMAKE_C_COMPILER)
-    set(CMAKE_C_COMPILER "/opt/homebrew/Cellar/gcc/15.2.0/bin/gcc-15")
+    set(CMAKE_C_COMPILER "/opt/homebrew/Cellar/gcc/16.1.0/bin/gcc-16")
 endif()
 if(NOT CMAKE_CXX_COMPILER)
-    set(CMAKE_CXX_COMPILER "/opt/homebrew/Cellar/gcc/15.2.0/bin/g++-15")
+    set(CMAKE_CXX_COMPILER "/opt/homebrew/Cellar/gcc/16.1.0/bin/g++-16")
 endif()
 
 project(loong-boot C CXX)

@@ -67,7 +67,7 @@ function build_loong()
             cmake .. -DCMAKE_BUILD_TYPE=Debug -DBUILD_DROGON_SHARED=ON -DCMAKE_CXX_VISIBILITY_PRESET=hidden -DCMAKE_VISIBILITY_INLINES_HIDDEN=1 -DUSE_PGO_GEN=${gen_pgo} -DUSE_PGO_USE=${use_pgo} $cmake_gen
             ;;
         Release|*)
-            cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-15 -DUSE_PGO_GEN=${gen_pgo} -DUSE_PGO_USE=${use_pgo} $cmake_gen
+            cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-16 -DUSE_PGO_GEN=${gen_pgo} -DUSE_PGO_USE=${use_pgo} $cmake_gen
             ;;
     esac
 

@@ -45,9 +45,10 @@ private:
     phmap::flat_hash_set<std::string> excludedUsers_ = {"dog", "cat", "mouse"};
     mutable std::mutex mutex_;
 
+    static void produceKafkaAsync(std::string topicName, std::string payload);
+
     void sendHeartbeatToAll() const
     {
-        rd_kafka_topic_t* topic_ptr = kafka::KafkaManager::instance().getTopic("message_topic_one");
         chatRooms_.publish("001", std::format("房间公告消息"));
 
         // 遍历并发送心跳给 excludedUsers_ 内的用户
@@ -71,21 +72,7 @@ private:
             // 发送给客户端
             wsConnPtr->send(json);
 
-            // Kafka 异步发送，避免阻塞心跳循环
-            auto kafkaTask = [topic_ptr, json]() {
-                retryWithSleep([&]() {
-                    if (!kafka::KafkaManager::safeProduce(topic_ptr, json.data()))
-                    {
-                        const rd_kafka_resp_err_t err = rd_kafka_last_error();
-                        LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(err);
-                        return err != RD_KAFKA_RESP_ERR__QUEUE_FULL;
-                    }
-                    return true;
-                });
-            };
-
-            // 使用 drogon 的线程池执行 Kafka 发送
-            HttpAppFramework::instance().getLoop()->runInLoop(kafkaTask);
+            produceKafkaAsync("message_topic_one", std::string(json.data(), json.size()));
         }
     }
 

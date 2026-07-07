@@ -22,9 +22,10 @@ class TrieNode
         subNodes_[c] = subNode;
     }
 
-    TrieNode* getSubNode(const uint16_t c)
+    TrieNode* getSubNode(const uint16_t c) const
     {
-        return subNodes_[c];
+        const auto it = subNodes_.find(c);
+        return it == subNodes_.end() ? nullptr : it->second;
     }
 
   private:

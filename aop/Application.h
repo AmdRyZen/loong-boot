@@ -117,7 +117,7 @@ Application::Application()
         //TbbCoroutinePool::instance().init();
 
         // 获取 KafkaManager 的配置
-        const std::string brokers = app().getCustomConfig()["kafka_manager"]["bootstrap.servers"].asString();
+        const std::string brokers = drogon::app().getCustomConfig()["kafka_manager"]["bootstrap.servers"].asString();
 
         // 初始化 KafkaManager
         kafka::KafkaManager::instance().initialize(brokers);
@@ -153,7 +153,7 @@ Application::Application()
         LOG_ERROR << "initialization failed: " << e.what();
     }
 
-    app().registerBeginningAdvice([]() {
+    drogon::app().registerBeginningAdvice([]() {
         std::string word_path;
         std::string stopped_path;
         word_path.append(std::filesystem::current_path()).append("/public/word.txt");
@@ -164,9 +164,9 @@ Application::Application()
         std::cout << std::endl;
     });
 
-    app().registerPreRoutingAdvice([](const HttpRequestPtr& req,
-                                              AdviceCallback&& acb,
-                                              AdviceChainCallback&& accb) {
+    drogon::app().registerPreRoutingAdvice([](const drogon::HttpRequestPtr& req,
+                                              drogon::AdviceCallback&& acb,
+                                              drogon::AdviceChainCallback&& accb) {
         // todo ...
         //LOG_INFO << "preRouting1!";
         accb();
