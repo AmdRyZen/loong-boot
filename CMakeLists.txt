@@ -9,10 +9,10 @@ endif()
 
 # 设置编译器（移除硬编码路径，允许用户自定义）
 if(NOT CMAKE_C_COMPILER)
-    set(CMAKE_C_COMPILER "/opt/homebrew/Cellar/gcc/16.1.0/bin/gcc-16")
+    set(CMAKE_C_COMPILER "/opt/homebrew/opt/gcc/bin/gcc-16")
 endif()
 if(NOT CMAKE_CXX_COMPILER)
-    set(CMAKE_CXX_COMPILER "/opt/homebrew/Cellar/gcc/16.1.0/bin/g++-16")
+    set(CMAKE_CXX_COMPILER "/opt/homebrew/opt/gcc/bin/g++-16")
 endif()
 
 project(loong-boot C CXX)
@@ -221,9 +221,6 @@ if(DEFINED LTO_LINK_OPTIONS)
     target_link_options(${PROJECT_NAME} PRIVATE ${LTO_LINK_OPTIONS})
 endif()
 
-# 添加链接路径
-target_link_directories(${PROJECT_NAME} PRIVATE /usr/local/lib)
-
 # 拉取 Glaze 稳定版本
 include(FetchContent)
 FetchContent_Declare(
@@ -236,35 +233,53 @@ FetchContent_MakeAvailable(glaze)
 
 # 查找其他依赖
 find_package(Drogon CONFIG REQUIRED)
-find_package(mimalloc 3.1.5 REQUIRED)
-find_package(Boost 1.89.0 REQUIRED)
+find_package(mimalloc CONFIG REQUIRED)
+find_package(Boost CONFIG REQUIRED)
 find_package(TBB REQUIRED)
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+find_package(nlohmann_json CONFIG REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(RDKAFKA REQUIRED IMPORTED_TARGET rdkafka)
 
-# 检查 Homebrew 路径是否存在
-if(EXISTS "/opt/homebrew/include")
-    target_include_directories(${PROJECT_NAME} PRIVATE /opt/homebrew/include)
-endif()
+# jwt-cpp is header-only and does not provide a Homebrew CMake package.
+find_path(JWT_CPP_INCLUDE_DIR
+        NAMES jwt-cpp/jwt.h
+        REQUIRED)
+
+# kafka-core is a locally installed project library.
+find_library(KAFKA_CORE_LIBRARY
+        NAMES kafka-core
+        REQUIRED)
 
 # 链接库
 target_link_libraries(${PROJECT_NAME} PRIVATE
         Drogon::Drogon
         Boost::boost
         glaze::glaze
-        kafka-core
-        rdkafka
+        nlohmann_json::nlohmann_json
+        ${KAFKA_CORE_LIBRARY}
+        PkgConfig::RDKAFKA
         TBB::tbb
         mimalloc
+        OpenSSL::Crypto
         $<$<BOOL:${USE_OPENMP}>:OpenMP::OpenMP_CXX>
 )
 
 # 编译定义
 target_compile_definitions(${PROJECT_NAME} PRIVATE MI_MALLOC=1)
+if(APPLE AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # Boost 1.89 checks this libstdc++ feature macro before exposing
+    # boost::ulong_long_type. Homebrew GCC 16 on macOS supports the type but
+    # does not define the compatibility macro itself.
+    target_compile_definitions(${PROJECT_NAME} PRIVATE _GLIBCXX_USE_LONG_LONG=1)
+endif()
 
 # 包含目录
 target_include_directories(${PROJECT_NAME} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/models
         ${CMAKE_CURRENT_SOURCE_DIR}/external/kafka-core/include
+        ${JWT_CPP_INCLUDE_DIR}
 )
 
 # 处理测试子目录
@@ -277,6 +292,7 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
         CXX_STANDARD ${CMAKE_CXX_STANDARD}
         CXX_STANDARD_REQUIRED ${CMAKE_CXX_STANDARD_REQUIRED}
         CXX_EXTENSIONS ${CMAKE_CXX_EXTENSIONS}
+        CXX_SCAN_FOR_MODULES OFF
 )
 
 # 显示构建信息

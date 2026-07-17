@@ -3,7 +3,7 @@
 //
 
 #pragma once
-#include <rdkafka.h>
+#include <librdkafka/rdkafka.h>
 #include <atomic>
 #include <cassert>
 #include <functional>

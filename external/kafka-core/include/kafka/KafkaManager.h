@@ -4,7 +4,7 @@
 
 #pragma once
 
-#include <rdkafka.h>
+#include <librdkafka/rdkafka.h>
 #include <string>
 #include <mutex>
 #include <unordered_map>
