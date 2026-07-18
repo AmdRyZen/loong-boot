@@ -195,94 +195,73 @@ Task<> OpenApi::mqtt(const HttpRequestPtr req, std::function<void(const HttpResp
     co_return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
 }
 
-#include "utils/retry_utils.h"
-// 切换测试协程，模拟 Rust 的 yield_now
-Task<> switchCoroutine(const int count) {
-    for (int i = 0; i < count; ++i) {
-        //co_await std::suspend_never{}; // 不挂起，直接继续
-        co_await retryWithDelayAsync([]() -> Task<bool> {
-            co_return true;
-        }, 1, milliseconds(1));
-    }
+namespace
+{
+Task<> emptyCoroutine()
+{
     co_return;
 }
 
-// 同步运行协程的辅助函数
-void runSync(const Task<>& task, std::mutex& mtx, std::condition_variable& cv, int& completed) {
-    while (!task.coro_.done()) {
-        task.coro_.resume(); // 直接恢复协程
+Task<std::int64_t> benchmarkTaskAwait(const std::size_t iterations)
+{
+    const auto start = steady_clock::now();
+    for (std::size_t i = 0; i < iterations; ++i)
+    {
+        // 测量 Drogon Task 创建、co_await 对称转移和销毁的整体开销。
+        co_await emptyCoroutine();
     }
-    std::lock_guard<std::mutex> lock(mtx);
-    completed++;
-    cv.notify_one();
+    co_return duration_cast<nanoseconds>(steady_clock::now() - start).count();
 }
 
+Task<std::int64_t> benchmarkEventLoopSwitch(trantor::EventLoop* requestLoop,
+                                            trantor::EventLoop* mainLoop,
+                                            const std::size_t roundTrips)
+{
+    const auto start = steady_clock::now();
+    for (std::size_t i = 0; i < roundTrips; ++i)
+    {
+        // 在两个不同 EventLoop 线程之间往返，每轮包含两次真实挂起/恢复。
+        co_await switchThreadCoro(mainLoop);
+        co_await switchThreadCoro(requestLoop);
+    }
+    co_return duration_cast<nanoseconds>(steady_clock::now() - start).count();
+}
+}  // namespace
 
 Task<> OpenApi::coroutine(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
 {
-    constexpr int NUM_TASKS = 8;
-    constexpr int RESUME_COUNT = 1'000'000;
+    constexpr std::uint64_t taskAwaitIterations = 1'000'000;
+    constexpr std::uint64_t eventLoopRoundTrips = 10'000;
+    constexpr std::uint64_t eventLoopSwitches = eventLoopRoundTrips * 2;
 
-    std::mutex mtx;
-    std::condition_variable cv;
-    int completed = 0;
-
-    const auto start = high_resolution_clock::now();
-    std::vector<std::function<void()>> tasks;
-
-    // 提交协程任务 TbbCoroutinePool  CPU密集更好
-    for (int i = 0; i < NUM_TASKS; ++i) {
-        TbbCoroutinePool::instance().submit([&]() -> AsyncTask {
-            co_await switchCoroutine(RESUME_COUNT);
-            {
-                std::lock_guard<std::mutex> lock(mtx);
-                completed++;
-                cv.notify_one();
-            }
-            co_return;
-        });
+    auto* requestLoop = trantor::EventLoop::getEventLoopOfCurrentThread();
+    auto* mainLoop = app().getLoop();
+    if (!requestLoop || !mainLoop || requestLoop == mainLoop)
+    {
+        throw std::runtime_error("需要两个不同的 EventLoop 才能测试跨线程恢复");
     }
 
-    // drogon async_run
-    /*for (int i = 0; i < NUM_TASKS; ++i)
-    {
-        async_run([&]() -> Task<> {
-          co_await switchCoroutine(RESUME_COUNT);
-              {
-                  std::lock_guard<std::mutex> lock(mtx);
-                  completed++;
-                  cv.notify_one();
-              }
-              co_return;
-          });
-    }*/
+    // 少量预热，减少首次创建协程和首次调度对结果的影响。
+    (void)co_await benchmarkTaskAwait(1'000);
+    (void)co_await benchmarkEventLoopSwitch(requestLoop, mainLoop, 100);
 
-    //  drogon 的事件循环
-    /*for (int i = 0; i < NUM_TASKS; ++i) {
-        tasks.emplace_back([&]() {
-            const auto task = switchCoroutine(RESUME_COUNT);
-            runSync(task, mtx, cv, completed); // 同步运行每个协程
-        });
-        app().getLoop()->queueInLoop(tasks.back()); // 异步调度
-    }*/
+    const auto taskAwaitNs = co_await benchmarkTaskAwait(taskAwaitIterations);
+    const auto eventLoopNs =
+        co_await benchmarkEventLoopSwitch(
+            requestLoop, mainLoop, eventLoopRoundTrips);
 
+    CoroutineBenchmarkVo result;
+    result.task_await_iterations = taskAwaitIterations;
+    result.task_await_total_ms = static_cast<double>(taskAwaitNs) / 1'000'000.0;
+    result.task_await_average_ns =
+        static_cast<double>(taskAwaitNs) / static_cast<double>(taskAwaitIterations);
+    result.event_loop_iterations = eventLoopSwitches;
+    result.event_loop_total_ms = static_cast<double>(eventLoopNs) / 1'000'000.0;
+    result.event_loop_average_ns =
+        static_cast<double>(eventLoopNs) / static_cast<double>(eventLoopSwitches);
 
-    // 等待所有任务完成
-    {
-        std::unique_lock<std::mutex> lock(mtx);
-        cv.wait(lock, [&] {
-            return completed >= NUM_TASKS;
-        });
-    }
-
-    const auto end = high_resolution_clock::now();
-    const auto total_ns = duration_cast<nanoseconds>(end - start).count();
-    constexpr auto total_resumes = static_cast<uint64_t>(NUM_TASKS) * RESUME_COUNT;
-
-    std::cout << "Drogon coroutine benchmark total time: " << total_ns << " ns\n";
-    std::cout << "Average coroutine resume time: " << static_cast<double>(total_ns) / static_cast<double>(total_resumes) << " ns\n";
-
-    co_return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
+    co_return callback(Base<CoroutineBenchmarkVo>::createHttpSuccessResponse(
+        StatusOK, Success, std::move(result)));
 }
 
 Task<> OpenApi::algorithm(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
@@ -1245,4 +1224,3 @@ Task<> OpenApi::taskflow(HttpRequestPtr req, std::function<void(const HttpRespon
 
     co_return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
 }
-

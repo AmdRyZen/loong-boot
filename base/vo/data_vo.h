@@ -140,6 +140,30 @@ struct glz::meta<DynamicUpdateResponseVo>
     );
 };
 
+struct CoroutineBenchmarkVo
+{
+    std::uint64_t task_await_iterations{};
+    double task_await_total_ms{};
+    double task_await_average_ns{};
+    std::uint64_t event_loop_iterations{};
+    double event_loop_total_ms{};
+    double event_loop_average_ns{};
+};
+
+template <>
+struct glz::meta<CoroutineBenchmarkVo>
+{
+    using T = CoroutineBenchmarkVo;
+    static constexpr auto value = object(
+        "taskAwaitIterations", &T::task_await_iterations,
+        "taskAwaitTotalMs", &T::task_await_total_ms,
+        "taskAwaitAverageNs", &T::task_await_average_ns,
+        "eventLoopIterations", &T::event_loop_iterations,
+        "eventLoopTotalMs", &T::event_loop_total_ms,
+        "eventLoopAverageNs", &T::event_loop_average_ns
+    );
+};
+
 // 测试结构体示例
 struct MyStruct {
     int id = 1;
