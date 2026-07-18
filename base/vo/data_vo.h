@@ -95,6 +95,40 @@ struct glz::meta<UserDataListVo> {
     );
 };
 
+struct DynamicUpdateRecordVo
+{
+    std::int64_t id{};
+    std::string author;
+};
+
+template <>
+struct glz::meta<DynamicUpdateRecordVo>
+{
+    using T = DynamicUpdateRecordVo;
+    static constexpr auto value = object(
+        "id", &T::id,
+        "author", &T::author
+    );
+};
+
+struct DynamicUpdateResponseVo
+{
+    std::vector<std::uint64_t> affected_rows;
+    std::vector<DynamicUpdateRecordVo> records;
+    std::uint64_t update_count{};
+};
+
+template <>
+struct glz::meta<DynamicUpdateResponseVo>
+{
+    using T = DynamicUpdateResponseVo;
+    static constexpr auto value = object(
+        "affectedRows", &T::affected_rows,
+        "records", &T::records,
+        "updateCount", &T::update_count
+    );
+};
+
 // 测试结构体示例
 struct MyStruct {
     int id = 1;

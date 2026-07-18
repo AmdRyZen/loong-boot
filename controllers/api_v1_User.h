@@ -11,6 +11,7 @@ class User final : public drogon::HttpController<User>
   public:
     METHOD_LIST_BEGIN
     METHOD_ADD(User::buildSql, "/buildSql", Get);
+    METHOD_ADD(User::dynamicUpdateJobAuthor, "/dynamicUpdateJobAuthor", Post);
     METHOD_ADD(User::login, "/login?userId={1}&passwd={2}", Post);
     METHOD_ADD(User::getInfo, "/{1}/getInfo?token={2}", Post, "drogon::LoginFilter");
     METHOD_ADD(User::getBanWord, "/getBanWord?word={1}", Get);
@@ -23,6 +24,9 @@ class User final : public drogon::HttpController<User>
     METHOD_LIST_END
 
     static Task<> buildSql(HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback);
+
+    static Task<> dynamicUpdateJobAuthor(HttpRequestPtr req,
+                                         std::function<void(const HttpResponsePtr&)> callback);
 
     static void login(const HttpRequestPtr& req,
                       std::function<void(const HttpResponsePtr&)>&& callback,

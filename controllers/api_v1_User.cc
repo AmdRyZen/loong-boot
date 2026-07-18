@@ -13,13 +13,14 @@
 #include "base/base.h"
 #include "base/vo/data_vo.h"
 #include "base/dto/open_dto.h"
+#include "utils/SqlUpdate.h"
+#include "utils/SqlQuery.h"
 #include <tbb/concurrent_vector.h>
 
 using namespace api::v1;
 using namespace drogon::orm;
 using namespace drogon;
 using namespace sql;
-
 
 Task<> User::buildSql(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
 {
@@ -139,6 +140,81 @@ Task<> User::buildSql(const HttpRequestPtr req, std::function<void(const HttpRes
        msg = "error";
     }
     co_return callback(Base<HttpMethod>::createHttpSuccessResponse(StatusOK, msg, method));
+}
+
+Task<> User::dynamicUpdateJobAuthor(
+    const HttpRequestPtr req,
+    std::function<void(const HttpResponsePtr&)> callback)
+{
+    try
+    {
+        const auto body = req->getJsonObject();
+        if (!body || !body->isMember("updates") ||
+            !(*body)["updates"].isArray() || (*body)["updates"].empty())
+        {
+            co_return callback(Base<std::string>::createHttpErrorResponse(
+                StatusError,
+                "请求格式应为 {\"updates\":[{\"id\":1,\"author\":\"aa\"}]}",
+                ""));
+        }
+
+        const auto clientPtr = app().getFastDbClient();
+        auto transPtr = co_await clientPtr->newTransactionCoro();
+        DynamicUpdateResponseVo response;
+        try
+        {
+            for (const auto& update : (*body)["updates"])
+            {
+                if (!update.isObject() || !update["id"].isInt() ||
+                    !update["author"].isString())
+                {
+                    throw std::invalid_argument(
+                        "每个 update 都必须包含整数 id 和字符串 author");
+                }
+
+                const auto result = co_await SqlUpdate(transPtr, "xxl_job_info")
+                    .set({{"author", update["author"]}})
+                    .where("id = ?", update["id"].asInt())
+                    .limit(1)
+                    .exec();
+                response.affected_rows.push_back(result.affectedRows());
+            }
+
+            // 查询只执行一次
+            const auto queryResult = co_await SqlQuery(transPtr, "xxl_job_info")
+                .select({"id", "author"})
+                .where("id != ?", (*body)["updates"][0]["id"].asInt())
+                .orderBy("id", SqlOrder::Desc)
+                .limit(10)
+                .exec();
+
+            for (const auto& row : queryResult)
+            {
+                DynamicUpdateRecordVo record;
+                record.id = row["id"].as<std::int64_t>();
+                if (!row["author"].isNull())
+                {
+                    record.author = row["author"].as<std::string>();
+                }
+                response.records.push_back(std::move(record));
+            }
+        }
+        catch (...)
+        {
+            transPtr->rollback();
+            throw;
+        }
+
+        response.update_count = (*body)["updates"].size();
+        co_return callback(Base<DynamicUpdateResponseVo>::createHttpSuccessResponse(
+            StatusOK, Success, std::move(response)));
+    }
+    catch (const std::exception& e)
+    {
+        LOG_ERROR << "dynamicUpdateJobAuthor failed: " << e.what();
+        co_return callback(Base<std::string>::createHttpErrorResponse(
+            StatusError, e.what(), ""));
+    }
 }
 
 //add definition of your processing function here
@@ -303,19 +379,6 @@ Task<> User::getInfo(const HttpRequestPtr req,
 
         } catch (const std::exception& e) {
             std::cerr << "构建 SQL 失败，原因: " << e.what() << std::endl;
-        }
-
-        auto transPtr = co_await clientPtr->newTransactionCoro();
-        try
-        {
-            co_await transPtr->execSqlCoro("update xxl_job_info set author = ? where id = ? limit 1", "aa", 1);
-            co_await transPtr->execSqlCoro("update xxl_job_info set author = ? where id = ? limit 1", "bb", 2);
-            //throw std::runtime_error("hahaha");
-        }
-        catch (const DrogonDbException& e)
-        {
-            transPtr->rollback();
-            LOG_ERROR << "update failed: " << e.base().what();
         }
 
         *clientPtr  << "select * from xxl_job_info where author != ? and id = ?"
