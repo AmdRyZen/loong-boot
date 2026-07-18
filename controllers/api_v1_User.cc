@@ -181,23 +181,12 @@ Task<> User::dynamicUpdateJobAuthor(
             }
 
             // 查询只执行一次
-            const auto queryResult = co_await SqlQuery(transPtr, "xxl_job_info")
-                .select({"id", "author"})
+            auto query = SqlQuery(transPtr, "xxl_job_info");
+            query.select({"id", "author"})
                 .where("id != ?", (*body)["updates"][0]["id"].asInt())
                 .orderBy("id", SqlOrder::Desc)
-                .limit(10)
-                .exec();
-
-            for (const auto& row : queryResult)
-            {
-                DynamicUpdateRecordVo record;
-                record.id = row["id"].as<std::int64_t>();
-                if (!row["author"].isNull())
-                {
-                    record.author = row["author"].as<std::string>();
-                }
-                response.records.push_back(std::move(record));
-            }
+                .limit(10);
+            response.records = co_await query.list<DynamicUpdateRecordVo>();
         }
         catch (...)
         {

@@ -99,6 +99,17 @@ struct DynamicUpdateRecordVo
 {
     std::int64_t id{};
     std::string author;
+
+    static DynamicUpdateRecordVo from(const orm::Row& row)
+    {
+        DynamicUpdateRecordVo record;
+        record.id = row["id"].as<std::int64_t>();
+        if (!row["author"].isNull())
+        {
+            record.author = row["author"].as<std::string>();
+        }
+        return record;
+    }
 };
 
 template <>

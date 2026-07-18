@@ -155,6 +155,19 @@ class SqlQuery
             static_cast<const std::vector<Json::Value>&>(whereValues_));
     }
 
+    template <typename T>
+    drogon::Task<std::vector<T>> list() &
+    {
+        const auto result = co_await exec();
+        std::vector<T> records;
+        records.reserve(result.size());
+        for (const auto& row : result)
+        {
+            records.push_back(T::from(row));
+        }
+        co_return records;
+    }
+
   private:
     static bool isIdentifier(std::string_view value)
     {
