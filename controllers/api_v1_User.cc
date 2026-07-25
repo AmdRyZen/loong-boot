@@ -13,8 +13,7 @@
 #include "base/base.h"
 #include "base/vo/data_vo.h"
 #include "base/dto/open_dto.h"
-#include "utils/SqlUpdate.h"
-#include "utils/SqlQuery.h"
+#include "utils/SqlCrud.h"
 #include <tbb/concurrent_vector.h>
 
 using namespace api::v1;
@@ -180,6 +179,29 @@ Task<> User::dynamicUpdateJobAuthor(
                 });
             }
 
+            const auto& previewRow = (*body)["updates"][0];
+            response.sql_preview.insert_sql =
+                SqlInsert(transPtr, "xxl_job_info")
+                    .values({
+                        {"id", previewRow["id"]},
+                        {"author", previewRow["author"]}
+                    })
+                    .onDuplicateUpdate({"author"})
+                    .toSql();
+
+            response.sql_preview.update_sql =
+                SqlUpdate::prepareBatch(
+                    "xxl_job_info",
+                    "id",
+                    batchRows)
+                    .statement;
+
+            response.sql_preview.delete_sql =
+                SqlDelete(transPtr, "xxl_job_info")
+                    .whereEq("id", previewRow["id"].asInt64())
+                    .limit(1)
+                    .toSql();
+
             // 所有更新合并为一条 CASE UPDATE，只进行一次数据库往返。
             const auto affectedRows = co_await SqlUpdate::batch(
                 transPtr,
@@ -194,6 +216,7 @@ Task<> User::dynamicUpdateJobAuthor(
                 .whereNe("id", (*body)["updates"][0]["id"].asInt64())
                 .orderBy("id", SqlOrder::Desc)
                 .limit(10);
+            response.sql_preview.query_sql = query.toSql();
             response.records = co_await query.list<DynamicUpdateRecordVo>();
         }
         catch (...)

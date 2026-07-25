@@ -181,6 +181,12 @@ set(MODEL_SOURCES_COMMON
 target_sources(${PROJECT_NAME} PRIVATE
         main.cc
         utils/sql.h
+        utils/SqlBuilderSupport.h
+        utils/SqlCrud.h
+        utils/SqlInsert.h
+        utils/SqlQuery.h
+        utils/SqlUpdate.h
+        utils/SqlDelete.h
         controllers/PlaintextCtrl.cc
         controllers/PlaintextCtrl.h
         controllers/api_v1_User.cc

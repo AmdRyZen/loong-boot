@@ -122,11 +122,32 @@ struct glz::meta<DynamicUpdateRecordVo>
     );
 };
 
+struct CrudSqlPreviewVo
+{
+    std::string insert_sql;
+    std::string query_sql;
+    std::string update_sql;
+    std::string delete_sql;
+};
+
+template <>
+struct glz::meta<CrudSqlPreviewVo>
+{
+    using T = CrudSqlPreviewVo;
+    static constexpr auto value = object(
+        "insert", &T::insert_sql,
+        "query", &T::query_sql,
+        "update", &T::update_sql,
+        "delete", &T::delete_sql
+    );
+};
+
 struct DynamicUpdateResponseVo
 {
     std::vector<std::uint64_t> affected_rows;
     std::vector<DynamicUpdateRecordVo> records;
     std::uint64_t update_count{};
+    CrudSqlPreviewVo sql_preview;
 };
 
 template <>
@@ -136,7 +157,8 @@ struct glz::meta<DynamicUpdateResponseVo>
     static constexpr auto value = object(
         "affectedRows", &T::affected_rows,
         "records", &T::records,
-        "updateCount", &T::update_count
+        "updateCount", &T::update_count,
+        "sqlPreview", &T::sql_preview
     );
 };
 

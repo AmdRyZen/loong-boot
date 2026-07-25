@@ -2,8 +2,7 @@
 #include <drogon/drogon_test.h>
 #include <drogon/drogon.h>
 #include "../utils/SqlBuilderSupport.h"
-#include "../utils/SqlQuery.h"
-#include "../utils/SqlUpdate.h"
+#include "../utils/SqlCrud.h"
 
 namespace
 {
@@ -46,6 +45,31 @@ struct StrictWhereBuilder : sql::detail::WhereBuilder<StrictWhereBuilder>
         .decrement("quota", 2)
         .whereIn("id", ids)
         .limit(2);
+}
+
+[[maybe_unused]] void compileInsertApis(sql::SqlInsert& insert)
+{
+    insert.values({{"id", 1}, {"author", "root"}})
+        .value("status", 1)
+        .ignore()
+        .onDuplicateUpdate({"author", "status"});
+    static_cast<void>(insert.exec());
+
+    const std::vector<sql::SqlInsert::Row> rows{
+        {{"id", 1}, {"author", "root"}}
+    };
+    static_cast<void>(sql::SqlInsert::batch(
+        drogon::orm::DbClientPtr{}, "user", rows));
+}
+
+[[maybe_unused]] void compileDeleteApis(sql::SqlDelete& deletion)
+{
+    const std::vector<int> ids{1, 2};
+    deletion.whereIn("id", ids).limit(2);
+    static_cast<void>(deletion.exec());
+    static_cast<void>(deletion.softDelete("deleted_at", "2026-07-25"));
+    static_cast<void>(sql::SqlDelete::batch(
+        drogon::orm::DbClientPtr{}, "user", "id", ids));
 }
 }
 
@@ -91,6 +115,21 @@ DROGON_TEST(BasicTest)
     CHECK(batch.statement ==
           "update xxl_job_info set author = case id when ? then ? when ? "
           "then ? else author end where id in (?, ?)");
+
+    sql::SqlInsert::BatchOptions insertOptions;
+    insertOptions.updateFields = {"name"};
+    auto insertBatch = sql::SqlInsert::prepareBatch(
+        "user",
+        {
+            {{"id", 1}, {"name", "aa"}},
+            {{"id", 2}, {"name", "bb"}, {"age", 20}}
+        },
+        insertOptions);
+    CHECK(insertBatch.rowCount == 2);
+    CHECK(insertBatch.parameters.size() == 6);
+    CHECK(insertBatch.statement ==
+          "insert into user (id, name, age) values (?, ?, ?), (?, ?, ?) "
+          "on duplicate key update name = values(name)");
 }
 
 int main(const int argc, char** argv)
