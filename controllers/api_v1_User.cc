@@ -163,27 +163,35 @@ Task<> User::dynamicUpdateJobAuthor(
         DynamicUpdateResponseVo response;
         try
         {
+            std::vector<SqlUpdate::BatchRow> batchRows;
+            batchRows.reserve((*body)["updates"].size());
             for (const auto& update : (*body)["updates"])
             {
-                if (!update.isObject() || !update["id"].isInt() ||
+                if (!update.isObject() || !update["id"].isInt64() ||
                     !update["author"].isString())
                 {
                     throw std::invalid_argument(
                         "每个 update 都必须包含整数 id 和字符串 author");
                 }
 
-                const auto result = co_await SqlUpdate(transPtr, "xxl_job_info")
-                    .set({{"author", update["author"]}})
-                    .where("id = ?", update["id"].asInt())
-                    .limit(1)
-                    .exec();
-                response.affected_rows.push_back(result.affectedRows());
+                batchRows.push_back({
+                    update["id"].asInt64(),
+                    {{"author", update["author"]}}
+                });
             }
+
+            // 所有更新合并为一条 CASE UPDATE，只进行一次数据库往返。
+            const auto affectedRows = co_await SqlUpdate::batch(
+                transPtr,
+                "xxl_job_info",
+                "id",
+                std::move(batchRows));
+            response.affected_rows.push_back(affectedRows);
 
             // 查询只执行一次
             auto query = SqlQuery(transPtr, "xxl_job_info");
             query.select({"id", "author"})
-                .where("id != ?", (*body)["updates"][0]["id"].asInt())
+                .whereNe("id", (*body)["updates"][0]["id"].asInt64())
                 .orderBy("id", SqlOrder::Desc)
                 .limit(10);
             response.records = co_await query.list<DynamicUpdateRecordVo>();
