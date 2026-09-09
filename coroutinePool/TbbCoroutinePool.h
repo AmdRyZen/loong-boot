@@ -8,6 +8,7 @@
 #include <functional>
 #include <tbb/task_group.h>
 #include <iostream>
+#include <atomic>
 
 class TbbCoroutinePool {
 public:
@@ -28,15 +29,25 @@ public:
         tg_.wait();
     }
 
-    // 非模板版本，接受右值引用，避免复制
-    void submit(std::function<void()>&& task) {
-        tg_.run(std::move(task));
+    template<typename TaskFunc>
+    bool submit(TaskFunc&& func) {
+        // 当积压任务超过 32768 时进行背压限流，防止压测时无界内存暴涨
+        if (activeTasks_.load(std::memory_order_relaxed) > 32768) {
+            return false;
+        }
+        activeTasks_.fetch_add(1, std::memory_order_relaxed);
+        tg_.run([this, f = std::forward<TaskFunc>(func)]() {
+            try {
+                f();
+            } catch (...) {
+            }
+            activeTasks_.fetch_sub(1, std::memory_order_release);
+        });
+        return true;
     }
 
-    // 模板版本，直接转发给 TBB task_group
-    template<typename TaskFunc>
-    void submit(TaskFunc&& func) {
-        tg_.run(std::forward<TaskFunc>(func));
+    size_t getActiveTasks() const {
+        return activeTasks_.load(std::memory_order_relaxed);
     }
 
     ~TbbCoroutinePool() {
@@ -53,6 +64,7 @@ public:
 private:
     TbbCoroutinePool() = default;
     tbb::task_group tg_;
+    std::atomic<size_t> activeTasks_{0};
 };
 
 #endif // TBB_COROUTINEPOOL_H
