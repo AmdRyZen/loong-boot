@@ -21,7 +21,7 @@ using namespace drogon::orm;
 using namespace drogon;
 using namespace sql;
 
-Task<> User::buildSql(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
+Task<> User::buildSql(HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
 {
     auto method  = req->getMethod();
     std::string msg = "success";
@@ -279,7 +279,7 @@ void User::login(const HttpRequestPtr& req,
     }
 }
 
-Task<> User::getInfo(const HttpRequestPtr req,
+Task<> User::getInfo(HttpRequestPtr req,
                      std::function<void(const HttpResponsePtr&)> callback,
                      std::string userId,
                      const std::string token)

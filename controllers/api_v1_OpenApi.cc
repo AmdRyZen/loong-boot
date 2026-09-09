@@ -838,11 +838,10 @@ double testJsonCppDeserialize(const std::string& json_str, const int loops) {
     return measure([&]() {
         for (int i = 0; i < loops; ++i) {
             Json::CharReaderBuilder builder;
-            Json::CharReader* reader = builder.newCharReader();
+            std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
             Json::Value root;
             std::string errs;
             reader->parse(json_str.c_str(), json_str.c_str() + json_str.size(), &root, &errs);
-            delete reader;
 
             MyStruct s;
             s.id = root["id"].asInt();

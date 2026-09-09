@@ -18,7 +18,7 @@ public:
     }
 
     void initialize(const std::string& serverAddress, const std::string& clientId) {
-        client_ = new mqtt::async_client(serverAddress, clientId);
+        client_ = std::make_unique<mqtt::async_client>(serverAddress, clientId);
         mqtt::connect_options connOpts;
         connOpts.set_keep_alive_interval(20);  // 设置保活间隔为 20 秒
         connOpts.set_clean_session(true);    // 清理会话
@@ -53,9 +53,10 @@ public:
         try {
             LOG_INFO << "Disconnecting from MQTT broker...";
             if (client_) {
-                client_->disconnect()->wait();
-                delete client_; // 手动释放资源
-                client_ = nullptr;
+                if (client_->is_connected()) {
+                    client_->disconnect()->wait();
+                }
+                client_.reset();
             }
             LOG_INFO << "Disconnected from the MQTT broker.";
         } catch (const mqtt::exception& e) {
@@ -64,11 +65,11 @@ public:
     }
 
     [[nodiscard]] mqtt::async_client* getClient() const {
-        return client_;
+        return client_.get();
     }
 
 private:
-    mqtt::async_client* client_; // 使用裸指针
+    std::unique_ptr<mqtt::async_client> client_; // 使用智能指针管理生命周期
 };
 
 #endif // MQTTMANAGER_H

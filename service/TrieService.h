@@ -58,6 +58,9 @@ class TrieService
 
     TrieService& operator=(const TrieService& thad) = delete;
 
+    // 清空字典树释放内存
+    static void clear();
+
     //从文件加载敏感词列表，文件utf8格式，一个敏感词单独一行
     static void loadFromFile(const std::string& file_name);
 

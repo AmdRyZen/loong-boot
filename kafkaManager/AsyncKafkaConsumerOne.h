@@ -93,6 +93,8 @@ private:
 
     void submitMessageTask(rd_kafka_message_t* msg, rd_kafka_t* consumer)
     {
+        if (!msg) return;
+
         TbbCoroutinePool::instance().submit([msg, consumer, this]() -> drogon::AsyncTask {
             try
             {
@@ -120,6 +122,11 @@ private:
             {
                 ++stats_.errCount;
                 LOG_ERROR << "AsyncKafkaConsumerOne Exception while processing message: " << ex.what();
+            }
+            catch (...)
+            {
+                ++stats_.errCount;
+                LOG_ERROR << "AsyncKafkaConsumerOne Unknown exception while processing message";
             }
             rd_kafka_message_destroy(msg);
         });

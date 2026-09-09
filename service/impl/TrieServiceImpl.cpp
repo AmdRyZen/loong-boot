@@ -37,6 +37,12 @@ TrieNode::~TrieNode()
     subNodes_.clear();
 }
 
+void TrieService::clear()
+{
+    delete root_;
+    root_ = new TrieNode();
+}
+
 TrieService::TrieService()
 {
     root_ = new TrieNode();

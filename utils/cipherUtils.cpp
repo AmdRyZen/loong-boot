@@ -94,8 +94,21 @@ std::string cipherUtils::decrypt_cbc(const std::string& basestr, const std::stri
         memcpy(lastblock, currblock, 16);
     }
 
-    output[outlen - output[outlen - 1]] = '\0';  //unpad
-    std::string ret = (char*)output;
+    if (outlen == 0 || outlen % BLOCK_SIZE != 0)
+    {
+        delete[] output;
+        return "";
+    }
+
+    uint8_t pad = output[outlen - 1];
+    if (pad == 0 || pad > BLOCK_SIZE || pad > outlen)
+    {
+        delete[] output;
+        return "";
+    }
+
+    size_t plain_len = outlen - pad;
+    std::string ret(reinterpret_cast<const char*>(output), plain_len);
     delete[] output;
     return ret;
 }
