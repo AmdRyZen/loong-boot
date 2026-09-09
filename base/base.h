@@ -26,6 +26,7 @@ struct Base {
 private:
     // 静态线程本地缓冲区用于高性能 JSON 序列化
     static inline thread_local std::string sharedBuf;
+    static inline thread_local bool inUse = false;
 
 public:
     // 序列化为 JSON 的方法
@@ -35,10 +36,23 @@ public:
         return json_output;
     }
 
-    // 高性能 JSON 序列化方法，使用静态缓冲区，避免重复分配
+    // 高性能 JSON 序列化方法，使用静态缓冲区避免重复堆分配，具备重入保护与动态扩展
     [[nodiscard]] std::string toJsonFast() const {
+        // 重入保护：若已在序列化调用栈中（递归或嵌套使用），降级为局部分配，避免脏写
+        if (inUse) {
+            return toJson();
+        }
+
+        struct ReentrancyGuard {
+            bool& flag;
+            ReentrancyGuard(bool& f) : flag(f) { flag = true; }
+            ~ReentrancyGuard() { flag = false; }
+        } guard(inUse);
+
         sharedBuf.clear();
-        sharedBuf.reserve(8192); // 避免重复分配
+        if (sharedBuf.capacity() < 8192) {
+            sharedBuf.reserve(8192);
+        }
         (void) glz::write_json(*this, sharedBuf);
         return sharedBuf;
     }
