@@ -79,6 +79,23 @@ private:
     void publishToCluster(const std::string& topic, const std::string& json) const;
     static void produceKafkaAsync(std::string topicName, std::string payload);
 
+    // 集群总线开关：读 custom_config.enable_cluster_bus，缺省为 false。
+    //
+    // ⚠️ 未启用时【绝不能】调用 app().getRedisClient() / app().getFastRedisClient()。
+    // drogon 的 RedisClientManager::getRedisClient(name) 内部是
+    //     assert(map.find(name) != map.end());
+    //     return map[name];                 // ← operator[]
+    // 名字不存在时 operator[] 会往 redisClientsMap_ 里插入一个【空的 shared_ptr】，
+    // Release 构建下 assert 被裁掉，于是静默留下一个空条目；
+    // 进程退出时 ~RedisClientManager() 会对它做虚调用 closeAll()
+    // （`for (auto& p : redisClientsMap_) p.second->closeAll();`）
+    // → 从地址 0 取 vtable → SIGSEGV at 0x0，实测退出码 139。
+    // 该崩溃发生在 drogon 的 quit() 里，应用侧 try/catch 拦不住，只能不触发它。
+    //
+    // 另注：本工程 redis_clients 配的是 is_fast=true，所以集群总线也必须用
+    // getFastRedisClient()；取非 fast 变体同样会踩上面这个空条目。
+    static bool clusterBusEnabled();
+
     struct ClusterPacket
     {
         std::string instId;

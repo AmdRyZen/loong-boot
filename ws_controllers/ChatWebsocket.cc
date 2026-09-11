@@ -362,13 +362,43 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
     }
 }
 
+bool ChatWebsocket::clusterBusEnabled()
+{
+    static const bool enabled = []() {
+        try
+        {
+            const auto& custom = drogon::app().getCustomConfig();
+            if (custom.isMember("enable_cluster_bus"))
+            {
+                return custom["enable_cluster_bus"].asBool();
+            }
+        }
+        catch (...)
+        {
+        }
+        // 缺省关闭：宁可静默单机运行，也不触发 drogon 的空条目退出崩溃（见头文件注释）
+        return false;
+    }();
+    return enabled;
+}
+
 void ChatWebsocket::initClusterBus()
 {
     // 延迟注册到框架启动事件中，确保 Redis 客户端已完全初始化并建立连接
     HttpAppFramework::instance().registerBeginningAdvice([this]() {
         try
         {
-            auto redisClient = drogon::app().getRedisClient();
+            if (!clusterBusEnabled())
+            {
+                LOG_INFO << "Redis Cluster Bus disabled (custom_config.enable_cluster_bus != true), "
+                            "running in standalone mode.";
+                return;
+            }
+
+            // 必须用 fast 变体：本工程 redis_clients 为 is_fast=true，
+            // 且 redisUtils 全走 fast；取非 fast 变体会让 drogon 往
+            // redisClientsMap_ 插入空条目，退出时必然段错误（见 clusterBusEnabled 注释）。
+            auto redisClient = drogon::app().getFastRedisClient();
             if (!redisClient)
             {
                 LOG_WARN << "Redis client is not configured, running in standalone mode.";
@@ -413,9 +443,16 @@ void ChatWebsocket::initClusterBus()
 
 void ChatWebsocket::publishToCluster(const std::string& topic, const std::string& json) const
 {
+    // 未启用集群总线时直接返回：既省开销，也避免踩 drogon getRedisClient 的空条目坑
+    if (!clusterBusEnabled())
+    {
+        return;
+    }
+
     try
     {
-        auto redisClient = drogon::app().getRedisClient();
+        // fast 客户端按线程持有（IOThreadStorage），调用线程即其所属 loop 线程
+        auto redisClient = drogon::app().getFastRedisClient();
         if (!redisClient)
         {
             return;
