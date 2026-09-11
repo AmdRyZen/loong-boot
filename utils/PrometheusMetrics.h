@@ -48,6 +48,12 @@ public:
         wsTotalMessages_.fetch_add(count, std::memory_order_relaxed);
     }
 
+    // 因线程池背压 / 房间积压限流而被丢弃的消息数。
+    // 该计数必须暴露：一旦持续增长说明吞吐已达上限，需要扩实例而不是继续加压。
+    void recordWsMessageDropped(uint64_t count = 1) {
+        wsDroppedMessages_.fetch_add(count, std::memory_order_relaxed);
+    }
+
     // 生成标准 Prometheus 文本格式导出
     std::string exportPrometheusText() const {
         std::ostringstream ss;
@@ -73,7 +79,10 @@ public:
            << "ws_connections_current " << wsOnlineConnections_.load(std::memory_order_relaxed) << "\n\n"
            << "# HELP ws_messages_received_total Total WebSocket messages processed.\n"
            << "# TYPE ws_messages_received_total counter\n"
-           << "ws_messages_received_total " << wsTotalMessages_.load(std::memory_order_relaxed) << "\n\n";
+           << "ws_messages_received_total " << wsTotalMessages_.load(std::memory_order_relaxed) << "\n\n"
+           << "# HELP ws_messages_dropped_total Total WebSocket messages dropped due to backpressure.\n"
+           << "# TYPE ws_messages_dropped_total counter\n"
+           << "ws_messages_dropped_total " << wsDroppedMessages_.load(std::memory_order_relaxed) << "\n\n";
 
         // HTTP 度量
         ss << "# HELP http_requests_total Total HTTP requests handled.\n"
@@ -116,6 +125,7 @@ private:
     std::atomic<uint64_t> totalLatencyMs_{0}; // 微秒累计
     std::atomic<int64_t> wsOnlineConnections_{0};
     std::atomic<uint64_t> wsTotalMessages_{0};
+    std::atomic<uint64_t> wsDroppedMessages_{0};
 };
 
 } // namespace Metrics

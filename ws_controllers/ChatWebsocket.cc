@@ -7,6 +7,8 @@
 #include <drogon/HttpAppFramework.h>
 #include "utils/retry_utils.h"
 #include <memory_resource>
+#include <atomic>
+#include <vector>
 #include <drogon/nosql/RedisSubscriber.h>
 
 struct Subscriber
@@ -14,38 +16,71 @@ struct Subscriber
     std::string topic_;
     std::string userName_;
     SubscriberID id_{};
-    std::chrono::steady_clock::time_point lastActiveTime_{std::chrono::steady_clock::now()};
+
+    // 跨线程访问：IO 线程写入（收到任意帧即刷新），主循环定时任务读取（空闲驱逐）。
+    // 原先是非原子的 time_point —— 跨线程读写属于 data race（形式上 UB），
+    // 这里用原子量存 steady_clock 纳秒计数消除竞争。
+    static int64_t nowNanos()
+    {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    }
+
+    void touch()
+    {
+        lastActiveNanos_.store(nowNanos(), std::memory_order_relaxed);
+    }
+
+    std::atomic<int64_t> lastActiveNanos_{nowNanos()};
 };
 
 void ChatWebsocket::produceKafkaAsync(std::string topicName, std::string payload)
 {
     // 读取生产环境配置开关：通过 enable_kafka_persistence 控制是否异步落库 Kafka
     static const bool enableKafka = []() {
-        try {
+        try
+        {
             const auto& custom = drogon::app().getCustomConfig();
-            if (custom.isMember("enable_kafka_persistence")) {
+            if (custom.isMember("enable_kafka_persistence"))
+            {
                 return custom["enable_kafka_persistence"].asBool();
             }
-        } catch (...) {}
+        }
+        catch (...)
+        {
+        }
         return true;
     }();
 
-    if (!enableKafka) {
+    if (!enableKafka)
+    {
         return; // 开发或压测模式下跳过 Kafka 写入，保持极致 CPU 吞吐
     }
 
-    TbbCoroutinePool::instance().submit([topicName = std::move(topicName), payload = std::move(payload)] {
-        rd_kafka_topic_t* topicPtr = kafka::KafkaManager::instance().getTopic(topicName);
-        retryWithSleep([&]() {
-            if (!kafka::KafkaManager::safeProduce(topicPtr, payload))
-            {
-                const rd_kafka_resp_err_t err = rd_kafka_last_error();
-                LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(err);
-                return err != RD_KAFKA_RESP_ERR__QUEUE_FULL;
-            }
-            return true;
+    const std::string topicForLog = topicName;
+
+    // 背压：TBB 池积压超过上限时 submit 会返回 false。
+    // 原实现忽略返回值 → 消息被静默丢弃，无日志无指标，上层误以为已落库。
+    const bool accepted = TbbCoroutinePool::instance().submit(
+        [topicName = std::move(topicName), payload = std::move(payload)] {
+            rd_kafka_topic_t* topicPtr = kafka::KafkaManager::instance().getTopic(topicName);
+            retryWithSleep([&]() {
+                if (!kafka::KafkaManager::safeProduce(topicPtr, payload))
+                {
+                    const rd_kafka_resp_err_t err = rd_kafka_last_error();
+                    LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(err);
+                    return err != RD_KAFKA_RESP_ERR__QUEUE_FULL;
+                }
+                return true;
+            });
         });
-    });
+
+    if (!accepted)
+    {
+        Metrics::PrometheusRegistry::instance().recordWsMessageDropped();
+        LOG_WARN << "TBB pool saturated, dropped Kafka persistence for topic: " << topicForLog;
+    }
 }
 
 void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::string&& msg, const WebSocketMessageType& type)
@@ -57,7 +92,7 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
             if (wsConn->hasContext())
             {
                 auto& subscriber = wsConn->getContextRef<Subscriber>();
-                subscriber.lastActiveTime_ = std::chrono::steady_clock::now();
+                subscriber.touch();
             }
             wsConn->send("pong_ms", WebSocketMessageType::Pong);
             LOG_INFO << "Received a ping";
@@ -69,7 +104,7 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
             if (wsConn->hasContext())
             {
                 auto& subscriber = wsConn->getContextRef<Subscriber>();
-                subscriber.lastActiveTime_ = std::chrono::steady_clock::now();
+                subscriber.touch();
             }
             return;
         }
@@ -93,10 +128,12 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                 return;
             }
 
-            if (!wsConn->disconnected())
+            // hasContext() 必须判：连接在 handleNewConnection 中途失败时上下文可能未落，
+            // getContextRef 会直接解引用空指针（UB），而不是抛异常。
+            if (!wsConn->disconnected() && wsConn->hasContext())
             {
                 auto& subscriber = wsConn->getContextRef<Subscriber>();
-                subscriber.lastActiveTime_ = std::chrono::steady_clock::now();
+                subscriber.touch();
                 const std::string& topic = subscriber.topic_;
                 const std::string& senderName = subscriber.userName_;
                 const auto id = subscriber.id_;
@@ -109,71 +146,91 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                     if (!msg_dto.toUser.empty())
                     {
                         const std::string targetUser(msg_dto.toUser);
-                        WebSocketConnectionPtr targetConn = nullptr;
+
+                        // 拷贝目标会话列表后在锁外发送，避免持锁做 IO
+                        std::vector<WebSocketConnectionPtr> targets;
                         {
-                            std::lock_guard guard(mutex_);
-                            if (auto it = userNameToConn_.find(targetUser); it != userNameToConn_.end())
+                            std::shared_lock lock(connMutex_);
+                            if (const auto it = userNameToConn_.find(targetUser); it != userNameToConn_.end())
                             {
-                                targetConn = it->second;
+                                targets = it->second;
                             }
                         }
 
-                        if (targetConn && targetConn->connected())
-                        {
-                            chatMessageVo msg_vo{};
-                            msg_vo.code = 200;
-                            msg_vo.id = id;
-                            msg_vo.name = std::string_view(senderName);
-                            msg_vo.message = std::format("[私聊] {}", std::string_view(msg_dto.msgContent));
-
-                            std::string json{};
-                            (void)glz::write_json(msg_vo, json);
-
-                            // 直接精准推送给目标会话与发送者自己
-                            targetConn->send(json);
-                            if (targetConn != wsConn)
-                            {
-                                wsConn->send(json);
-                            }
-
-                            // 生产环境持久化：私聊消息异步推至 Kafka 私聊主题
-                            produceKafkaAsync("chat_direct_topic", json);
-                        }
-                        else
-                        {
-                            // 目标离线提示
-                            chatMessageVo err_vo{};
-                            err_vo.code = 404;
-                            err_vo.id = 0;
-                            err_vo.name = "系统通知";
-                            err_vo.message = std::format("用户 {} 当前不在线", targetUser);
-                            std::string json{};
-                            (void)glz::write_json(err_vo, json);
-                            wsConn->send(json);
-                        }
-                        return;
-                    }
-
-                    // 默认房间广播模式：异步提交给 TBB 纯净线程池 (38万+ QPS)，彻底杜绝协程堆帧泄漏
-                    TbbCoroutinePool::instance().submit([this, topic, msg = std::move(msg_dto.msgContent), id, senderName]() {
                         chatMessageVo msg_vo{};
                         msg_vo.code = 200;
                         msg_vo.id = id;
                         msg_vo.name = std::string_view(senderName);
-                        msg_vo.message = std::move(msg);
+                        msg_vo.message = std::format("[私聊] {}", std::string_view(msg_dto.msgContent));
 
                         std::string json{};
                         (void)glz::write_json(msg_vo, json);
 
-                        // 1. 本实例本地房间广播
-                        chatRooms_.publish(topic, json);
+                        // 投递给目标用户的所有在线会话（多端登录），发送者自己只回显一次
+                        bool delivered = false;
+                        bool echoedToSender = false;
+                        for (const auto& conn : targets)
+                        {
+                            if (!conn || !conn->connected())
+                            {
+                                continue;
+                            }
+                            conn->send(json);
+                            delivered = true;
+                            if (conn == wsConn)
+                            {
+                                echoedToSender = true;
+                            }
+                        }
 
-                        // 2. 分布式总线：同步广播给集群其他实例
-                        publishToCluster(topic, json);
+                        if (!delivered)
+                        {
+                            // 目标离线提示
+                            wsConn->send(buildNoticeJson(
+                                404, "系统通知", std::format("用户 {} 当前不在线", targetUser).c_str()));
+                            return;
+                        }
 
-                        // 3. 生产环境持久化：异步投递到 Kafka 历史消息流
-                        produceKafkaAsync("chat_messages_topic", json);
-                    });
+                        if (!echoedToSender)
+                        {
+                            wsConn->send(json);
+                        }
+
+                        // [压测隔离] Kafka 推送已关闭（同上），避免压测时无消费者导致磁盘被写满。
+                        // 生产环境持久化：私聊消息异步推至 Kafka 私聊主题
+                        // produceKafkaAsync("chat_direct_topic", json);
+                        return;
+                    }
+
+                    // 默认房间广播模式：在 IO 线程按到达顺序直接进入房间串行队列。
+                    // 注意：这里刻意不再经过 TBB 池中转。多线程池会打乱入队顺序，
+                    // 顺序一旦在池里被搅乱，下游再怎么串行扇出也救不回来（实测 300 条必乱）。
+                    // 扇出与序列化都在房间串行队列内完成，保证同一房间严格 FIFO；
+                    // 不同房间各自独立成队列，仍可跨线程并行，不影响多房间水平扩展。
+                    const bool queued = roomDispatcher_.dispatch(
+                        topic, [this, topic, msg = std::move(msg_dto.msgContent), id, senderName]() {
+                            chatMessageVo msg_vo{};
+                            msg_vo.code = 200;
+                            msg_vo.id = id;
+                            msg_vo.name = std::string_view(senderName);
+                            msg_vo.message = std::move(msg);
+
+                            std::string json{};
+                            (void)glz::write_json(msg_vo, json);
+
+                            // 1. 本实例本地房间广播
+                            // 2. 分布式总线：同步广播给集群其他实例
+                            // 3. 生产环境持久化：异步投递到 Kafka 历史消息流
+                            fanOutRoom(topic, json);
+                        });
+
+                    // 房间积压达到上限：显式告知客户端并计数，杜绝静默丢消息
+                    if (!queued)
+                    {
+                        Metrics::PrometheusRegistry::instance().recordWsMessageDropped();
+                        LOG_WARN << "Room backlog full, dropped message for room: " << topic;
+                        sendOverloadNotice(wsConn);
+                    }
                 }
             }
         }
@@ -186,92 +243,117 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
 
 void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSocketConnectionPtr& wsConn)
 {
-    Subscriber s;
-    s.topic_ = req->getHeader("room_name");
-    if (s.topic_.empty())
+    try
     {
-        s.topic_ = req->getParameter("room_name");
-        if (s.topic_.empty())
+        std::string topic = req->getHeader("room_name");
+        if (topic.empty())
         {
-            s.topic_ = "default_room";
+            topic = req->getParameter("room_name");
+            if (topic.empty())
+            {
+                topic = "default_room";
+            }
         }
-    }
-    std::string userName = req->getHeader("name");
-    if (userName.empty())
-    {
-        userName = req->getParameter("name");
+        std::string userName = req->getHeader("name");
         if (userName.empty())
         {
-            userName = "default_name";
+            userName = req->getParameter("name");
+            if (userName.empty())
+            {
+                userName = "default_name";
+            }
         }
-    }
-    s.userName_ = userName;
 
-    s.id_ = chatRooms_.subscribe(s.topic_, [weakWs = std::weak_ptr<WebSocketConnection>(wsConn)](const std::string&, const std::string& msg)
-    {
-        if (const auto web_socket_connection = weakWs.lock())
+        // 先落上下文：hasContext() 从此成为「连接已登记」的可靠标志。
+        // 这样 connect/disconnect 指标必然成对，断开路径也能安全地判空后取值。
+        auto subscriber = std::make_shared<Subscriber>();
+        subscriber->topic_ = topic;
+        subscriber->userName_ = userName;
+        wsConn->setContext(subscriber);
+
+        Metrics::PrometheusRegistry::instance().recordWsConnect();
+
+        subscriber->id_ = chatRooms_.subscribe(topic, [weakWs = std::weak_ptr<WebSocketConnection>(wsConn)](const std::string&, const std::string& msg)
         {
-            web_socket_connection->send(msg);
+            if (const auto web_socket_connection = weakWs.lock())
+            {
+                web_socket_connection->send(msg);
+            }
+        });
+
+        // 同一昵称允许多端并存：注册为「昵称 -> 会话列表」，多端都能收到私聊。
+        // 原实现用 emplace 存单连接，同名时静默失败，且断开时按昵称 erase 会误删新连接。
+        {
+            std::unique_lock lock(connMutex_);
+            userNameToConn_[userName].push_back(wsConn);
         }
-    });
 
-    Metrics::PrometheusRegistry::instance().recordWsConnect();
+        LOG_INFO << "Added connection for user: " << userName << " Subscriber ID: " << subscriber->id_
+                 << ", Topic: " << topic;
 
-    // 使用原子操作或无锁数据结构来减少锁竞争
-    {
-        std::lock_guard guard(mutex_);
-        userNameToConn_.emplace(userName, wsConn);
-        connToUser_.emplace(wsConn, userName);
+        chatMessageVo msg_vo;
+        msg_vo.code = 200;
+        msg_vo.id = subscriber->id_;
+        msg_vo.name = topic;
+        msg_vo.message = std::format("欢迎 {} 加入我们 {}", userName, topic);
+
+        // 使用普通string避免thread_local问题
+        std::string json{};
+        (void)glz::write_json(msg_vo, json);
+
+        // 与聊天消息共用同一房间串行队列，保证「入群公告」与其他消息的相对顺序稳定
+        const bool queued = roomDispatcher_.dispatch(topic, [this, topic, json]() {
+            chatRooms_.publish(topic, json);
+            // [压测隔离] Kafka 推送已关闭：压测只生产不消费会把磁盘写满。
+            // 恢复：取消下行注释，并确认 custom_config.enable_kafka_persistence 为 true。
+            // produceKafkaAsync("message_topic", json);
+        });
+
+        if (!queued)
+        {
+            Metrics::PrometheusRegistry::instance().recordWsMessageDropped();
+            LOG_WARN << "Room backlog full, dropped join notice for room: " << topic;
+        }
     }
-
-    LOG_INFO << "Added connection for user: " << userName << " Subscriber ID: " << s.id_ << ", Topic: " << s.topic_;
-
-    chatMessageVo msg_vo;
-    msg_vo.code = 200;
-    msg_vo.id = s.id_;
-    msg_vo.name = s.topic_;
-    msg_vo.message = std::format("欢迎 {} 加入我们 {}", userName, s.topic_);
-
-    // 使用普通string避免thread_local问题
-    std::string json{};
-    (void)glz::write_json(msg_vo, json);
-
-    chatRooms_.publish(s.topic_, json);
-
-    produceKafkaAsync("message_topic", json);
-
-    wsConn->setContext(std::make_shared<Subscriber>(std::move(s)));
+    catch (const std::exception& e)
+    {
+        LOG_ERROR << "Error in handleNewConnection: " << e.what();
+    }
 }
 
 void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
 {
     try
     {
-        std::string userName;
+        // 未登记成功的连接直接放过，避免 getContextRef 解引用空上下文（UB）
+        if (!wsConn || !wsConn->hasContext())
         {
-            std::lock_guard<std::mutex> guard(mutex_);
-            if (const auto it = connToUser_.find(wsConn); it != connToUser_.end())
-            {
-                userName = it->second;
-                connToUser_.erase(it);
-                userNameToConn_.erase(userName);
-                LOG_INFO << "Removed user: " << userName;
-            }
-
-            // 仅在容器很大时才尝试收缩内存
-            if (userNameToConn_.size() > 1000) {
-                userNameToConn_.rehash(0); // 尝试释放多余内存
-            }
-            if (connToUser_.size() > 1000) {
-                connToUser_.rehash(0);
-            }
-
-            LOG_INFO << "Removed closed connection";
+            LOG_WARN << "Closed a connection without subscriber context, skip cleanup";
+            return;
         }
 
         const auto& subscriber = wsConn->getContextRef<Subscriber>();
-        const std::string& topic = subscriber.topic_;
+        const std::string userName = subscriber.userName_;
+        const std::string topic = subscriber.topic_;
         const auto id = subscriber.id_;
+
+        // 只摘除「本连接自己」这一条记录：
+        // 原实现按昵称直接 erase，同名的新连接会被旧连接的断开事件误删，
+        // 导致新用户从此收不到私聊、且残留幽灵条目。
+        {
+            std::unique_lock lock(connMutex_);
+            if (const auto it = userNameToConn_.find(userName); it != userNameToConn_.end())
+            {
+                auto& sessions = it->second;
+                std::erase(sessions, wsConn);
+                if (sessions.empty())
+                {
+                    userNameToConn_.erase(it);
+                }
+            }
+        }
+        LOG_INFO << "Removed user: " << userName;
+
         chatRooms_.unsubscribe(topic, id);
         Metrics::PrometheusRegistry::instance().recordWsDisconnect();
         LOG_INFO << "Unsubscribed from topic: " << topic << ", ID: " << id;
@@ -286,9 +368,18 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
         std::string json{};
         (void)glz::write_json(msg_vo, json);
 
-        chatRooms_.publish(topic, json);
+        const bool queued = roomDispatcher_.dispatch(topic, [this, topic, json]() {
+            chatRooms_.publish(topic, json);
+            // [压测隔离] Kafka 推送已关闭：压测只生产不消费会把磁盘写满。
+            // 恢复：取消下行注释，并确认 custom_config.enable_kafka_persistence 为 true。
+            // produceKafkaAsync("message_topic", json);
+        });
 
-        produceKafkaAsync("message_topic", json);
+        if (!queued)
+        {
+            Metrics::PrometheusRegistry::instance().recordWsMessageDropped();
+            LOG_WARN << "Room backlog full, dropped leave notice for room: " << topic;
+        }
     }
     catch (const std::exception& e)
     {
@@ -385,34 +476,47 @@ void ChatWebsocket::checkAndEvictIdleConnections()
 {
     try
     {
-        const auto now = std::chrono::steady_clock::now();
-        constexpr auto idleTimeout = std::chrono::seconds(60); // 60 秒无心跳/无交互视为僵尸连接
+        const auto now = Subscriber::nowNanos();
+        // 60 秒无心跳/无交互视为僵尸连接
+        constexpr int64_t idleTimeoutNanos =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::seconds(60)).count();
 
-        std::vector<WebSocketConnectionPtr> deadConns;
+        // 先在共享锁内做一次快照，再在锁外做 connected()/forceClose()，
+        // 避免长时间独占锁阻塞 IO 线程的连接注册与注销。
+        std::vector<std::pair<WebSocketConnectionPtr, std::string>> snapshot;
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            for (const auto& [conn, name] : connToUser_)
+            std::shared_lock lock(connMutex_);
+            snapshot.reserve(userNameToConn_.size());
+            for (const auto& [name, sessions] : userNameToConn_)
             {
-                if (!conn->connected())
+                for (const auto& conn : sessions)
                 {
-                    deadConns.push_back(conn);
-                    continue;
-                }
-                if (conn->hasContext())
-                {
-                    const auto& sub = conn->getContextRef<Subscriber>();
-                    if (now - sub.lastActiveTime_ > idleTimeout)
-                    {
-                        LOG_WARN << "Evicting idle connection: " << name << " (idle > 60s)";
-                        deadConns.push_back(conn);
-                    }
+                    snapshot.emplace_back(conn, name);
                 }
             }
         }
 
-        for (const auto& conn : deadConns)
+        for (const auto& [conn, name] : snapshot)
         {
-            conn->forceClose(); // 主动切断死连接
+            if (!conn)
+            {
+                continue;
+            }
+            if (!conn->connected())
+            {
+                conn->forceClose();
+                continue;
+            }
+            if (conn->hasContext())
+            {
+                const auto& sub = conn->getContextRef<Subscriber>();
+                const auto idleNanos = now - sub.lastActiveNanos_.load(std::memory_order_relaxed);
+                if (idleNanos > idleTimeoutNanos)
+                {
+                    LOG_WARN << "Evicting idle connection: " << name << " (idle > 60s)";
+                    conn->forceClose(); // 主动切断死连接
+                }
+            }
         }
     }
     catch (const std::exception& e)

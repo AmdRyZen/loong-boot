@@ -201,6 +201,7 @@ target_sources(${PROJECT_NAME} PRIVATE
         utils/redisUtils.cpp
         ws_controllers/ChatWebsocket.h
         ws_controllers/ChatWebsocket.cc
+        ws_controllers/RoomSerialDispatcher.h
         service/SbcConvertService.h
         service/impl/SbcConvertServiceImpl.cpp
         service/TrieService.h
