@@ -11,6 +11,7 @@
 struct Subscriber
 {
     std::string topic_;
+    std::string userName_;
     SubscriberID id_{};
 };
 
@@ -63,22 +64,18 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
             if (!wsConn->disconnected())
             {
                 const auto& subscriber = wsConn->getContextRef<Subscriber>();
-                const auto& [topic, id] = subscriber;
-
-                std::string data{};
-                if (!msg_dto.key.empty())
-                {
-                    data = "xxxxxx";
-                }
+                const std::string& topic = subscriber.topic_;
+                const std::string& senderName = subscriber.userName_;
+                const auto id = subscriber.id_;
 
                 if (!msg_dto.action.empty() && msg_dto.action == "message")
                 {
                     // 异步提交给 TBB 纯净线程池：保持极速返回(38万+ QPS)，同时彻底杜绝 AsyncTask 协程帧泄漏
-                    TbbCoroutinePool::instance().submit([this, topic = std::string(topic), msg = std::move(msg_dto.msgContent), id, data = std::move(data)]() {
+                    TbbCoroutinePool::instance().submit([this, topic, msg = std::move(msg_dto.msgContent), id, senderName]() {
                         chatMessageVo msg_vo{};
                         msg_vo.code = 200;
                         msg_vo.id = id;
-                        msg_vo.name = std::move(data);
+                        msg_vo.name = std::string_view(senderName);
                         msg_vo.message = std::move(msg);
 
                         std::string json{};
@@ -102,13 +99,22 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
     s.topic_ = req->getHeader("room_name");
     if (s.topic_.empty())
     {
-        s.topic_ = "default_room";
+        s.topic_ = req->getParameter("room_name");
+        if (s.topic_.empty())
+        {
+            s.topic_ = "default_room";
+        }
     }
     std::string userName = req->getHeader("name");
     if (userName.empty())
     {
-        userName = "default_name";
+        userName = req->getParameter("name");
+        if (userName.empty())
+        {
+            userName = "default_name";
+        }
     }
+    s.userName_ = userName;
 
     s.id_ = chatRooms_.subscribe(s.topic_, [weakWs = std::weak_ptr<WebSocketConnection>(wsConn)](const std::string&, const std::string& msg)
     {
@@ -171,7 +177,8 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
         }
 
         const auto& subscriber = wsConn->getContextRef<Subscriber>();
-        const auto& [topic, id] = subscriber;
+        const std::string& topic = subscriber.topic_;
+        const auto id = subscriber.id_;
         chatRooms_.unsubscribe(topic, id);
         LOG_INFO << "Unsubscribed from topic: " << topic << ", ID: " << id;
 

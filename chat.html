@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-page-node-id="sttLwomCa1Nn1GvdbpyhIL">
+<head data-page-node-id="Qt4mP3fK1mxBUK7PmmtxiM">
+    <meta charset="UTF-8" data-page-node-id="VyOQAdfhvMaX8W6fyswOoC">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" data-page-node-id="BckLzFC1bj9ULuDFd4IFIV">
+    <title>Loong-Boot 高性能 WebSocket 聊天室</title>
+    <style>
+        :root {
+            --bg-primary: #0f172a;
+            --bg-secondary: #1e293b;
+            --bg-tertiary: #334155;
+            --accent: #0ea5e9;
+            --accent-hover: #0284c7;
+            --text-primary: #f8fafc;
+            --text-secondary: #94a3b8;
+            --success: #10b981;
+            --danger: #ef4444;
+            --border: #334155;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        }
+
+        body {
+            background-color: var(--bg-primary);
+            color: var(--text-primary);
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 16px;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 960px;
+            height: 94vh;
+            background: var(--bg-secondary);
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5);
+            overflow: hidden;
+        }
+
+        /* 顶部状态栏 */
+        .header {
+            padding: 16px 20px;
+            background: rgba(15, 23, 42, 0.7);
+            backdrop-filter: blur(8px);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+
+        .header-title {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 1.1rem;
+            font-weight: 600;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: var(--danger);
+            box-shadow: 0 0 8px var(--danger);
+            transition: all 0.3s;
+        }
+
+        .status-dot.online {
+            background: var(--success);
+            box-shadow: 0 0 8px var(--success);
+        }
+
+        .metrics-bar {
+            display: flex;
+            gap: 16px;
+            background: var(--bg-primary);
+            padding: 6px 14px;
+            border-radius: 20px;
+            border: 1px solid var(--border);
+            font-size: 0.85rem;
+        }
+
+        .metric-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .metric-val {
+            font-weight: 700;
+            color: var(--accent);
+            font-variant-numeric: tabular-nums;
+        }
+
+        /* 连接配置表单 */
+        .conn-bar {
+            padding: 10px 20px;
+            background: var(--bg-primary);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .input-group {
+            display: flex;
+            align-items: center;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 4px 10px;
+            flex: 1;
+        }
+
+        .input-group label {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            margin-right: 8px;
+        }
+
+        .input-group input {
+            background: transparent;
+            border: none;
+            color: var(--text-primary);
+            width: 100%;
+            outline: none;
+            font-size: 0.9rem;
+        }
+
+        button {
+            background: var(--accent);
+            color: white;
+            border: none;
+            padding: 7px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 500;
+            font-size: 0.9rem;
+            transition: background 0.2s;
+            white-space: nowrap;
+        }
+
+        button:hover {
+            background: var(--accent-hover);
+        }
+
+        button.btn-danger {
+            background: var(--danger);
+        }
+
+        button.btn-danger:hover {
+            background: #dc2626;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        /* 聊天消息区域 */
+        .chat-body {
+            flex: 1;
+            padding: 20px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            scroll-behavior: smooth;
+        }
+
+        .message-row {
+            display: flex;
+            flex-direction: column;
+            max-width: 75%;
+            animation: fadeIn 0.15s ease-out;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(4px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .message-row.self {
+            align-self: flex-end;
+            align-items: flex-end;
+        }
+
+        .message-row.other {
+            align-self: flex-start;
+            align-items: flex-start;
+        }
+
+        .message-row.system {
+            align-self: center;
+            max-width: 90%;
+            align-items: center;
+        }
+
+        .msg-meta {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            margin-bottom: 3px;
+        }
+
+        .msg-bubble {
+            padding: 10px 14px;
+            border-radius: 10px;
+            font-size: 0.92rem;
+            line-height: 1.45;
+            word-break: break-all;
+        }
+
+        .message-row.self .msg-bubble {
+            background: var(--accent);
+            color: white;
+            border-bottom-right-radius: 2px;
+        }
+
+        .message-row.other .msg-bubble {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            border-bottom-left-radius: 2px;
+        }
+
+        .message-row.system .msg-bubble {
+            background: rgba(51, 65, 85, 0.4);
+            color: var(--text-secondary);
+            font-size: 0.8rem;
+            padding: 4px 12px;
+            border-radius: 12px;
+        }
+
+        /* 底部输入框 */
+        .input-bar {
+            padding: 16px 20px;
+            background: var(--bg-primary);
+            border-top: 1px solid var(--border);
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .input-bar input {
+            flex: 1;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 10px 14px;
+            color: var(--text-primary);
+            outline: none;
+            font-size: 0.95rem;
+        }
+
+        .input-bar input:focus {
+            border-color: var(--accent);
+        }
+
+        /* 压测辅助工具开关 */
+        .stress-bar {
+            padding: 6px 20px;
+            background: #182234;
+            border-top: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+        }
+
+        .stress-ctrls {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+    </style>
+</head>
+<body data-page-node-id="voReuZmWFi40EHPBvPZ2aK">
+    <div class="container" data-page-node-id="cHbPAGD18dGLk5lB0QixUR">
+        <!-- 头部导航与指标监控 -->
+        <div class="header" data-page-node-id="MmqcAXKPHyDcUtuUbOyWaG">
+            <div class="header-title" data-page-node-id="yoJfG7qKADH8hbphB2a9CN">
+                <div id="statusDot" class="status-dot" data-page-node-id="GmVfojOdXPEjyYbxF5wqx3"></div>
+                <span data-page-node-id="W5sqGBOsnP8jBWyom6EhUH">Loong-Boot WebSocket</span>
+            </div>
+            <div class="metrics-bar" data-page-node-id="hGngg1Qxi12mcYkOAKoYOL">
+                <div class="metric-item" data-page-node-id="8qBvidYYUuvr8A3TucoOBt">
+                    <span data-page-node-id="S8YIWRypgCZjSuR6G1Wvza">发送:</span>
+                    <span id="sentCount" class="metric-val" data-page-node-id="kUpelDx76SgjFGXLH3VgyG">0</span>
+                </div>
+                <div class="metric-item" data-page-node-id="cCXEURCFXYEMsA4XmtCM0F">
+                    <span data-page-node-id="DeqM1Wz9OqkU67E1jzhxDG">接收:</span>
+                    <span id="recvCount" class="metric-val" data-page-node-id="V90fj8RXtOi32GeOEEPpVy">0</span>
+                </div>
+                <div class="metric-item" data-page-node-id="Gzz9EVIHzNBPJOMi9Sl3Sn">
+                    <span data-page-node-id="eakIeG3D1jmOJG7K5zU84Q">吞吐:</span>
+                    <span id="qpsVal" class="metric-val" data-page-node-id="fAQVHr7YH8TsT0VyUuexEe">0 msg/s</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- 连接设置栏 -->
+        <div class="conn-bar" data-page-node-id="lNX2GXBtuzW4ee2IsPUzPx">
+            <div class="input-group" style="flex: 2;" data-page-node-id="RYfcSArKFG0R6THS1OkCoh">
+                <label data-page-node-id="eGQ02TzlSznPfaeX4TtzcE">地址</label>
+                <input id="wsUrl" type="text" value="ws://127.0.0.1:9090/chat" data-page-node-id="yymDoL9vuRLvQluwVEpp6p">
+            </div>
+            <div class="input-group" style="flex: 1;" data-page-node-id="VDwrivWvLu9wBiaLWb1Dm7">
+                <label data-page-node-id="rAoLgBXab86iZwfxrFrYKP">房间</label>
+                <input id="roomName" type="text" value="default_room" data-page-node-id="81dkEuK5zvTyHwd7SqSDjr">
+            </div>
+            <div class="input-group" style="flex: 1;" data-page-node-id="05ZlHeTvrSWgpL6IO8o2kR">
+                <label data-page-node-id="EMUGQ4eDilsInYljVnZS0p">昵称</label>
+                <input id="userName" type="text" value="" placeholder="随机生成中..." data-page-node-id="64THKrXlV8VSZKhvVB6Tr4">
+            </div>
+            <button id="btnConnect" onclick="toggleConnect()" data-page-node-id="qOGCJrGrOMlU8MQtzMo8IJ">连接</button>
+        </div>
+
+        <!-- 消息流面板 -->
+        <div id="chatBody" class="chat-body" data-page-node-id="D3Krf8TyVQ9tnX9Uc5aFda">
+            <div class="message-row system" data-page-node-id="iZyBZyEp5wQinmfvBvcbvF">
+                <div class="msg-bubble" data-page-node-id="DhQJvD2HwNszdg9z1oBJ5h">欢迎使用 Loong-Boot 高性能聊天室。点击上方“连接”进入房间。</div>
+            </div>
+        </div>
+
+        <!-- 压测模式辅助 (最高支持浏览器单端万级吞吐) -->
+        <div class="stress-bar" data-page-node-id="psTzpk6pMvXUMb7kCJNway">
+            <span data-page-node-id="ZKH6yTYEBXc71NFXCFyxCr">💡 浏览器单端压测与调试</span>
+            <div class="stress-ctrls" data-page-node-id="Brb2vYhW2CSYMeU9DJaIDx">
+                <label data-page-node-id="6VXmobXv5LIsexumDeySaW"><input id="pauseRender" type="checkbox" data-page-node-id="0Pji4ZlYTFaavK3GxNTF6j"> 压测时暂停 DOM 渲染(保障极致速度)</label>
+                <button style="padding: 3px 8px; font-size: 0.75rem;" onclick="sendBatch(1000)" data-page-node-id="HbkfCBTc2uANVLVXtvlmiF">发 1000 条</button>
+                <button style="padding: 3px 8px; font-size: 0.75rem;" onclick="clearMessages()" data-page-node-id="EDhyQSlfZYqUwuGHSmiYrH">清屏</button>
+            </div>
+        </div>
+
+        <!-- 底部输入框 -->
+        <div class="input-bar" data-page-node-id="5iqgeCYhamex1ZkUFXXqgQ">
+            <input id="msgInput" type="text" placeholder="输入聊天内容，回车发送..." onkeydown="handleKeyDown(event)" disabled data-page-node-id="dlPDZbXQ6Y0ap84SJTXPl1">
+            <button id="btnSend" onclick="sendMessage()" disabled data-page-node-id="yqlgKa5kFLmutGl2wnhNn9">发送</button>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let sentTotal = 0;
+        let recvTotal = 0;
+        let lastRecv = 0;
+        let mySubscriberId = null;
+
+        // 页面打开时自动随机分配独立昵称（如 User_7392），避免多窗口冲突
+        window.addEventListener('DOMContentLoaded', () => {
+            const randomId = Math.floor(1000 + Math.random() * 9000);
+            document.getElementById('userName').value = `User_${randomId}`;
+        });
+
+        // 环形消息缓冲区：最多保留 200 条，防止长聊/压测浏览器内存膨胀
+        const MAX_MESSAGES = 200;
+
+        // 吞吐量统计器 (每秒刷新)
+        setInterval(() => {
+            const delta = recvTotal - lastRecv;
+            lastRecv = recvTotal;
+            document.getElementById('qpsVal').innerText = delta.toLocaleString() + ' msg/s';
+        }, 1000);
+
+        function toggleConnect() {
+            if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+                ws.close();
+            } else {
+                connect();
+            }
+        }
+
+        function connect() {
+            const url = document.getElementById('wsUrl').value.trim();
+            const room = document.getElementById('roomName').value.trim();
+            const user = document.getElementById('userName').value.trim();
+
+            addSystemMessage(`正在连接到 ${url}...`);
+
+            try {
+                // 支持 URL Query 参数透传 room_name 与 name
+                const wsFullUrl = `${url}?room_name=${encodeURIComponent(room)}&name=${encodeURIComponent(user)}`;
+                ws = new WebSocket(wsFullUrl);
+            } catch (e) {
+                addSystemMessage(`连接初始化失败: ${e.message}`);
+                return;
+            }
+
+            const dot = document.getElementById('statusDot');
+            const btnConnect = document.getElementById('btnConnect');
+            const msgInput = document.getElementById('msgInput');
+            const btnSend = document.getElementById('btnSend');
+
+            ws.onopen = () => {
+                dot.classList.add('online');
+                btnConnect.innerText = '断开';
+                btnConnect.classList.add('btn-danger');
+                msgInput.disabled = false;
+                btnSend.disabled = false;
+                msgInput.focus();
+                addSystemMessage(`已成功连接！房间: ${room}, 用户: ${user}`);
+            };
+
+            ws.onmessage = (event) => {
+                recvTotal++;
+                document.getElementById('recvCount').innerText = recvTotal.toLocaleString();
+
+                // 压测模式下可跳过 DOM 绘制以跑满浏览器极限
+                if (document.getElementById('pauseRender').checked) return;
+
+                try {
+                    const data = JSON.parse(event.data);
+                    // 现有协议结构：{ code: 200, id: 1, name: "xxxxxx", message: "content" }
+                    if (data.code === 200) {
+                        const isSelf = (mySubscriberId && data.id === mySubscriberId);
+                        appendChatMessage(data.name || `User_${data.id}`, data.message, isSelf);
+                    } else {
+                        appendChatMessage('系统', JSON.stringify(data), false);
+                    }
+                } catch (e) {
+                    appendChatMessage('原始帧', event.data, false);
+                }
+            };
+
+            ws.onclose = () => {
+                dot.classList.remove('online');
+                btnConnect.innerText = '连接';
+                btnConnect.classList.remove('btn-danger');
+                msgInput.disabled = true;
+                btnSend.disabled = true;
+                addSystemMessage('连接已断开');
+            };
+
+            ws.onerror = (err) => {
+                addSystemMessage('WebSocket 连接发生错误');
+            };
+        }
+
+        function sendMessage() {
+            const input = document.getElementById('msgInput');
+            const content = input.value.trim();
+            if (!content || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+            // 严格对齐 ChatWebsocket 期望的 chatMessageDto:
+            // struct chatMessageDto { key, action, msgContent }
+            const payload = JSON.stringify({
+                key: document.getElementById('roomName').value.trim(),
+                action: "message",
+                msgContent: content
+            });
+
+            ws.send(payload);
+            sentTotal++;
+            document.getElementById('sentCount').innerText = sentTotal.toLocaleString();
+            input.value = '';
+        }
+
+        function sendBatch(count) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                alert('请先连接 WebSocket');
+                return;
+            }
+            const room = document.getElementById('roomName').value.trim();
+            for (let i = 0; i < count; i++) {
+                const payload = JSON.stringify({
+                    key: room,
+                    action: "message",
+                    msgContent: `batch_bench_msg_${i}`
+                });
+                ws.send(payload);
+                sentTotal++;
+            }
+            document.getElementById('sentCount').innerText = sentTotal.toLocaleString();
+        }
+
+        function handleKeyDown(e) {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        }
+
+        function appendChatMessage(sender, text, isSelf) {
+            const body = document.getElementById('chatBody');
+            const row = document.createElement('div');
+            row.className = `message-row ${isSelf ? 'self' : 'other'}`;
+
+            const meta = document.createElement('div');
+            meta.className = 'msg-meta';
+            meta.innerText = `${sender} · ${new Date().toLocaleTimeString()}`;
+
+            const bubble = document.createElement('div');
+            bubble.className = 'msg-bubble';
+            bubble.innerText = text;
+
+            row.appendChild(meta);
+            row.appendChild(bubble);
+            body.appendChild(row);
+
+            // 限制 DOM 节点总数，防止长时间压测导致页面卡顿
+            if (body.children.length > MAX_MESSAGES) {
+                body.removeChild(body.firstChild);
+            }
+
+            body.scrollTop = body.scrollHeight;
+        }
+
+        function addSystemMessage(text) {
+            const body = document.getElementById('chatBody');
+            const row = document.createElement('div');
+            row.className = 'message-row system';
+
+            const bubble = document.createElement('div');
+            bubble.className = 'msg-bubble';
+            bubble.innerText = `${new Date().toLocaleTimeString()} - ${text}`;
+
+            row.appendChild(bubble);
+            body.appendChild(row);
+            body.scrollTop = body.scrollHeight;
+        }
+
+        function clearMessages() {
+            document.getElementById('chatBody').innerHTML = '';
+        }
+    </script>
+</body>
+</html>
