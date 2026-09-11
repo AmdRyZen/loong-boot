@@ -14,6 +14,7 @@ struct Subscriber
     std::string topic_;
     std::string userName_;
     SubscriberID id_{};
+    std::chrono::steady_clock::time_point lastActiveTime_{std::chrono::steady_clock::now()};
 };
 
 void ChatWebsocket::produceKafkaAsync(std::string topicName, std::string payload)
@@ -38,8 +39,23 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
     {
         if (type == WebSocketMessageType::Ping)
         {
+            if (wsConn->hasContext())
+            {
+                auto& subscriber = wsConn->getContextRef<Subscriber>();
+                subscriber.lastActiveTime_ = std::chrono::steady_clock::now();
+            }
             wsConn->send("pong_ms", WebSocketMessageType::Pong);
             LOG_INFO << "Received a ping";
+            return;
+        }
+
+        if (type == WebSocketMessageType::Pong)
+        {
+            if (wsConn->hasContext())
+            {
+                auto& subscriber = wsConn->getContextRef<Subscriber>();
+                subscriber.lastActiveTime_ = std::chrono::steady_clock::now();
+            }
             return;
         }
 
@@ -64,7 +80,8 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
 
             if (!wsConn->disconnected())
             {
-                const auto& subscriber = wsConn->getContextRef<Subscriber>();
+                auto& subscriber = wsConn->getContextRef<Subscriber>();
+                subscriber.lastActiveTime_ = std::chrono::steady_clock::now();
                 const std::string& topic = subscriber.topic_;
                 const std::string& senderName = subscriber.userName_;
                 const auto id = subscriber.id_;
@@ -72,7 +89,54 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                 if (!msg_dto.action.empty() && msg_dto.action == "message")
                 {
                     Metrics::PrometheusRegistry::instance().recordWsMessage();
-                    // 异步提交给 TBB 纯净线程池：保持极速返回(38万+ QPS)，同时彻底杜绝 AsyncTask 协程帧泄漏
+
+                    // 判断是否为点对点私聊 (toUser 非空)
+                    if (!msg_dto.toUser.empty())
+                    {
+                        const std::string targetUser(msg_dto.toUser);
+                        WebSocketConnectionPtr targetConn = nullptr;
+                        {
+                            std::lock_guard guard(mutex_);
+                            if (auto it = userNameToConn_.find(targetUser); it != userNameToConn_.end())
+                            {
+                                targetConn = it->second;
+                            }
+                        }
+
+                        if (targetConn && targetConn->connected())
+                        {
+                            chatMessageVo msg_vo{};
+                            msg_vo.code = 200;
+                            msg_vo.id = id;
+                            msg_vo.name = std::string_view(senderName);
+                            msg_vo.message = std::format("[私聊] {}", std::string_view(msg_dto.msgContent));
+
+                            std::string json{};
+                            (void)glz::write_json(msg_vo, json);
+
+                            // 直接精准推送给目标会话与发送者自己
+                            targetConn->send(json);
+                            if (targetConn != wsConn)
+                            {
+                                wsConn->send(json);
+                            }
+                        }
+                        else
+                        {
+                            // 目标离线提示
+                            chatMessageVo err_vo{};
+                            err_vo.code = 404;
+                            err_vo.id = 0;
+                            err_vo.name = "系统通知";
+                            err_vo.message = std::format("用户 {} 当前不在线", targetUser);
+                            std::string json{};
+                            (void)glz::write_json(err_vo, json);
+                            wsConn->send(json);
+                        }
+                        return;
+                    }
+
+                    // 默认房间广播模式：异步提交给 TBB 纯净线程池 (38万+ QPS)，彻底杜绝协程堆帧泄漏
                     TbbCoroutinePool::instance().submit([this, topic, msg = std::move(msg_dto.msgContent), id, senderName]() {
                         chatMessageVo msg_vo{};
                         msg_vo.code = 200;
@@ -204,5 +268,45 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
     catch (const std::exception& e)
     {
         LOG_ERROR << "Error in handleConnectionClosed: " << e.what();
+    }
+}
+
+void ChatWebsocket::checkAndEvictIdleConnections()
+{
+    try
+    {
+        const auto now = std::chrono::steady_clock::now();
+        constexpr auto idleTimeout = std::chrono::seconds(60); // 60 秒无心跳/无交互视为僵尸连接
+
+        std::vector<WebSocketConnectionPtr> deadConns;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto& [conn, name] : connToUser_)
+            {
+                if (!conn->connected())
+                {
+                    deadConns.push_back(conn);
+                    continue;
+                }
+                if (conn->hasContext())
+                {
+                    const auto& sub = conn->getContextRef<Subscriber>();
+                    if (now - sub.lastActiveTime_ > idleTimeout)
+                    {
+                        LOG_WARN << "Evicting idle connection: " << name << " (idle > 60s)";
+                        deadConns.push_back(conn);
+                    }
+                }
+            }
+        }
+
+        for (const auto& conn : deadConns)
+        {
+            conn->forceClose(); // 主动切断死连接
+        }
+    }
+    catch (const std::exception& e)
+    {
+        LOG_ERROR << "Error in checkAndEvictIdleConnections: " << e.what();
     }
 }

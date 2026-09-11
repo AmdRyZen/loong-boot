@@ -19,8 +19,9 @@ public:
         connToUser_.reserve(estimatedUserCount);
         userNameToConn_.reserve(estimatedUserCount);
 
-        // 使用 drogon::HttpAppFramework::instance()
-        HttpAppFramework::instance().getLoop()->runEvery(10.0, [this] {
+        // 注册定时任务：心跳探测与空闲超时连接驱逐
+        HttpAppFramework::instance().getLoop()->runEvery(5.0, [this] {
+            checkAndEvictIdleConnections();
             sendHeartbeatToAll();
         });
     }
@@ -46,6 +47,8 @@ private:
     mutable std::mutex mutex_;
 
     static void produceKafkaAsync(std::string topicName, std::string payload);
+
+    void checkAndEvictIdleConnections();
 
     void sendHeartbeatToAll() const
     {
@@ -81,6 +84,7 @@ private:
         std::pmr::string key;
         std::pmr::string action;
         std::pmr::string msgContent;
+        std::pmr::string toUser;  // 新增：点对点私聊目标用户名 (为空表示房间广播)
     };
 
     struct chatMessageVo

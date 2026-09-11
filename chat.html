@@ -1,354 +1,537 @@
 <!DOCTYPE html>
-<html lang="zh-CN" data-page-node-id="sttLwomCa1Nn1GvdbpyhIL">
-<head data-page-node-id="Qt4mP3fK1mxBUK7PmmtxiM">
-    <meta charset="UTF-8" data-page-node-id="VyOQAdfhvMaX8W6fyswOoC">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" data-page-node-id="BckLzFC1bj9ULuDFd4IFIV">
-    <title>Loong-Boot 高性能 WebSocket 聊天室</title>
+<html lang="zh-CN" data-page-node-id="mz87ACVgMBTCxQb8eXh8zK">
+<head data-page-node-id="1yOmUFVjSVAywSuD7qonQJ">
+    <meta charset="UTF-8" data-page-node-id="O8ogKtamABGzoKr5kTy4qC">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" data-page-node-id="tN1Y98Dum98isHeia85d7Z">
+    <title>Loong-Boot · 鸿蒙沉浸式通信终端</title>
     <style>
         :root {
-            --bg-primary: #0f172a;
-            --bg-secondary: #1e293b;
-            --bg-tertiary: #334155;
-            --accent: #0ea5e9;
-            --accent-hover: #0284c7;
-            --text-primary: #f8fafc;
-            --text-secondary: #94a3b8;
-            --success: #10b981;
-            --danger: #ef4444;
-            --border: #334155;
+            /* HarmonyOS 核心色彩阶梯与自然材质 */
+            --hm-bg-dark: #07090E;
+            --hm-glass: rgba(26, 32, 46, 0.45);
+            --hm-glass-card: rgba(30, 38, 54, 0.55);
+            --hm-glass-active: rgba(45, 56, 80, 0.65);
+            --hm-line: rgba(255, 255, 255, 0.08);
+            --hm-line-glow: rgba(77, 137, 255, 0.25);
+            
+            /* 鸿蒙意境配色 */
+            --hm-blue: #3E7BFA;
+            --hm-blue-light: #5A91FF;
+            --hm-blue-glow: rgba(62, 123, 250, 0.35);
+            --hm-teal: #2FD0B5;
+            --hm-amber: #F5A623;
+            --hm-red: #FF4D4F;
+            
+            --hm-text-primary: #FFFFFF;
+            --hm-text-secondary: rgba(255, 255, 255, 0.65);
+            --hm-text-tertiary: rgba(255, 255, 255, 0.38);
+
+            --hm-r-sm: 10px;
+            --hm-r-md: 18px;
+            --hm-r-lg: 26px;
+            --hm-r-pill: 9999px;
+
+            --hm-font: "HarmonyOS Sans SC", -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+            --hm-mono: "HarmonyOS Sans", ui-monospace, "SF Mono", Menlo, monospace;
         }
 
         * {
             box-sizing: border-box;
             margin: 0;
             padding: 0;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            font-family: var(--hm-font);
+            -webkit-font-smoothing: antialiased;
         }
 
         body {
-            background-color: var(--bg-primary);
-            color: var(--text-primary);
+            background-color: var(--hm-bg-dark);
+            color: var(--hm-text-primary);
             height: 100vh;
             display: flex;
             justify-content: center;
             align-items: center;
-            padding: 16px;
+            overflow: hidden;
+            position: relative;
         }
 
-        .container {
+        /* 鸿蒙流光动态极光底衬 (Aurora Glow) */
+        .aurora-bg {
+            position: absolute;
+            inset: 0;
+            overflow: hidden;
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        /* 鸿蒙星芒粒子动效画布 */
+        #particleCanvas {
+            position: absolute;
+            inset: 0;
             width: 100%;
-            max-width: 960px;
+            height: 100%;
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        .aurora-blob {
+            position: absolute;
+            filter: blur(90px);
+            opacity: 0.38;
+            border-radius: 50%;
+            animation: auroraFloat 18s infinite alternate ease-in-out;
+        }
+
+        .blob-1 {
+            width: 520px;
+            height: 520px;
+            background: radial-gradient(circle, #2251B5 0%, transparent 70%);
+            top: -120px;
+            left: -80px;
+        }
+
+        .blob-2 {
+            width: 480px;
+            height: 480px;
+            background: radial-gradient(circle, #18987E 0%, transparent 70%);
+            bottom: -100px;
+            right: -60px;
+            animation-duration: 22s;
+            animation-delay: -5s;
+        }
+
+        .blob-3 {
+            width: 360px;
+            height: 360px;
+            background: radial-gradient(circle, #55348C 0%, transparent 70%);
+            top: 40%;
+            left: 55%;
+            animation-duration: 20s;
+        }
+
+        @keyframes auroraFloat {
+            0% { transform: translate(0, 0) scale(1); }
+            50% { transform: translate(60px, 40px) scale(1.1); }
+            100% { transform: translate(-40px, 70px) scale(0.95); }
+        }
+
+        /* 鸿蒙沉浸式悬浮容器 */
+        .hm-window {
+            position: relative;
+            z-index: 1;
+            width: 95vw;
+            max-width: 1040px;
             height: 94vh;
-            background: var(--bg-secondary);
-            border-radius: 12px;
-            border: 1px solid var(--border);
+            background: var(--hm-glass);
+            backdrop-filter: blur(35px) saturate(190%);
+            -webkit-backdrop-filter: blur(35px) saturate(190%);
+            border: 1px solid var(--hm-line);
+            border-radius: var(--hm-r-lg);
             display: flex;
             flex-direction: column;
-            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5);
+            box-shadow: 0 32px 64px -16px rgba(0, 0, 0, 0.7), inset 0 1px 1px rgba(255, 255, 255, 0.15);
             overflow: hidden;
         }
 
-        /* 顶部状态栏 */
-        .header {
-            padding: 16px 20px;
-            background: rgba(15, 23, 42, 0.7);
-            backdrop-filter: blur(8px);
-            border-bottom: 1px solid var(--border);
+        /* 沉浸式胶囊导航 */
+        .hm-header {
+            padding: 16px 26px;
             display: flex;
             align-items: center;
             justify-content: space-between;
-            gap: 16px;
-            flex-wrap: wrap;
+            border-bottom: 1px solid var(--hm-line);
+            background: rgba(255, 255, 255, 0.02);
         }
 
-        .header-title {
+        .hm-brand {
             display: flex;
             align-items: center;
-            gap: 10px;
-            font-size: 1.1rem;
-            font-weight: 600;
+            gap: 12px;
         }
 
-        .status-dot {
-            width: 10px;
-            height: 10px;
-            border-radius: 50%;
-            background: var(--danger);
-            box-shadow: 0 0 8px var(--danger);
-            transition: all 0.3s;
-        }
-
-        .status-dot.online {
-            background: var(--success);
-            box-shadow: 0 0 8px var(--success);
-        }
-
-        .metrics-bar {
+        .hm-logo {
+            width: 34px;
+            height: 34px;
+            border-radius: 10px;
+            background: linear-gradient(135deg, #3E7BFA 0%, #2FD0B5 100%);
             display: flex;
-            gap: 16px;
-            background: var(--bg-primary);
-            padding: 6px 14px;
-            border-radius: 20px;
-            border: 1px solid var(--border);
-            font-size: 0.85rem;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 4px 12px var(--hm-blue-glow);
         }
 
-        .metric-item {
+        .hm-logo svg {
+            width: 20px;
+            height: 20px;
+            fill: #ffffff;
+        }
+
+        .hm-title {
+            font-size: 1.05rem;
+            font-weight: 500;
+            letter-spacing: 0.2px;
+        }
+
+        .hm-sub {
+            font-size: 0.72rem;
+            color: var(--hm-text-tertiary);
+            font-family: var(--hm-mono);
+        }
+
+        /* 鸿蒙态势胶囊仪表盘 */
+        .hm-capsule-bar {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            background: rgba(0, 0, 0, 0.28);
+            padding: 6px 18px;
+            border-radius: var(--hm-r-pill);
+            border: 1px solid var(--hm-line);
+        }
+
+        .hm-metric {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.8rem;
+        }
+
+        .hm-metric-val {
+            font-family: var(--hm-mono);
+            font-weight: 600;
+            color: var(--hm-teal);
+            font-variant-numeric: tabular-nums;
+        }
+
+        .hm-status-pulse {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--hm-red);
+            box-shadow: 0 0 10px var(--hm-red);
+            transition: all 0.4s ease;
+        }
+
+        .hm-status-pulse.online {
+            background: var(--hm-teal);
+            box-shadow: 0 0 14px var(--hm-teal);
+        }
+
+        /* 连接卡片栏 */
+        .hm-control-card {
+            padding: 12px 26px;
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            background: rgba(0, 0, 0, 0.15);
+            border-bottom: 1px solid var(--hm-line);
+        }
+
+        .hm-input-pill {
+            display: flex;
+            align-items: center;
+            background: var(--hm-glass-card);
+            border: 1px solid var(--hm-line);
+            border-radius: var(--hm-r-pill);
+            padding: 6px 16px;
+            transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        .hm-input-pill:focus-within {
+            border-color: var(--hm-blue-light);
+            background: var(--hm-glass-active);
+            box-shadow: 0 0 0 3px rgba(62, 123, 250, 0.18);
+        }
+
+        .hm-input-pill label {
+            font-size: 0.78rem;
+            color: var(--hm-text-secondary);
+            margin-right: 8px;
+            white-space: nowrap;
+        }
+
+        .hm-input-pill input {
+            background: transparent;
+            border: none;
+            color: var(--hm-text-primary);
+            width: 100%;
+            outline: none;
+            font-size: 0.88rem;
+        }
+
+        .hm-btn {
+            background: linear-gradient(135deg, var(--hm-blue) 0%, #2962D9 100%);
+            color: #ffffff;
+            border: none;
+            padding: 8px 22px;
+            border-radius: var(--hm-r-pill);
+            cursor: pointer;
+            font-size: 0.88rem;
+            font-weight: 500;
+            transition: all 0.25s ease;
+            box-shadow: 0 4px 14px rgba(62, 123, 250, 0.35);
+            white-space: nowrap;
+        }
+
+        .hm-btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 18px rgba(62, 123, 250, 0.5);
+            filter: brightness(1.08);
+        }
+
+        .hm-btn:active {
+            transform: translateY(0);
+        }
+
+        .hm-btn.disconnect {
+            background: linear-gradient(135deg, var(--hm-red) 0%, #D32F2F 100%);
+            box-shadow: 0 4px 14px rgba(255, 77, 79, 0.35);
+        }
+
+        /* 聊天主界面与沉浸式卡片流 */
+        .hm-chat-flow {
+            flex: 1;
+            padding: 24px 28px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            scroll-behavior: smooth;
+        }
+
+        .hm-chat-flow::-webkit-scrollbar {
+            width: 4px;
+        }
+
+        .hm-chat-flow::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.12);
+            border-radius: 4px;
+        }
+
+        .hm-msg-row {
+            display: flex;
+            flex-direction: column;
+            max-width: 68%;
+            animation: springIn 0.28s cubic-bezier(0.18, 0.89, 0.32, 1.28);
+        }
+
+        @keyframes springIn {
+            0% { opacity: 0; transform: translateY(10px) scale(0.97); }
+            100% { opacity: 1; transform: translateY(0) scale(1); }
+        }
+
+        .hm-msg-row.self {
+            align-self: flex-end;
+            align-items: flex-end;
+        }
+
+        .hm-msg-row.other {
+            align-self: flex-start;
+            align-items: flex-start;
+        }
+
+        .hm-msg-row.system {
+            align-self: center;
+            max-width: 85%;
+            align-items: center;
+        }
+
+        .hm-meta {
+            font-size: 0.72rem;
+            color: var(--hm-text-tertiary);
+            margin-bottom: 5px;
             display: flex;
             align-items: center;
             gap: 6px;
         }
 
-        .metric-val {
-            font-weight: 700;
-            color: var(--accent);
-            font-variant-numeric: tabular-nums;
-        }
-
-        /* 连接配置表单 */
-        .conn-bar {
-            padding: 10px 20px;
-            background: var(--bg-primary);
-            border-bottom: 1px solid var(--border);
-            display: flex;
-            gap: 10px;
-            align-items: center;
-        }
-
-        .input-group {
-            display: flex;
-            align-items: center;
-            background: var(--bg-secondary);
-            border: 1px solid var(--border);
+        .hm-meta-badge {
+            font-size: 0.65rem;
+            padding: 1px 7px;
             border-radius: 6px;
-            padding: 4px 10px;
-            flex: 1;
+            background: rgba(245, 166, 35, 0.15);
+            color: var(--hm-amber);
+            border: 0.5px solid rgba(245, 166, 35, 0.35);
         }
 
-        .input-group label {
-            font-size: 0.8rem;
-            color: var(--text-secondary);
-            margin-right: 8px;
-        }
-
-        .input-group input {
-            background: transparent;
-            border: none;
-            color: var(--text-primary);
-            width: 100%;
-            outline: none;
-            font-size: 0.9rem;
-        }
-
-        button {
-            background: var(--accent);
-            color: white;
-            border: none;
-            padding: 7px 16px;
-            border-radius: 6px;
-            cursor: pointer;
-            font-weight: 500;
-            font-size: 0.9rem;
-            transition: background 0.2s;
-            white-space: nowrap;
-        }
-
-        button:hover {
-            background: var(--accent-hover);
-        }
-
-        button.btn-danger {
-            background: var(--danger);
-        }
-
-        button.btn-danger:hover {
-            background: #dc2626;
-        }
-
-        button:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-
-        /* 聊天消息区域 */
-        .chat-body {
-            flex: 1;
-            padding: 20px;
-            overflow-y: auto;
-            display: flex;
-            flex-direction: column;
-            gap: 12px;
-            scroll-behavior: smooth;
-        }
-
-        .message-row {
-            display: flex;
-            flex-direction: column;
-            max-width: 75%;
-            animation: fadeIn 0.15s ease-out;
-        }
-
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(4px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-
-        .message-row.self {
-            align-self: flex-end;
-            align-items: flex-end;
-        }
-
-        .message-row.other {
-            align-self: flex-start;
-            align-items: flex-start;
-        }
-
-        .message-row.system {
-            align-self: center;
-            max-width: 90%;
-            align-items: center;
-        }
-
-        .msg-meta {
-            font-size: 0.75rem;
-            color: var(--text-secondary);
-            margin-bottom: 3px;
-        }
-
-        .msg-bubble {
-            padding: 10px 14px;
-            border-radius: 10px;
-            font-size: 0.92rem;
-            line-height: 1.45;
+        .hm-bubble {
+            padding: 12px 18px;
+            font-size: 0.94rem;
+            line-height: 1.5;
             word-break: break-all;
+            border-radius: var(--hm-r-md);
+            position: relative;
         }
 
-        .message-row.self .msg-bubble {
-            background: var(--accent);
-            color: white;
-            border-bottom-right-radius: 2px;
+        .hm-msg-row.self .hm-bubble {
+            background: linear-gradient(135deg, rgba(62, 123, 250, 0.85) 0%, rgba(35, 87, 206, 0.9) 100%);
+            color: #FFFFFF;
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            border-bottom-right-radius: 4px;
+            box-shadow: 0 4px 16px rgba(62, 123, 250, 0.25);
         }
 
-        .message-row.other .msg-bubble {
-            background: var(--bg-tertiary);
-            color: var(--text-primary);
-            border-bottom-left-radius: 2px;
+        .hm-msg-row.other .hm-bubble {
+            background: var(--hm-glass-card);
+            color: var(--hm-text-primary);
+            border: 1px solid var(--hm-line);
+            border-bottom-left-radius: 4px;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
         }
 
-        .message-row.system .msg-bubble {
-            background: rgba(51, 65, 85, 0.4);
-            color: var(--text-secondary);
+        .hm-msg-row.system .hm-bubble {
+            background: rgba(0, 0, 0, 0.32);
+            color: var(--hm-text-secondary);
             font-size: 0.8rem;
-            padding: 4px 12px;
-            border-radius: 12px;
+            padding: 5px 16px;
+            border-radius: var(--hm-r-pill);
+            border: 1px solid var(--hm-line);
         }
 
-        /* 底部输入框 */
-        .input-bar {
-            padding: 16px 20px;
-            background: var(--bg-primary);
-            border-top: 1px solid var(--border);
-            display: flex;
-            gap: 10px;
-            align-items: center;
-        }
-
-        .input-bar input {
-            flex: 1;
-            background: var(--bg-secondary);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 10px 14px;
-            color: var(--text-primary);
-            outline: none;
-            font-size: 0.95rem;
-        }
-
-        .input-bar input:focus {
-            border-color: var(--accent);
-        }
-
-        /* 压测辅助工具开关 */
-        .stress-bar {
-            padding: 6px 20px;
-            background: #182234;
-            border-top: 1px solid var(--border);
+        /* 压测与辅助开关栏 */
+        .hm-sub-bar {
+            padding: 8px 26px;
+            background: rgba(0, 0, 0, 0.2);
+            border-top: 1px solid var(--hm-line);
             display: flex;
             align-items: center;
             justify-content: space-between;
-            font-size: 0.8rem;
-            color: var(--text-secondary);
+            font-size: 0.78rem;
+            color: var(--hm-text-secondary);
         }
 
-        .stress-ctrls {
+        .hm-btn-ghost {
+            background: transparent;
+            color: var(--hm-text-secondary);
+            border: 1px solid var(--hm-line);
+            padding: 4px 12px;
+            border-radius: var(--hm-r-pill);
+            cursor: pointer;
+            font-size: 0.75rem;
+            transition: all 0.2s;
+        }
+
+        .hm-btn-ghost:hover {
+            background: rgba(255, 255, 255, 0.08);
+            color: var(--hm-text-primary);
+        }
+
+        /* 底部输入舱 */
+        .hm-dock {
+            padding: 16px 26px;
+            background: rgba(21, 25, 36, 0.75);
+            backdrop-filter: blur(25px);
+            border-top: 1px solid var(--hm-line);
             display: flex;
-            gap: 10px;
+            gap: 12px;
             align-items: center;
+        }
+
+        .hm-input-box {
+            background: var(--hm-glass-card);
+            border: 1px solid var(--hm-line);
+            border-radius: var(--hm-r-pill);
+            padding: 10px 18px;
+            color: #FFFFFF;
+            outline: none;
+            font-size: 0.92rem;
+            transition: all 0.25s;
+        }
+
+        .hm-input-box:focus {
+            background: var(--hm-glass-active);
+            border-color: var(--hm-blue-light);
+            box-shadow: 0 0 0 3px rgba(62, 123, 250, 0.2);
+        }
+
+        .hm-input-box::placeholder {
+            color: var(--hm-text-tertiary);
         }
     </style>
 </head>
-<body data-page-node-id="voReuZmWFi40EHPBvPZ2aK">
-    <div class="container" data-page-node-id="cHbPAGD18dGLk5lB0QixUR">
-        <!-- 头部导航与指标监控 -->
-        <div class="header" data-page-node-id="MmqcAXKPHyDcUtuUbOyWaG">
-            <div class="header-title" data-page-node-id="yoJfG7qKADH8hbphB2a9CN">
-                <div id="statusDot" class="status-dot" data-page-node-id="GmVfojOdXPEjyYbxF5wqx3"></div>
-                <span data-page-node-id="W5sqGBOsnP8jBWyom6EhUH">Loong-Boot WebSocket</span>
-            </div>
-            <div class="metrics-bar" data-page-node-id="hGngg1Qxi12mcYkOAKoYOL">
-                <div class="metric-item" data-page-node-id="8qBvidYYUuvr8A3TucoOBt">
-                    <span data-page-node-id="S8YIWRypgCZjSuR6G1Wvza">发送:</span>
-                    <span id="sentCount" class="metric-val" data-page-node-id="kUpelDx76SgjFGXLH3VgyG">0</span>
+<body data-page-node-id="mEj7Q4IkRT8FYwz4uAHpBj">
+    <!-- 鸿蒙动态极光光晕背景 -->
+    <div class="aurora-bg" data-page-node-id="hOmLo8GCk8iOwYRLwoa48d">
+        <canvas id="particleCanvas"></canvas>
+        <div class="aurora-blob blob-1" data-page-node-id="UlmDdFYbKhUbo5do54lT44"></div>
+        <div class="aurora-blob blob-2" data-page-node-id="IekkZP1GR0eJEfYpCMaY5v"></div>
+        <div class="aurora-blob blob-3" data-page-node-id="UnG9MHkYYdj5eKzpa6ELHU"></div>
+    </div>
+
+    <!-- 沉浸式主面板 -->
+    <div class="hm-window" data-page-node-id="KMQd3JaAnjhz0357sZZJh7">
+        <!-- 头部导航与仪表盘 -->
+        <div class="hm-header" data-page-node-id="ae97uOj4l4BCM5QwHae2mW">
+            <div class="hm-brand" data-page-node-id="tRrOt2p7Ls4ymi2r1eqCqg">
+                <div class="hm-logo" data-page-node-id="mINsm6bU5rvK7GxqJPVW5d">
+                    <svg viewBox="0 0 24 24" data-page-node-id="ileDPt8GAKaRgFLdgdcc5N"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" data-page-node-id="JFpFxyGKLvfGN7LL5biQR3"/></svg>
                 </div>
-                <div class="metric-item" data-page-node-id="cCXEURCFXYEMsA4XmtCM0F">
-                    <span data-page-node-id="DeqM1Wz9OqkU67E1jzhxDG">接收:</span>
-                    <span id="recvCount" class="metric-val" data-page-node-id="V90fj8RXtOi32GeOEEPpVy">0</span>
-                </div>
-                <div class="metric-item" data-page-node-id="Gzz9EVIHzNBPJOMi9Sl3Sn">
-                    <span data-page-node-id="eakIeG3D1jmOJG7K5zU84Q">吞吐:</span>
-                    <span id="qpsVal" class="metric-val" data-page-node-id="fAQVHr7YH8TsT0VyUuexEe">0 msg/s</span>
+                <div data-page-node-id="Ckw0mV3SOWiYlpTrzoBQf1">
+                    <div class="hm-title" data-page-node-id="DSmgzC8fSL8SjBLtsf47XP">Loong-Boot 实时通信网关</div>
+                    <div class="hm-sub" data-page-node-id="kRu1D16YDFJNgl5WhlvlM0">HARMONYOS IMMERSIVE CONSOLE</div>
                 </div>
             </div>
-        </div>
-
-        <!-- 连接设置栏 -->
-        <div class="conn-bar" data-page-node-id="lNX2GXBtuzW4ee2IsPUzPx">
-            <div class="input-group" style="flex: 2;" data-page-node-id="RYfcSArKFG0R6THS1OkCoh">
-                <label data-page-node-id="eGQ02TzlSznPfaeX4TtzcE">地址</label>
-                <input id="wsUrl" type="text" value="ws://127.0.0.1:9090/chat" data-page-node-id="yymDoL9vuRLvQluwVEpp6p">
-            </div>
-            <div class="input-group" style="flex: 1;" data-page-node-id="VDwrivWvLu9wBiaLWb1Dm7">
-                <label data-page-node-id="rAoLgBXab86iZwfxrFrYKP">房间</label>
-                <input id="roomName" type="text" value="default_room" data-page-node-id="81dkEuK5zvTyHwd7SqSDjr">
-            </div>
-            <div class="input-group" style="flex: 1;" data-page-node-id="05ZlHeTvrSWgpL6IO8o2kR">
-                <label data-page-node-id="EMUGQ4eDilsInYljVnZS0p">昵称</label>
-                <input id="userName" type="text" value="" placeholder="随机生成中..." data-page-node-id="64THKrXlV8VSZKhvVB6Tr4">
-            </div>
-            <button id="btnConnect" onclick="toggleConnect()" data-page-node-id="qOGCJrGrOMlU8MQtzMo8IJ">连接</button>
-        </div>
-
-        <!-- 消息流面板 -->
-        <div id="chatBody" class="chat-body" data-page-node-id="D3Krf8TyVQ9tnX9Uc5aFda">
-            <div class="message-row system" data-page-node-id="iZyBZyEp5wQinmfvBvcbvF">
-                <div class="msg-bubble" data-page-node-id="DhQJvD2HwNszdg9z1oBJ5h">欢迎使用 Loong-Boot 高性能聊天室。点击上方“连接”进入房间。</div>
+            <div class="hm-capsule-bar" data-page-node-id="Scc6yoMzBprpQCjQfwpv4Z">
+                <div class="hm-metric" data-page-node-id="DwmdEJsdWIUQYnDQOnj3Kc">
+                    <div id="statusDot" class="hm-status-pulse" data-page-node-id="l2hGetmvjwi8X0M2lPWg62"></div>
+                    <span id="connStatusText" data-page-node-id="sYoUGu98VfRcZHUSOqxuVB">待就绪</span>
+                </div>
+                <div style="width: 1px; height: 12px; background: var(--hm-line);" data-page-node-id="cQcU0ELdUFXnjzGZCRX4lZ"></div>
+                <div class="hm-metric" data-page-node-id="7AYLUQkzJ1cAKnBV18PLKF">
+                    <span style="color: var(--hm-text-tertiary);" data-page-node-id="DUxIYLHIrrGAmi2g2tnLao">发送</span>
+                    <span id="sentCount" class="hm-metric-val" data-page-node-id="DDyxtzcQfAI9uF8LDjzHBQ">0</span>
+                </div>
+                <div class="hm-metric" data-page-node-id="ZsJb9we62Dvk8votYDIJvf">
+                    <span style="color: var(--hm-text-tertiary);" data-page-node-id="BIQMncWzmLQxshkEXAVHBX">接收</span>
+                    <span id="recvCount" class="hm-metric-val" data-page-node-id="w9J00qjY6fB9EI76O48ZmC">0</span>
+                </div>
+                <div class="hm-metric" data-page-node-id="I1BCS1ZiBM3wrQx6rDUHpZ">
+                    <span style="color: var(--hm-text-tertiary);" data-page-node-id="TYckH4Di8L7gfIVZvdN3uL">吞吐</span>
+                    <span id="qpsVal" class="hm-metric-val" style="color: #64B5F6;" data-page-node-id="fr1TB04jKZVFNCLro5cUAb">0 msg/s</span>
+                </div>
             </div>
         </div>
 
-        <!-- 压测模式辅助 (最高支持浏览器单端万级吞吐) -->
-        <div class="stress-bar" data-page-node-id="psTzpk6pMvXUMb7kCJNway">
-            <span data-page-node-id="ZKH6yTYEBXc71NFXCFyxCr">💡 浏览器单端压测与调试</span>
-            <div class="stress-ctrls" data-page-node-id="Brb2vYhW2CSYMeU9DJaIDx">
-                <label data-page-node-id="6VXmobXv5LIsexumDeySaW"><input id="pauseRender" type="checkbox" data-page-node-id="0Pji4ZlYTFaavK3GxNTF6j"> 压测时暂停 DOM 渲染(保障极致速度)</label>
-                <button style="padding: 3px 8px; font-size: 0.75rem;" onclick="sendBatch(1000)" data-page-node-id="HbkfCBTc2uANVLVXtvlmiF">发 1000 条</button>
-                <button style="padding: 3px 8px; font-size: 0.75rem;" onclick="clearMessages()" data-page-node-id="EDhyQSlfZYqUwuGHSmiYrH">清屏</button>
+        <!-- 鸿蒙圆润胶囊控制台 -->
+        <div class="hm-control-card" data-page-node-id="PtSdDeGRPRUrzJPoHYiEv6">
+            <div class="hm-input-pill" style="flex: 2;" data-page-node-id="LVBwXh1Q4B90G0pcgIG2Dw">
+                <label data-page-node-id="6cMn5a8ZgXEk2Yx2I368f6">地址</label>
+                <input id="wsUrl" type="text" value="ws://127.0.0.1:9090/chat" data-page-node-id="LDfKgvIZiEDQ36KpZcDYKB">
+            </div>
+            <div class="hm-input-pill" style="flex: 1;" data-page-node-id="CLr0t2bDA0HodjguK8RcbM">
+                <label data-page-node-id="cJCgMWBjTaT62QmXMaaWjJ">房间</label>
+                <input id="roomName" type="text" value="default_room" data-page-node-id="CA4S5JMFCgXNyHFMJkqRYO">
+            </div>
+            <div class="hm-input-pill" style="flex: 1;" data-page-node-id="kKhDEQlqmeqAk5ljL8O4mh">
+                <label data-page-node-id="XBOgS0acCiPkSW3rlzHaBU">身份</label>
+                <input id="userName" type="text" value="" placeholder="生成中..." data-page-node-id="Kp57QUQ6xHCfV9DbwnfQ2P">
+            </div>
+            <button id="btnConnect" class="hm-btn" onclick="toggleConnect()" data-page-node-id="Jgsbdmh1vkQ74WYmRXAPZE">连接终端</button>
+        </div>
+
+        <!-- 聊天气泡主屏 -->
+        <div id="chatBody" class="hm-chat-flow" data-page-node-id="91qGECZIpRhrZwwCShbuF3">
+            <div class="hm-msg-row system" data-page-node-id="DgxB0gBfE55nTNo1xl1Est">
+                <div class="hm-bubble" data-page-node-id="I4C2cM69QHAnPSB166Ofi5">欢迎进入 Loong-Boot 鸿蒙沉浸通信空间。点击上方“连接终端”开始互动。</div>
             </div>
         </div>
 
-        <!-- 底部输入框 -->
-        <div class="input-bar" data-page-node-id="5iqgeCYhamex1ZkUFXXqgQ">
-            <input id="msgInput" type="text" placeholder="输入聊天内容，回车发送..." onkeydown="handleKeyDown(event)" disabled data-page-node-id="dlPDZbXQ6Y0ap84SJTXPl1">
-            <button id="btnSend" onclick="sendMessage()" disabled data-page-node-id="yqlgKa5kFLmutGl2wnhNn9">发送</button>
+        <!-- 压测调试工具条 -->
+        <div class="hm-sub-bar" data-page-node-id="foXaTuMkoG8r9uoTZi9Mfb">
+            <span data-page-node-id="wC0oZB8FLFatErCKhBT1AD">高并发性能吞吐与压测</span>
+            <div style="display: flex; gap: 12px; align-items: center;" data-page-node-id="zQJUEGxqTia6Pllrs0uurh">
+                <label style="cursor: pointer; display: flex; align-items: center; gap: 6px;" data-page-node-id="b7TQoAjEtt0gz26yBAnGqK">
+                    <input id="pauseRender" type="checkbox" data-page-node-id="oalHvDyFVHyWHDMd8BwA0S"> 压测时暂停 DOM 渲染 (防爆模式)
+                </label>
+                <button class="hm-btn-ghost" onclick="sendBatch(1000)" data-page-node-id="1HFsxojC9DYsamjldW9Cdr">压测 1000 条</button>
+                <button class="hm-btn-ghost" onclick="clearMessages()" data-page-node-id="gVWafl53bChoJQDIa4cipq">清空面板</button>
+            </div>
+        </div>
+
+        <!-- 底部浮岛输入舱 -->
+        <div class="hm-dock" data-page-node-id="P16TkXE7KCuoxdBIXFLitq">
+            <input id="toUser" class="hm-input-box" type="text" placeholder="@指定私聊对象 (留空全房广播)" style="max-width: 220px;" data-page-node-id="X4vUWDniBG7JZFGPN1W9IX">
+            <input id="msgInput" class="hm-input-box" type="text" placeholder="输入消息，回车快速发送..." onkeydown="handleKeyDown(event)" disabled style="flex: 1;" data-page-node-id="pCbXCVtGYa8dNqS4ARUUKu">
+            <button id="btnSend" class="hm-btn" onclick="sendMessage()" disabled data-page-node-id="SvBJtLLdVw4MUNsjQIlbl6">发送</button>
         </div>
     </div>
 
@@ -357,78 +540,78 @@
         let sentTotal = 0;
         let recvTotal = 0;
         let lastRecv = 0;
-        let mySubscriberId = null;
 
-        // 页面打开时自动随机分配独立昵称（如 User_7392），避免多窗口冲突
+        // 窗口初始化：随机独立昵称
         window.addEventListener('DOMContentLoaded', () => {
             const randomId = Math.floor(1000 + Math.random() * 9000);
             document.getElementById('userName').value = `User_${randomId}`;
         });
 
-        // 环形消息缓冲区：最多保留 200 条，防止长聊/压测浏览器内存膨胀
+        // 环形缓冲：最多保留 200 条，杜绝 DOM 树无界膨胀
         const MAX_MESSAGES = 200;
 
-        // 吞吐量统计器 (每秒刷新)
+        // QPS 吞吐量实时计算器 (每秒计算)
         setInterval(() => {
-            const delta = recvTotal - lastRecv;
+            const currentQps = recvTotal - lastRecv;
             lastRecv = recvTotal;
-            document.getElementById('qpsVal').innerText = delta.toLocaleString() + ' msg/s';
+            document.getElementById('qpsVal').innerText = `${currentQps.toLocaleString()} msg/s`;
         }, 1000);
 
         function toggleConnect() {
             if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
                 ws.close();
             } else {
-                connect();
+                connectWebSocket();
             }
         }
 
-        function connect() {
+        function connectWebSocket() {
             const url = document.getElementById('wsUrl').value.trim();
             const room = document.getElementById('roomName').value.trim();
             const user = document.getElementById('userName').value.trim();
 
-            addSystemMessage(`正在连接到 ${url}...`);
-
-            try {
-                // 支持 URL Query 参数透传 room_name 与 name
-                const wsFullUrl = `${url}?room_name=${encodeURIComponent(room)}&name=${encodeURIComponent(user)}`;
-                ws = new WebSocket(wsFullUrl);
-            } catch (e) {
-                addSystemMessage(`连接初始化失败: ${e.message}`);
-                return;
-            }
-
             const dot = document.getElementById('statusDot');
+            const statusText = document.getElementById('connStatusText');
             const btnConnect = document.getElementById('btnConnect');
             const msgInput = document.getElementById('msgInput');
             const btnSend = document.getElementById('btnSend');
 
+            try {
+                const wsFullUrl = `${url}?room_name=${encodeURIComponent(room)}&name=${encodeURIComponent(user)}`;
+                ws = new WebSocket(wsFullUrl);
+            } catch (e) {
+                alert('连接构造失败: ' + e.message);
+                return;
+            }
+
             ws.onopen = () => {
                 dot.classList.add('online');
-                btnConnect.innerText = '断开';
-                btnConnect.classList.add('btn-danger');
+                statusText.innerText = '在线';
+                statusText.style.color = 'var(--hm-teal)';
+                btnConnect.innerText = '断开终端';
+                btnConnect.classList.add('disconnect');
                 msgInput.disabled = false;
                 btnSend.disabled = false;
                 msgInput.focus();
-                addSystemMessage(`已成功连接！房间: ${room}, 用户: ${user}`);
+                addSystemMessage(`已进入空间 [${room}]，身份: ${user}`);
             };
 
             ws.onmessage = (event) => {
                 recvTotal++;
                 document.getElementById('recvCount').innerText = recvTotal.toLocaleString();
 
-                // 压测模式下可跳过 DOM 绘制以跑满浏览器极限
-                if (document.getElementById('pauseRender').checked) return;
+                if (document.getElementById('pauseRender').checked) {
+                    return;
+                }
 
                 try {
                     const data = JSON.parse(event.data);
-                    // 现有协议结构：{ code: 200, id: 1, name: "xxxxxx", message: "content" }
                     if (data.code === 200) {
-                        const isSelf = (mySubscriberId && data.id === mySubscriberId);
+                        const myName = document.getElementById('userName').value.trim();
+                        const isSelf = data.name === myName;
                         appendChatMessage(data.name || `User_${data.id}`, data.message, isSelf);
                     } else {
-                        appendChatMessage('系统', JSON.stringify(data), false);
+                        appendChatMessage('系统态势', JSON.stringify(data), false);
                     }
                 } catch (e) {
                     appendChatMessage('原始帧', event.data, false);
@@ -437,15 +620,17 @@
 
             ws.onclose = () => {
                 dot.classList.remove('online');
-                btnConnect.innerText = '连接';
-                btnConnect.classList.remove('btn-danger');
+                statusText.innerText = '已断开';
+                statusText.style.color = 'var(--hm-text-secondary)';
+                btnConnect.innerText = '连接终端';
+                btnConnect.classList.remove('disconnect');
                 msgInput.disabled = true;
                 btnSend.disabled = true;
-                addSystemMessage('连接已断开');
+                addSystemMessage('已安全退出当前空间');
             };
 
-            ws.onerror = (err) => {
-                addSystemMessage('WebSocket 连接发生错误');
+            ws.onerror = () => {
+                addSystemMessage('通信链路发生异常波动');
             };
         }
 
@@ -454,12 +639,13 @@
             const content = input.value.trim();
             if (!content || !ws || ws.readyState !== WebSocket.OPEN) return;
 
-            // 严格对齐 ChatWebsocket 期望的 chatMessageDto:
-            // struct chatMessageDto { key, action, msgContent }
+            const toUser = document.getElementById('toUser').value.trim();
+
             const payload = JSON.stringify({
                 key: document.getElementById('roomName').value.trim(),
                 action: "message",
-                msgContent: content
+                msgContent: content,
+                toUser: toUser
             });
 
             ws.send(payload);
@@ -470,7 +656,7 @@
 
         function sendBatch(count) {
             if (!ws || ws.readyState !== WebSocket.OPEN) {
-                alert('请先连接 WebSocket');
+                alert('请先连接服务器');
                 return;
             }
             const room = document.getElementById('roomName').value.trim();
@@ -495,21 +681,20 @@
         function appendChatMessage(sender, text, isSelf) {
             const body = document.getElementById('chatBody');
             const row = document.createElement('div');
-            row.className = `message-row ${isSelf ? 'self' : 'other'}`;
+            row.className = `hm-msg-row ${isSelf ? 'self' : 'other'}`;
 
             const meta = document.createElement('div');
-            meta.className = 'msg-meta';
+            meta.className = 'hm-meta';
             meta.innerText = `${sender} · ${new Date().toLocaleTimeString()}`;
 
             const bubble = document.createElement('div');
-            bubble.className = 'msg-bubble';
+            bubble.className = 'hm-bubble';
             bubble.innerText = text;
 
             row.appendChild(meta);
             row.appendChild(bubble);
             body.appendChild(row);
 
-            // 限制 DOM 节点总数，防止长时间压测导致页面卡顿
             if (body.children.length > MAX_MESSAGES) {
                 body.removeChild(body.firstChild);
             }
@@ -520,10 +705,10 @@
         function addSystemMessage(text) {
             const body = document.getElementById('chatBody');
             const row = document.createElement('div');
-            row.className = 'message-row system';
+            row.className = 'hm-msg-row system';
 
             const bubble = document.createElement('div');
-            bubble.className = 'msg-bubble';
+            bubble.className = 'hm-bubble';
             bubble.innerText = `${new Date().toLocaleTimeString()} - ${text}`;
 
             row.appendChild(bubble);
@@ -534,6 +719,85 @@
         function clearMessages() {
             document.getElementById('chatBody').innerHTML = '';
         }
+
+        // ==========================================
+        // 鸿蒙纯血微动粒子引擎 (轻量高效、零阻塞主线程)
+        // ==========================================
+        (function initParticles() {
+            const canvas = document.getElementById('particleCanvas');
+            if (!canvas) return;
+            const ctx = canvas.getContext('2d');
+            let w = canvas.width = window.innerWidth;
+            let h = canvas.height = window.innerHeight;
+
+            window.addEventListener('resize', () => {
+                w = canvas.width = window.innerWidth;
+                h = canvas.height = window.innerHeight;
+            });
+
+            const PARTICLE_COUNT = 48;
+            const particles = [];
+
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                particles.push({
+                    x: Math.random() * w,
+                    y: Math.random() * h,
+                    r: Math.random() * 1.6 + 0.6,
+                    vx: (Math.random() - 0.5) * 0.35,
+                    vy: (Math.random() - 0.5) * 0.35,
+                    alpha: Math.random() * 0.5 + 0.2,
+                    dAlpha: (Math.random() * 0.008 + 0.003) * (Math.random() > 0.5 ? 1 : -1)
+                });
+            }
+
+            function render() {
+                ctx.clearRect(0, 0, w, h);
+
+                // 绘制柔和星芒微尘
+                for (let i = 0; i < particles.length; i++) {
+                    const p = particles[i];
+                    p.x += p.vx;
+                    p.y += p.vy;
+
+                    if (p.x < 0) p.x = w;
+                    else if (p.x > w) p.x = 0;
+                    if (p.y < 0) p.y = h;
+                    else if (p.y > h) p.y = 0;
+
+                    p.alpha += p.dAlpha;
+                    if (p.alpha > 0.75 || p.alpha < 0.15) {
+                        p.dAlpha = -p.dAlpha;
+                    }
+
+                    ctx.beginPath();
+                    ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+                    ctx.fillStyle = `rgba(160, 205, 255, ${p.alpha})`;
+                    ctx.shadowBlur = 8;
+                    ctx.shadowColor = 'rgba(91, 141, 239, 0.6)';
+                    ctx.fill();
+
+                    // 局部微连线（鸿蒙星联感觉）
+                    for (let j = i + 1; j < particles.length; j++) {
+                        const p2 = particles[j];
+                        const dx = p.x - p2.x;
+                        const dy = p.y - p2.y;
+                        const dist = Math.sqrt(dx * dx + dy * dy);
+                        if (dist < 85) {
+                            ctx.beginPath();
+                            ctx.moveTo(p.x, p.y);
+                            ctx.lineTo(p2.x, p2.y);
+                            ctx.strokeStyle = `rgba(100, 165, 255, ${(1 - dist / 85) * 0.12})`;
+                            ctx.lineWidth = 0.6;
+                            ctx.stroke();
+                        }
+                    }
+                }
+
+                requestAnimationFrame(render);
+            }
+
+            render();
+        })();
     </script>
 </body>
 </html>
