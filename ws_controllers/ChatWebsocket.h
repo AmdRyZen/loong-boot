@@ -1,16 +1,18 @@
 #pragma once
-#include <drogon/PubSubService.h>
 #include <drogon/WebSocketController.h>
 #include "kafka/KafkaManager.h"
 #include <glaze/glaze.hpp>
 #include <drogon/HttpAppFramework.h>
 #include "utils/retry_utils.h"
 #include "parallel_hashmap/phmap.h"
-#include "RoomSerialDispatcher.h"
+#include "RoomRegistry.h"
+#include <algorithm>
+#include <cstdlib>
 #include <memory_resource>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <drogon/nosql/RedisClient.h>
@@ -22,7 +24,7 @@ using namespace drogon;
 class ChatWebsocket final : public WebSocketController<ChatWebsocket>
 {
 public:
-    ChatWebsocket()
+    ChatWebsocket() : roomRegistry_(makeFanoutOptions())
     {
         constexpr size_t estimatedUserCount = 10000; // 可用配置替代硬编码
         userNameToConn_.reserve(estimatedUserCount);
@@ -54,7 +56,10 @@ public:
     WS_PATH_LIST_END
 
 private:
-    PubSubService<std::string> chatRooms_;
+    // 房间注册表：按订阅者分片 + 多核并行扇出，严格保序。
+    // 取代了原先的 drogon::PubSubService（它单线程扇出，房间越大越慢）
+    // 与 RoomSerialDispatcher（保序职责已内聚到 RoomRegistry 的房间级发布锁）。
+    RoomRegistry roomRegistry_;
 
     // 用户名 -> 该用户名下的所有在线会话（同一昵称允许多端并存，多端都能收到私聊）
     // 原先的 name -> 单连接 语义在「同名多连接」时会串号：旧连接断开时会把新连接的
@@ -67,9 +72,6 @@ private:
     // 读路径（私聊查表 / 定时任务遍历）走共享锁，连接注册与注销走独占锁，
     // 彻底消除原实现「无锁遍历 vs IO 线程 emplace/erase」的数据竞争。
     mutable std::shared_mutex connMutex_;
-
-    // 房间级串行派发器：保证同一房间消息严格 FIFO，不同房间并行不互斥
-    RoomSerialDispatcher roomDispatcher_;
 
     std::string instanceId_;
     std::shared_ptr<drogon::nosql::RedisSubscriber> clusterSubscriber_;
@@ -84,19 +86,49 @@ private:
         std::string json;
     };
 
+    // 扇出参数：默认值适配本机，可用环境变量覆盖（便于压测 A/B 调参，不依赖配置加载时序）
+    static RoomRegistry::Options makeFanoutOptions()
+    {
+        RoomRegistry::Options opt;
+        // 默认不启用扇出线程池（opt.fanoutThreads 保持 0 = 单分片内联扇出）。
+        // 多分片并行扇出是实验特性：保序正确性已由单测覆盖，但回声饱和压测下
+        // 吞吐不稳定且低于内联路径，需要时用 LOONG_WS_FANOUT_THREADS 显式打开。
+        auto readEnv = [](const char* key, size_t& out) {
+            if (const char* v = std::getenv(key); v != nullptr && *v != '\0')
+            {
+                try
+                {
+                    out = static_cast<size_t>(std::stoull(v));
+                }
+                catch (...)
+                {
+                }
+            }
+        };
+        readEnv("LOONG_WS_MAX_SHARDS", opt.maxShards);
+        readEnv("LOONG_WS_SUBS_PER_SHARD", opt.subsPerShard);
+        readEnv("LOONG_WS_FANOUT_THREADS", opt.fanoutThreads);
+        readEnv("LOONG_WS_INLINE_MAX_SUBS", opt.inlineMaxSubs);
+        readEnv("LOONG_WS_BACKLOG_PER_SHARD", opt.backlogPerShard);
+        readEnv("LOONG_WS_DRAIN_BATCH", opt.drainBatch);
+        return opt;
+    }
+
     void checkAndEvictIdleConnections();
 
     // 把 room 内的消息投递到本地房间 + 集群总线（+ Kafka 持久化，已按需关闭）
-    void fanOutRoom(const std::string& topic, const std::string& json)
+    // 返回 false 表示本地分片积压达上限、消息被丢弃（调用方需计数并告知客户端）
+    bool fanOutRoom(const std::string& topic, const std::string& json)
     {
-        chatRooms_.publish(topic, json);
+        const bool ok = roomRegistry_.publish(topic, json);
         publishToCluster(topic, json);
         // [压测隔离] Kafka 推送已关闭：压测只生产不消费会把磁盘写满。
         // 恢复：取消下行注释，并确认 custom_config.enable_kafka_persistence 为 true。
         // produceKafkaAsync("chat_messages_topic", json);
+        return ok;
     }
 
-    void sendHeartbeatToAll() const
+    void sendHeartbeatToAll()
     {
         // 先加共享锁做一次快照，再在锁外发送。
         // 原实现无锁遍历 userNameToConn_，与 IO 线程的注册/注销并发修改容器 = UB。
@@ -113,7 +145,7 @@ private:
             }
         }
 
-        chatRooms_.publish("001", std::format("房间公告消息"));
+        roomRegistry_.publish("001", std::string("房间公告消息"));
 
         // 遍历并发送心跳给 excludedUsers_ 内的用户
         for (const auto& [userName, wsConnPtr] : snapshot)

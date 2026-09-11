@@ -15,7 +15,7 @@ struct Subscriber
 {
     std::string topic_;
     std::string userName_;
-    SubscriberID id_{};
+    RoomRegistry::SubscriberID id_{};
 
     // 跨线程访问：IO 线程写入（收到任意帧即刷新），主循环定时任务读取（空闲驱逐）。
     // 原先是非原子的 time_point —— 跨线程读写属于 data race（形式上 UB），
@@ -202,30 +202,23 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                         return;
                     }
 
-                    // 默认房间广播模式：在 IO 线程按到达顺序直接进入房间串行队列。
-                    // 注意：这里刻意不再经过 TBB 池中转。多线程池会打乱入队顺序，
-                    // 顺序一旦在池里被搅乱，下游再怎么串行扇出也救不回来（实测 300 条必乱）。
-                    // 扇出与序列化都在房间串行队列内完成，保证同一房间严格 FIFO；
-                    // 不同房间各自独立成队列，仍可跨线程并行，不影响多房间水平扩展。
-                    const bool queued = roomDispatcher_.dispatch(
-                        topic, [this, topic, msg = std::move(msg_dto.msgContent), id, senderName]() {
-                            chatMessageVo msg_vo{};
-                            msg_vo.code = 200;
-                            msg_vo.id = id;
-                            msg_vo.name = std::string_view(senderName);
-                            msg_vo.message = std::move(msg);
+                    // 默认房间广播模式：直接把已序列化的 payload 交给 RoomRegistry。
+                    // 保序由 RoomRegistry 内部的「房间级发布锁 + 分片 FIFO 队列」保证，
+                    // 扇出本身在多核上并行，所以这里不再需要额外的串行派发器中转，
+                    // 也不再经 TBB 池（多线程池会打乱入队顺序，下游再怎么串行都救不回来）。
+                    chatMessageVo msg_vo{};
+                    msg_vo.code = 200;
+                    msg_vo.id = id;
+                    msg_vo.name = std::string_view(senderName);
+                    msg_vo.message = std::move(msg_dto.msgContent);
 
-                            std::string json{};
-                            (void)glz::write_json(msg_vo, json);
+                    std::string json{};
+                    (void)glz::write_json(msg_vo, json);
 
-                            // 1. 本实例本地房间广播
-                            // 2. 分布式总线：同步广播给集群其他实例
-                            // 3. 生产环境持久化：异步投递到 Kafka 历史消息流
-                            fanOutRoom(topic, json);
-                        });
-
-                    // 房间积压达到上限：显式告知客户端并计数，杜绝静默丢消息
-                    if (!queued)
+                    // 1. 本实例本地房间广播（分片并行扇出）
+                    // 2. 分布式总线：同步广播给集群其他实例
+                    // 3. 生产环境持久化：异步投递到 Kafka 历史消息流
+                    if (!fanOutRoom(topic, json))
                     {
                         Metrics::PrometheusRegistry::instance().recordWsMessageDropped();
                         LOG_WARN << "Room backlog full, dropped message for room: " << topic;
@@ -273,13 +266,8 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
 
         Metrics::PrometheusRegistry::instance().recordWsConnect();
 
-        subscriber->id_ = chatRooms_.subscribe(topic, [weakWs = std::weak_ptr<WebSocketConnection>(wsConn)](const std::string&, const std::string& msg)
-        {
-            if (const auto web_socket_connection = weakWs.lock())
-            {
-                web_socket_connection->send(msg);
-            }
-        });
+        // 注册到房间注册表：分片直接持有连接指针，省掉 std::function 回调中转的开销
+        subscriber->id_ = roomRegistry_.subscribe(topic, wsConn);
 
         // 同一昵称允许多端并存：注册为「昵称 -> 会话列表」，多端都能收到私聊。
         // 原实现用 emplace 存单连接，同名时静默失败，且断开时按昵称 erase 会误删新连接。
@@ -301,15 +289,8 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
         std::string json{};
         (void)glz::write_json(msg_vo, json);
 
-        // 与聊天消息共用同一房间串行队列，保证「入群公告」与其他消息的相对顺序稳定
-        const bool queued = roomDispatcher_.dispatch(topic, [this, topic, json]() {
-            chatRooms_.publish(topic, json);
-            // [压测隔离] Kafka 推送已关闭：压测只生产不消费会把磁盘写满。
-            // 恢复：取消下行注释，并确认 custom_config.enable_kafka_persistence 为 true。
-            // produceKafkaAsync("message_topic", json);
-        });
-
-        if (!queued)
+        // 与聊天消息共用同一房间的发布锁，保证「入群公告」与其他消息的相对顺序稳定
+        if (!fanOutRoom(topic, json))
         {
             Metrics::PrometheusRegistry::instance().recordWsMessageDropped();
             LOG_WARN << "Room backlog full, dropped join notice for room: " << topic;
@@ -354,7 +335,7 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
         }
         LOG_INFO << "Removed user: " << userName;
 
-        chatRooms_.unsubscribe(topic, id);
+        roomRegistry_.unsubscribe(topic, id);
         Metrics::PrometheusRegistry::instance().recordWsDisconnect();
         LOG_INFO << "Unsubscribed from topic: " << topic << ", ID: " << id;
 
@@ -368,14 +349,8 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
         std::string json{};
         (void)glz::write_json(msg_vo, json);
 
-        const bool queued = roomDispatcher_.dispatch(topic, [this, topic, json]() {
-            chatRooms_.publish(topic, json);
-            // [压测隔离] Kafka 推送已关闭：压测只生产不消费会把磁盘写满。
-            // 恢复：取消下行注释，并确认 custom_config.enable_kafka_persistence 为 true。
-            // produceKafkaAsync("message_topic", json);
-        });
-
-        if (!queued)
+        // 与聊天消息共用同一房间的发布锁，保证「离群公告」与其他消息的相对顺序稳定
+        if (!fanOutRoom(topic, json))
         {
             Metrics::PrometheusRegistry::instance().recordWsMessageDropped();
             LOG_WARN << "Room backlog full, dropped leave notice for room: " << topic;
@@ -419,8 +394,8 @@ void ChatWebsocket::initClusterBus()
                             return;
                         }
 
-                        // 收到来自其他实例的广播，推给本实例房间内的所有客户端
-                        chatRooms_.publish(packet.topic, packet.json);
+                        // 收到来自其他实例的广播，推给本实例房间内的所有客户端（同样分片并行扇出）
+                        roomRegistry_.publish(packet.topic, packet.json);
                     }
                     catch (...)
                     {

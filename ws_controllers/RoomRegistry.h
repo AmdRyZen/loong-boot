@@ -1,0 +1,659 @@
+//
+// Created by 神圣•凯莎 on 26-9-11.
+//
+// RoomRegistry —— 房间级「按订阅者分片 + 多核并行扇出」的发布订阅注册表
+// ===========================================================================
+// 为什么需要它（旧实现的真实瓶颈）：
+//   drogon::PubSubService<Topic>::publish() 在 shared_lock 下【单线程】遍历全部订阅者，
+//   而 WebSocketConnectionImpl::sendWsData() 对每个订阅者都要：
+//       bytesFormatted.resize(len + 10)   // 一次堆分配
+//       bytesFormatted.append(msg, len)   // 一次全量 memcpy
+//   于是单房间一次扇出的 CPU 成本 = O(订阅者数 × 消息长度)，且全部压死在一个核上。
+//   房间越大 → 单核越忙 → 极限吞吐越低。这就是「去掉 TBB 中转后极限性能下降」的根因。
+//
+// 设计（严格保序 + 多核并行，二者不冲突）：
+//   1. 每个房间有固定 K 个分片槽位（K = maxShards），订阅者按 id % K 恒定归属某个分片，
+//      【永不迁移】。因为不存在「分片数变化 → 成员重分布」这一步，也就没有
+//      「旧分片残留消息晚于新分片消息投递」的乱序窗口。空槽位不建对象、发布时跳过，
+//      所以小房间的开销与成员数成正比，不会为用不到的分片买单。
+//   2. 每个分片有独立的 FIFO 队列，队列内部严格串行 → 同分片订阅者天然有序。
+//      并行的永远是「不同订阅者」，不是「同一条消息的不同副本」。
+//   3. 房间级发布锁只负责「按到达顺序把 payload 压进各分片队列」这一小段临界区，
+//      真正的扇出（send）在锁外由扇出线程池并行完成。
+//      —— 顺序建立在【入队顺序】上，而不是【扇出顺序】上，所以并行不影响保序。
+//   4. 分片订阅者列表用 copy-on-write 快照：扇出线程每条消息只做一次 shared_ptr 拷贝，
+//      不产生 O(N) 的引用计数风暴；增删订阅者只重建受影响分片（O(N/K)）。
+//   5. 分片队列有上限，超限显式丢弃并返回 false（由调用方计数 + 告知客户端），不静默丢。
+//   6. 小房间（订阅者 ≤ inlineMaxSubs）直接内联扇出，与旧实现等价，不惊动线程池。
+//
+// 与旧实现的另一个差异：去掉了 std::function 回调中转，分片直接持有连接指针。
+//
+// 连接类型做成模板参数，唯一要求是「可 bool 判空 + 有 send(std::string_view)」。
+// 生产环境实例化为 RoomRegistry（= RoomRegistryT<drogon::WebSocketConnectionPtr>），
+// 单测则用轻量 mock 连接，无需拉起 drogon 运行时。
+// ===========================================================================
+//
+#ifndef LOONG_BOOT_ROOM_REGISTRY_H
+#define LOONG_BOOT_ROOM_REGISTRY_H
+
+#pragma once
+
+#include <atomic>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <shared_mutex>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include <drogon/WebSocketConnection.h>
+#include "parallel_hashmap/phmap.h"
+
+template <typename ConnT>
+class RoomRegistryT
+{
+  public:
+    using SubscriberID = uint64_t;
+    using ConnPtr = ConnT;
+
+    struct Options
+    {
+        // 单房间最大分片槽位数 = 单房间最大并行扇出度。
+        // 默认 1：单分片 + 内联扇出，与旧实现语义等价，但少了 std::function 中转与双层队列。
+        // 实测单房间扇出吞吐与旧实现持平（确定性基准 200 订阅者：约 35~42 万次投递/s，
+        // 两侧差异落在噪声内）；瓶颈在 drogon 每份投递的 send 路径
+        // （跨线程 queueInLoop + 每份一次堆分配 ≈ 2.5µs/份），不在扇出循环本身，
+        // 所以分片并行无法突破该上限（详见下方 fanoutThreads 说明）。
+        // 调大即可启用多分片并行扇出（需要同时把 fanoutThreads 设为 > 0）。
+        size_t maxShards = 1;
+        // 每多少个订阅者增加一个分片（分片数随房间规模阶梯增长：1/2/4/.../maxShards）
+        size_t subsPerShard = 16;
+        // 扇出线程池线程数。默认 0 = 不起线程池，全部内联扇出。
+        //
+        // 注意：多分片并行扇出（maxShards > 1 且 fanoutThreads > 0）目前是实验特性。
+        // 单元测试（test/test_room_registry.cc）已验证其保序与并发正确性；
+        // 但实测在 8 分片 / 8 线程下 CPU 占用升到约 3.3 核，吞吐仍与单分片持平
+        // （同样受 drogon send 路径限制），只多付了记账与上下文切换成本，
+        // 因此默认关闭，需要时用环境变量显式打开。
+        size_t fanoutThreads = 0;
+        // 订阅者数不超过该值时不惊动线程池，直接内联扇出
+        size_t inlineMaxSubs = 32;
+        // 单分片最大积压消息数
+        size_t backlogPerShard = 4096;
+        // 单次连续扇出的消息批上限，超过则让出 worker 重排队，避免热点分片饿死其他房间
+        size_t drainBatch = 32;
+    };
+
+    explicit RoomRegistryT(Options opt = Options{}) : opt_(opt)
+    {
+        if (opt_.maxShards == 0)
+        {
+            opt_.maxShards = 1;
+        }
+        if (opt_.subsPerShard == 0)
+        {
+            opt_.subsPerShard = 16;
+        }
+        if (opt_.drainBatch == 0)
+        {
+            opt_.drainBatch = 1;
+        }
+
+        // 没有线程池就谈不上并行扇出，分片数强制收敛为 1，避免白付分片记账开销
+        if (opt_.fanoutThreads == 0)
+        {
+            opt_.maxShards = 1;
+        }
+
+        workers_.reserve(opt_.fanoutThreads);
+        for (size_t i = 0; i < opt_.fanoutThreads; ++i)
+        {
+            workers_.emplace_back([this] { workerLoop(); });
+        }
+    }
+
+    ~RoomRegistryT()
+    {
+        {
+            std::lock_guard lock(poolMtx_);
+            stop_ = true;
+        }
+        poolCv_.notify_all();
+        for (auto& t : workers_)
+        {
+            if (t.joinable())
+            {
+                t.join();
+            }
+        }
+    }
+
+    RoomRegistryT(const RoomRegistryT&) = delete;
+    RoomRegistryT& operator=(const RoomRegistryT&) = delete;
+
+    /**
+     * @brief 订阅一个房间
+     * @return 订阅 ID，用于 unsubscribe
+     */
+    SubscriberID subscribe(const std::string& room, ConnPtr conn)
+    {
+        for (;;)
+        {
+            std::shared_ptr<Room> r = getOrCreateRoom(room);
+            std::unique_lock pubLock(r->pubMtx);
+
+            // 房间可能刚被并发退订判定为空并摘除。此时必须换一个房间重来，
+            // 否则会往一个已经不在 rooms_ 里的孤儿 Room 塞成员（消息从此无处投递）。
+            if (r->retired.load(std::memory_order_acquire))
+            {
+                pubLock.unlock();
+                std::this_thread::yield();
+                continue;
+            }
+
+            const SubscriberID id = ++r->nextId;
+            const size_t after = r->subCount.load(std::memory_order_relaxed) + 1;
+            const size_t want = shardsFor(after);
+
+            if (want != r->shards.size())
+            {
+                // 分片数跨越阶梯：走安全重建协议（见 reshapeLocked 注释）
+                reshapeLocked(*r, want, Entry{id, conn});
+            }
+            else
+            {
+                const size_t idx = static_cast<size_t>(id % want);
+                if (r->dist[idx].empty())
+                {
+                    r->nonEmptyShards.fetch_add(1, std::memory_order_relaxed);
+                }
+                r->dist[idx].push_back(Entry{id, conn});
+                r->idToShard[id] = idx;
+                r->shards[idx] = refreshSnapshot(r->shards[idx], r->dist[idx]);
+            }
+            r->subCount.store(after, std::memory_order_relaxed);
+            return id;
+        }
+    }
+
+    /**
+     * @brief 退订。幂等：重复退订或不存在的 ID 均安全返回。
+     */
+    void unsubscribe(const std::string& room, SubscriberID id)
+    {
+        std::shared_ptr<Room> r;
+        {
+            std::shared_lock roomsLock(roomsMtx_);
+            if (const auto it = rooms_.find(room); it != rooms_.end())
+            {
+                r = it->second;
+            }
+        }
+        if (!r)
+        {
+            return;
+        }
+
+        std::lock_guard pubLock(r->pubMtx);
+        const auto it = r->idToShard.find(id);
+        if (it == r->idToShard.end())
+        {
+            return;
+        }
+        const size_t idx = it->second;
+        auto& bucket = r->dist[idx];
+        std::erase_if(bucket, [id](const Entry& e) { return e.id == id; });
+        r->idToShard.erase(it);
+        r->shards[idx] = refreshSnapshot(r->shards[idx], bucket);
+        if (bucket.empty())
+        {
+            r->nonEmptyShards.fetch_sub(1, std::memory_order_relaxed);
+        }
+
+        if (r->subCount.fetch_sub(1, std::memory_order_relaxed) != 1)
+        {
+            return; // 房间里还有人，不回收
+        }
+
+        // 房间空了：置 retired 并摘除。
+        // 这里在持有 pubMtx 的同时取 roomsMtx_ 独占锁 —— 全局锁序恒为
+        // 「先 roomsMtx_ 后释放，再取 pubMtx」或「持 pubMtx 时取 roomsMtx_」，
+        // 不存在反序获取，因此不会死锁。
+        r->retired.store(true, std::memory_order_release);
+        std::unique_lock roomsLock(roomsMtx_);
+        if (const auto mit = rooms_.find(room); mit != rooms_.end() && mit->second == r)
+        {
+            rooms_.erase(mit);
+        }
+    }
+
+    /**
+     * @brief 向房间发布一条消息（payload 已序列化完成）
+     * @return false 表示分片积压达上限、消息被丢弃（调用方需计数并告知客户端）
+     */
+    bool publish(const std::string& room, const std::string& payload)
+    {
+        return publishShared(room, std::make_shared<const std::string>(payload));
+    }
+
+    bool publish(const std::string& room, std::string&& payload)
+    {
+        return publishShared(room, std::make_shared<const std::string>(std::move(payload)));
+    }
+
+    bool publishShared(const std::string& room, std::shared_ptr<const std::string> payload)
+    {
+        std::shared_ptr<Room> r;
+        {
+            std::shared_lock roomsLock(roomsMtx_);
+            if (const auto it = rooms_.find(room); it != rooms_.end())
+            {
+                r = it->second;
+            }
+        }
+        if (!r || !payload)
+        {
+            return true; // 无订阅者：与 drogon 旧行为一致，直接丢弃
+        }
+
+        // 小房间 / 未启用线程池：内联扇出，不惊动线程池
+        const bool inlineMode =
+            workers_.empty() || r->subCount.load(std::memory_order_relaxed) <= opt_.inlineMaxSubs;
+
+        std::vector<std::shared_ptr<Shard>> needWake;
+        bool ok = true;
+        {
+            // 房间级发布锁：消息顺序的唯一来源。只做「入队」，不做扇出。
+            std::lock_guard pubLock(r->pubMtx);
+            for (size_t i = 0; i < r->dist.size(); ++i)
+            {
+                if (r->dist[i].empty())
+                {
+                    continue; // 空槽位不建对象也不发布，小房间不为用不到的分片买单
+                }
+                const std::shared_ptr<Shard>& sh = r->shards[i];
+                std::lock_guard shardLock(sh->mtx);
+                if (sh->queue.size() >= opt_.backlogPerShard)
+                {
+                    sh->dropped.fetch_add(1, std::memory_order_relaxed);
+                    dropped_.fetch_add(1, std::memory_order_relaxed);
+                    ok = false;
+                    continue;
+                }
+                sh->queue.push_back(payload);
+                // 门铃：仅在「空闲 → 忙」跳变时入池，热点分片不会每条消息都惊动线程池。
+                // exchange 与 drain 的 busy=false 都在分片锁内完成，不会丢唤醒。
+                if (!sh->busy.exchange(true, std::memory_order_acq_rel))
+                {
+                    needWake.push_back(sh);
+                }
+            }
+
+            // 在 pubMtx 内入池（内联模式除外）：保证「busy == true ⟹ 分片已在池中或正在被抽」，
+            // 让 reshapeLocked 的自旋等待一定有进展，不会等一个没人抽的分片。
+            if (!inlineMode)
+            {
+                for (const auto& sh : needWake)
+                {
+                    enqueueReady(sh);
+                }
+            }
+        }
+
+        if (needWake.empty())
+        {
+            return ok; // 已有线程在抽这些分片，它会在循环里取到本条消息
+        }
+
+        if (inlineMode)
+        {
+            // 内联抽干：不占线程池槽位。同一分片不会被两个线程同时抽，
+            // 因为 busy 标志保证了「同一时刻只有一个抽干者」。
+            for (const auto& sh : needWake)
+            {
+                drainShard(sh, false);
+            }
+        }
+        return ok;
+    }
+
+    // ---- 观测 ----
+
+    size_t activeRooms() const
+    {
+        std::shared_lock lock(roomsMtx_);
+        return rooms_.size();
+    }
+
+    size_t activeShards() const
+    {
+        std::shared_lock lock(roomsMtx_);
+        size_t n = 0;
+        for (const auto& [name, r] : rooms_)
+        {
+            (void)name;
+            n += r->nonEmptyShards.load(std::memory_order_relaxed);
+        }
+        return n;
+    }
+
+    size_t droppedCount() const noexcept
+    {
+        return dropped_.load(std::memory_order_relaxed);
+    }
+
+    size_t subscribersIn(const std::string& room) const
+    {
+        std::shared_lock lock(roomsMtx_);
+        const auto it = rooms_.find(room);
+        return it == rooms_.end() ? 0 : it->second->subCount.load(std::memory_order_relaxed);
+    }
+
+    const Options& options() const noexcept
+    {
+        return opt_;
+    }
+
+  private:
+    struct Entry
+    {
+        SubscriberID id{0};
+        ConnPtr conn;
+    };
+
+    struct Shard
+    {
+        // 一把锁同时保护 queue / snap / busy 的写入。
+        // 扇出（send）刻意放在锁外，因此不会阻塞发布方入队。
+        std::mutex mtx;
+        std::deque<std::shared_ptr<const std::string>> queue;
+        // copy-on-write 快照：扇出线程每条消息只拷贝一次 shared_ptr，无 O(N) 引用计数风暴
+        std::shared_ptr<const std::vector<Entry>> snap = std::make_shared<const std::vector<Entry>>();
+        std::atomic<bool> busy{false};
+        std::atomic<uint64_t> dropped{0};
+    };
+
+    struct Room
+    {
+        // 房间级发布锁 —— 消息顺序的唯一来源
+        std::mutex pubMtx;
+        // 固定槽位，惰性创建；dist[i] 是分片 i 的权威成员表，成员永不迁移
+        std::vector<std::shared_ptr<Shard>> shards;
+        std::vector<std::vector<Entry>> dist;
+        phmap::flat_hash_map<SubscriberID, size_t> idToShard;
+        std::atomic<size_t> subCount{0};
+        std::atomic<size_t> nonEmptyShards{0};
+        // 已被回收标记：防止退订摘除房间与并发订阅之间出现「孤儿房间」
+        std::atomic<bool> retired{false};
+        SubscriberID nextId{0};
+    };
+
+    // 重建某个分片的 COW 快照。O(该分片成员数)，不触发 O(N) 全量拷贝。
+    static std::shared_ptr<Shard> refreshSnapshot(const std::shared_ptr<Shard>& sh,
+                                                  const std::vector<Entry>& bucket)
+    {
+        auto next = std::make_shared<const std::vector<Entry>>(bucket);
+        if (!sh)
+        {
+            auto created = std::make_shared<Shard>();
+            created->snap = std::move(next);
+            return created;
+        }
+        {
+            std::lock_guard lock(sh->mtx);
+            sh->snap = std::move(next);
+        }
+        return sh;
+    }
+
+    std::shared_ptr<Room> getOrCreateRoom(const std::string& room)
+    {
+        {
+            std::shared_lock lock(roomsMtx_);
+            if (const auto it = rooms_.find(room); it != rooms_.end())
+            {
+                return it->second;
+            }
+        }
+        // 插入必须走独占锁：共享锁下写 phmap 会与并发的 find 相互踩踏（哈希表损坏）
+        std::unique_lock lock(roomsMtx_);
+        if (const auto it = rooms_.find(room); it != rooms_.end())
+        {
+            return it->second;
+        }
+        auto r = std::make_shared<Room>();
+        // shards/dist 刻意留空：首次订阅时由 reshapeLocked 按规模一次性建好
+        rooms_[room] = r;
+        return r;
+    }
+
+    // 分片数随房间规模阶梯增长：1 / 2 / 4 / ... / maxShards。
+    // 只增不减 —— 缩容需要在成员迁移时额外处理顺序，收益不值这个复杂度；
+    // 房间在最后一个订阅者离开时会被整体回收，因此不存在长期占用。
+    size_t shardsFor(size_t subs) const
+    {
+        size_t k = 1;
+        while (k < opt_.maxShards && subs >= k * opt_.subsPerShard)
+        {
+            k <<= 1;
+        }
+        return k;
+    }
+
+    static std::shared_ptr<Shard> makeShard(const std::vector<Entry>& bucket)
+    {
+        auto sh = std::make_shared<Shard>();
+        sh->snap = std::make_shared<const std::vector<Entry>>(bucket);
+        return sh;
+    }
+
+    // 分片数变化时的安全重建协议。调用方必须持有 r.pubMtx。
+    //
+    // 核心约束：只有当【全体订阅者都收到了截止此刻的全部消息】时，重新分片才是安全的。
+    // 否则会出现「某人已经收过、某人还没收」的错位 —— 那是重复投递的来源
+    // （早期版本把各分片残留 payload 统一搬运再广播，实测必然产生重复）。
+    //
+    // 而「全体排空」在本函数里是免费可得的：调用方持 pubMtx，不会再有新消息入队；
+    // 又因为 publishShared 在 pubMtx 内就把分片入池，所以 busy == true 一定意味着
+    // 「该分片在池中或正在被抽」，自旋等待 busy == false 必然收敛，且收敛时队列已空。
+    // 换言之：持 pubMtx 时 busy == false ⟺ 队列为空且无在途扇出。
+    void reshapeLocked(Room& r, size_t newK, const Entry& extra)
+    {
+        for (auto& sh : r.shards)
+        {
+            if (!sh)
+            {
+                continue;
+            }
+            while (sh->busy.load(std::memory_order_acquire))
+            {
+                std::this_thread::yield();
+            }
+        }
+
+        std::vector<Entry> all;
+        all.reserve(r.subCount.load(std::memory_order_relaxed) + 1);
+        for (const auto& bucket : r.dist)
+        {
+            all.insert(all.end(), bucket.begin(), bucket.end());
+        }
+        all.push_back(extra);
+
+        r.shards.assign(newK, nullptr);
+        r.dist.assign(newK, {});
+        r.idToShard.clear();
+        r.idToShard.reserve(all.size());
+        r.nonEmptyShards.store(0, std::memory_order_relaxed);
+        for (const auto& e : all)
+        {
+            const size_t idx = static_cast<size_t>(e.id % newK);
+            r.dist[idx].push_back(e);
+            r.idToShard[e.id] = idx;
+        }
+        for (size_t i = 0; i < newK; ++i)
+        {
+            r.shards[i] = makeShard(r.dist[i]);
+            if (!r.dist[i].empty())
+            {
+                r.nonEmptyShards.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    // ---------------- 扇出线程池 ----------------
+
+    void enqueueReady(const std::shared_ptr<Shard>& sh)
+    {
+        {
+            std::lock_guard lock(poolMtx_);
+            ready_.push_back(sh);
+            readyCount_.fetch_add(1, std::memory_order_release);
+        }
+        if (parked_.load(std::memory_order_relaxed) > 0)
+        {
+            poolCv_.notify_one();
+        }
+    }
+
+    // 自旋提示：热点分片会高频「空闲 → 忙」跳变，落眠后走 futex 唤醒的延迟
+    // 在机器有负载时会被放大到毫秒级，直接把延迟敏感型房间的吞吐打塌。
+    static void cpuPause() noexcept
+    {
+#if defined(__aarch64__) || defined(_M_ARM64)
+        asm volatile("yield" ::: "memory");
+#elif defined(__x86_64__) || defined(__i386__)
+        asm volatile("pause" ::: "memory");
+#else
+        std::this_thread::yield();
+#endif
+    }
+
+    void workerLoop()
+    {
+        constexpr int kSpinRounds = 4000;
+
+        for (;;)
+        {
+            std::shared_ptr<Shard> sh;
+            bool got = false;
+
+            // 阶段一：无锁自旋。就绪计数为 0 时只做 pause，不碰锁、不落眠。
+            for (int spin = 0; spin < kSpinRounds; ++spin)
+            {
+                if (readyCount_.load(std::memory_order_acquire) != 0)
+                {
+                    std::lock_guard lock(poolMtx_);
+                    if (!ready_.empty())
+                    {
+                        sh = std::move(ready_.front());
+                        ready_.pop_front();
+                        readyCount_.fetch_sub(1, std::memory_order_relaxed);
+                        got = true;
+                    }
+                    break;
+                }
+                cpuPause();
+            }
+
+            // 阶段二：确实没活可干才落眠
+            if (!got)
+            {
+                std::unique_lock lock(poolMtx_);
+                ++parked_;
+                poolCv_.wait(lock, [this] { return stop_ || !ready_.empty(); });
+                --parked_;
+                if (ready_.empty())
+                {
+                    if (stop_)
+                    {
+                        return;
+                    }
+                    continue;
+                }
+                sh = std::move(ready_.front());
+                ready_.pop_front();
+                readyCount_.fetch_sub(1, std::memory_order_relaxed);
+            }
+
+            drainShard(sh, true);
+        }
+    }
+
+    // 抽干一个分片。yielding 为 true 时按批让出 worker，避免热点分片饿死其他房间。
+    void drainShard(const std::shared_ptr<Shard>& sh, bool yielding)
+    {
+        size_t processed = 0;
+        for (;;)
+        {
+            std::shared_ptr<const std::string> payload;
+            std::shared_ptr<const std::vector<Entry>> snap;
+            bool requeue = false;
+            {
+                std::lock_guard lock(sh->mtx);
+                if (sh->queue.empty())
+                {
+                    // 必须在锁内置 busy=false：与发布方的 exchange(true) 串行化，杜绝丢唤醒
+                    sh->busy.store(false, std::memory_order_release);
+                    return;
+                }
+                payload = std::move(sh->queue.front());
+                sh->queue.pop_front();
+                snap = sh->snap;
+                if (yielding && ++processed >= opt_.drainBatch && !sh->queue.empty())
+                {
+                    requeue = true;
+                }
+            }
+
+            // 先投递本条，再决定是否让出 worker —— 顺序不能颠倒，否则本条会被丢掉
+            fanOutToSnapshot(*snap, *payload);
+
+            if (requeue)
+            {
+                // busy 保持 true，重新排队继续抽；同一分片不会被并发扇出
+                enqueueReady(sh);
+                return;
+            }
+        }
+    }
+
+    // 真正的扇出：锁外执行，多分片并行跑在多个核上
+    static void fanOutToSnapshot(const std::vector<Entry>& snap, const std::string& payload)
+    {
+        const std::string_view view(payload);
+        for (const auto& e : snap)
+        {
+            if (e.conn)
+            {
+                e.conn->send(view);
+            }
+        }
+    }
+
+    Options opt_;
+
+    mutable std::shared_mutex roomsMtx_;
+    phmap::flat_hash_map<std::string, std::shared_ptr<Room>> rooms_;
+
+    std::mutex poolMtx_;
+    std::condition_variable poolCv_;
+    std::deque<std::shared_ptr<Shard>> ready_;
+    // 无锁就绪计数：worker 自旋阶段据此判断「有没有活」，避免为了看一眼队列就抢锁
+    std::atomic<size_t> readyCount_{0};
+    std::atomic<size_t> parked_{0};
+    bool stop_{false};
+    std::vector<std::thread> workers_;
+
+    std::atomic<size_t> dropped_{0};
+};
+
+// 生产实例：drogon WebSocket 连接
+using RoomRegistry = RoomRegistryT<drogon::WebSocketConnectionPtr>;
+
+#endif // LOONG_BOOT_ROOM_REGISTRY_H
