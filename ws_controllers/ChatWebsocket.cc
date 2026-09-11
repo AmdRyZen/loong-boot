@@ -7,7 +7,7 @@
 #include <drogon/HttpAppFramework.h>
 #include "utils/retry_utils.h"
 #include <memory_resource>
-#include <thread>
+#include <drogon/nosql/RedisSubscriber.h>
 
 struct Subscriber
 {
@@ -19,6 +19,21 @@ struct Subscriber
 
 void ChatWebsocket::produceKafkaAsync(std::string topicName, std::string payload)
 {
+    // 读取生产环境配置开关：通过 enable_kafka_persistence 控制是否异步落库 Kafka
+    static const bool enableKafka = []() {
+        try {
+            const auto& custom = drogon::app().getCustomConfig();
+            if (custom.isMember("enable_kafka_persistence")) {
+                return custom["enable_kafka_persistence"].asBool();
+            }
+        } catch (...) {}
+        return true;
+    }();
+
+    if (!enableKafka) {
+        return; // 开发或压测模式下跳过 Kafka 写入，保持极致 CPU 吞吐
+    }
+
     TbbCoroutinePool::instance().submit([topicName = std::move(topicName), payload = std::move(payload)] {
         rd_kafka_topic_t* topicPtr = kafka::KafkaManager::instance().getTopic(topicName);
         retryWithSleep([&]() {
@@ -120,6 +135,9 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                             {
                                 wsConn->send(json);
                             }
+
+                            // 生产环境持久化：私聊消息异步推至 Kafka 私聊主题
+                            produceKafkaAsync("chat_direct_topic", json);
                         }
                         else
                         {
@@ -147,7 +165,14 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                         std::string json{};
                         (void)glz::write_json(msg_vo, json);
 
+                        // 1. 本实例本地房间广播
                         chatRooms_.publish(topic, json);
+
+                        // 2. 分布式总线：同步广播给集群其他实例
+                        publishToCluster(topic, json);
+
+                        // 3. 生产环境持久化：异步投递到 Kafka 历史消息流
+                        produceKafkaAsync("chat_messages_topic", json);
                     });
                 }
             }
@@ -268,6 +293,91 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
     catch (const std::exception& e)
     {
         LOG_ERROR << "Error in handleConnectionClosed: " << e.what();
+    }
+}
+
+void ChatWebsocket::initClusterBus()
+{
+    // 延迟注册到框架启动事件中，确保 Redis 客户端已完全初始化并建立连接
+    HttpAppFramework::instance().registerBeginningAdvice([this]() {
+        try
+        {
+            auto redisClient = drogon::app().getRedisClient();
+            if (!redisClient)
+            {
+                LOG_WARN << "Redis client is not configured, running in standalone mode.";
+                return;
+            }
+
+            // 订阅分布式集群广播主题：通过 newSubscriber 获取长连接订阅者对象
+            clusterSubscriber_ = redisClient->newSubscriber();
+            clusterSubscriber_->subscribe(
+                "chat_cluster_bus",
+                [this](const std::string& channel, const std::string& message) {
+                    try
+                    {
+                        ClusterPacket packet{};
+                        if (glz::read_json(packet, message))
+                        {
+                            return;
+                        }
+
+                        // 避免本实例回环消费自己刚发出的消息
+                        if (packet.instId == instanceId_)
+                        {
+                            return;
+                        }
+
+                        // 收到来自其他实例的广播，推给本实例房间内的所有客户端
+                        chatRooms_.publish(packet.topic, packet.json);
+                    }
+                    catch (...)
+                    {
+                    }
+                });
+
+            LOG_INFO << "Redis Cluster Bus initialized successfully, instanceId: " << instanceId_;
+        }
+        catch (const std::exception& e)
+        {
+            LOG_WARN << "Failed to initialize Redis Cluster Bus: " << e.what();
+        }
+    });
+}
+
+void ChatWebsocket::publishToCluster(const std::string& topic, const std::string& json) const
+{
+    try
+    {
+        auto redisClient = drogon::app().getRedisClient();
+        if (!redisClient)
+        {
+            return;
+        }
+
+        ClusterPacket packet{
+            .instId = instanceId_,
+            .topic = topic,
+            .json = json
+        };
+
+        std::string payload{};
+        (void)glz::write_json(packet, payload);
+
+        // 极速异步发布至 Redis 广播频道 (非阻塞，零延迟开销)
+        redisClient->execCommandAsync(
+            [](const drogon::nosql::RedisResult&) {},
+            [](const std::exception& e) {
+                LOG_ERROR << "Redis publish error: " << e.what();
+            },
+            "PUBLISH %s %s",
+            "chat_cluster_bus",
+            payload.c_str()
+        );
+    }
+    catch (const std::exception& e)
+    {
+        LOG_ERROR << "publishToCluster exception: " << e.what();
     }
 }
 

@@ -8,6 +8,10 @@
 #include "parallel_hashmap/phmap.h"
 #include <memory_resource>
 
+#include <drogon/nosql/RedisClient.h>
+#include <random>
+#include <chrono>
+
 using namespace drogon;
 
 class ChatWebsocket final : public WebSocketController<ChatWebsocket>
@@ -19,11 +23,18 @@ public:
         connToUser_.reserve(estimatedUserCount);
         userNameToConn_.reserve(estimatedUserCount);
 
+        // 生成当前服务实例唯一的 Instance ID (防止集群跨机广播回环)
+        std::mt19937_64 rng(std::random_device{}());
+        instanceId_ = "inst_" + std::to_string(rng());
+
         // 注册定时任务：心跳探测与空闲超时连接驱逐
         HttpAppFramework::instance().getLoop()->runEvery(5.0, [this] {
             checkAndEvictIdleConnections();
             sendHeartbeatToAll();
         });
+
+        // 初始化 Redis 分布式集群网关总线
+        initClusterBus();
     }
 
     void handleNewMessage(const WebSocketConnectionPtr&,
@@ -46,7 +57,18 @@ private:
     phmap::flat_hash_set<std::string> excludedUsers_ = {"dog", "cat", "mouse"};
     mutable std::mutex mutex_;
 
+    std::string instanceId_;
+    std::shared_ptr<drogon::nosql::RedisSubscriber> clusterSubscriber_;
+    void initClusterBus();
+    void publishToCluster(const std::string& topic, const std::string& json) const;
     static void produceKafkaAsync(std::string topicName, std::string payload);
+
+    struct ClusterPacket
+    {
+        std::string instId;
+        std::string topic;
+        std::string json;
+    };
 
     void checkAndEvictIdleConnections();
 
