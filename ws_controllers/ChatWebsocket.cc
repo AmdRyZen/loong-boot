@@ -1,6 +1,7 @@
 #include "ChatWebsocket.h"
 #include "utils/redisUtils.h"
 #include "coroutinePool/TbbCoroutinePool.h"
+#include "utils/PrometheusMetrics.h"
 //#include "user.pb.h"
 #include <glaze/glaze.hpp>
 #include <drogon/HttpAppFramework.h>
@@ -70,6 +71,7 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
 
                 if (!msg_dto.action.empty() && msg_dto.action == "message")
                 {
+                    Metrics::PrometheusRegistry::instance().recordWsMessage();
                     // 异步提交给 TBB 纯净线程池：保持极速返回(38万+ QPS)，同时彻底杜绝 AsyncTask 协程帧泄漏
                     TbbCoroutinePool::instance().submit([this, topic, msg = std::move(msg_dto.msgContent), id, senderName]() {
                         chatMessageVo msg_vo{};
@@ -123,6 +125,8 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
             web_socket_connection->send(msg);
         }
     });
+
+    Metrics::PrometheusRegistry::instance().recordWsConnect();
 
     // 使用原子操作或无锁数据结构来减少锁竞争
     {
@@ -180,6 +184,7 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
         const std::string& topic = subscriber.topic_;
         const auto id = subscriber.id_;
         chatRooms_.unsubscribe(topic, id);
+        Metrics::PrometheusRegistry::instance().recordWsDisconnect();
         LOG_INFO << "Unsubscribed from topic: " << topic << ", ID: " << id;
 
         chatMessageVo msg_vo;

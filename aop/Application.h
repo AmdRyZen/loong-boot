@@ -17,6 +17,8 @@
 #include "kafkaManager/AsyncKafkaConsumer.h"
 #include "kafkaManager/AsyncKafkaConsumerOne.h"
 #include <tbb/global_control.h>
+#include "utils/TraceContext.h"
+#include "utils/PrometheusMetrics.h"
 
 inline TrieService trieService;
 static tbb::global_control tbb_limit(tbb::global_control::max_allowed_parallelism, std::thread::hardware_concurrency()); // 限制最大线程数
@@ -164,12 +166,55 @@ Application::Application()
         std::cout << std::endl;
     });
 
+    // 全局路由注册：/metrics 监控端点直接代码级注册，避免反射加载顺序失效
+    drogon::app().registerHandler(
+        "/metrics",
+        [](const drogon::HttpRequestPtr& req,
+           std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
+            const auto resp = drogon::HttpResponse::newHttpResponse();
+            resp->setStatusCode(drogon::k200OK);
+            resp->setContentTypeString("text/plain; version=0.0.4; charset=utf-8");
+            resp->setBody(Metrics::PrometheusRegistry::instance().exportPrometheusText());
+            resp->setExpiredTime(0);
+            callback(resp);
+        },
+        {drogon::Get});
+
+    // 全局分布式链路追踪 TraceId 拦截与注入
     drogon::app().registerPreRoutingAdvice([](const drogon::HttpRequestPtr& req,
                                               drogon::AdviceCallback&& acb,
                                               drogon::AdviceChainCallback&& accb) {
-        // todo ...
-        //LOG_INFO << "preRouting1!";
+        const std::string traceId = Trace::TraceContext::getOrCreateTraceId(req);
+        // 将 TraceId 存入请求上下文，供全链路 Controller/Service 使用
+        req->attributes()->insert("trace_id", traceId);
+        // 记录请求进入时间用于度量
+        const auto nowMs = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        req->attributes()->insert("req_start_us", nowMs);
+
         accb();
+    });
+
+    // 全局响应拦截：统一自动回填 X-Trace-Id 响应头，并记录 Prometheus 请求指标
+    drogon::app().registerPostHandlingAdvice([](const drogon::HttpRequestPtr& req,
+                                                const drogon::HttpResponsePtr& resp) {
+        if (!req || !resp) return;
+
+        // 回填 TraceId
+        if (req->attributes()->find("trace_id")) {
+            const auto traceId = req->attributes()->get<std::string>("trace_id");
+            resp->addHeader(std::string(Trace::TRACE_HEADER), traceId);
+        }
+
+        // 收集 Prometheus 统计指标
+        if (req->attributes()->find("req_start_us")) {
+            const auto startUs = req->attributes()->get<int64_t>("req_start_us");
+            const auto endUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            const double durationMs = static_cast<double>(endUs - startUs) / 1000.0;
+            Metrics::PrometheusRegistry::instance().recordHttpRequest(
+                std::string(req->methodString()), resp->statusCode(), durationMs);
+        }
     });
 }
 }  // namespace App

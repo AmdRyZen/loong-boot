@@ -173,6 +173,8 @@ set(MODEL_SOURCES_COMMON
         kafkaManager/AsyncKafkaConsumerOne.h
         utils/retry_utils.h
         utils/tbbUtils.h
+        utils/TraceContext.h
+        utils/PrometheusMetrics.h
         coroutinePool/TbbCoroutinePool.h
         coroutinePool/TbbCoroutinePool.cc
 )
@@ -189,6 +191,8 @@ target_sources(${PROJECT_NAME} PRIVATE
         utils/SqlDelete.h
         controllers/PlaintextCtrl.cc
         controllers/PlaintextCtrl.h
+        controllers/MetricsCtrl.cc
+        controllers/MetricsCtrl.h
         controllers/api_v1_User.cc
         controllers/api_v1_User.h
         controllers/api_v1_OpenApi.cc

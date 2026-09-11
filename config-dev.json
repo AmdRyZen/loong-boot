@@ -1,6 +1,6 @@
 {
   "app": {
-    "number_of_threads": 8,
+    "number_of_threads": 4,
     "enable_session": false,
     "session_timeout": 0,
     "document_root": "./",
@@ -31,7 +31,7 @@
         "is_recursive": true
       }
     ],
-    "max_connections": 1000000,
+    "max_connections": 100000,
     "max_connections_per_ip": 0,
     "load_dynamic_views": false,
     "dynamic_views_path": [
@@ -45,9 +45,9 @@
     },
     "log": {
       "log_path": "./log",
-      "logfile_base_name": "loong",
+      "logfile_base_name": "loong-dev",
       "log_size_limit": 100000000,
-      "log_level": "INFO"
+      "log_level": "DEBUG"
     },
     "run_as_daemon": false,
     "handle_sig_term": true,
