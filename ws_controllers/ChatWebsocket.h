@@ -33,9 +33,10 @@ public:
         std::mt19937_64 rng(std::random_device{}());
         instanceId_ = "inst_" + std::to_string(rng());
 
-        // 注册定时任务：空闲超时连接驱逐
+        // 注册定时任务：空闲超时连接驱逐 + 房间指标采集
         HttpAppFramework::instance().getLoop()->runEvery(5.0, [this] {
             checkAndEvictIdleConnections();
+            publishRoomMetrics();
         });
 
         // 初始化 Redis 分布式集群网关总线
@@ -132,6 +133,11 @@ private:
     }
 
     void checkAndEvictIdleConnections();
+
+    // 把 RoomRegistry 的房间侧快照推送到 Prometheus registry。
+    // 由 5 秒定时任务驱动：/metrics 抓取时就不必再去加房间表的锁，
+    // 代价是最多 5 秒的滞后（gauge 类指标可以接受）。
+    void publishRoomMetrics();
 
     // 把 room 内的消息投递到本地房间 + 集群总线（+ Kafka 持久化，已按需关闭）
     // 返回 false 表示本地分片积压达上限、消息被丢弃（调用方需计数并告知客户端）

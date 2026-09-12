@@ -54,6 +54,26 @@ public:
         wsDroppedMessages_.fetch_add(count, std::memory_order_relaxed);
     }
 
+    // 因空闲超时（60 秒未收到客户端任意帧）被服务端主动断开的连接数。
+    // 正常客户端会被 drogon 的协议层 Ping（默认 30s）+ 自动 Pong 保活，
+    // 因此该计数持续增长意味着客户端异常掉线（进程被杀 / 网络中断）而非正常退出。
+    void recordWsEvictedIdle(uint64_t count = 1) {
+        wsEvictedIdle_.fetch_add(count, std::memory_order_relaxed);
+    }
+
+    // 房间侧快照（由 ChatWebsocket 的 5 秒定时任务推送）。
+    // 这里存的是上一次采样的值：/metrics 抓取时无需再去加房间表的锁，
+    // 代价是最多 5 秒的滞后 —— 对 gauge 类指标完全够用。
+    void setRoomStats(uint64_t rooms,
+                      uint64_t shards,
+                      uint64_t subscribers,
+                      uint64_t maxRoomSubscribers) {
+        wsRoomsActive_.store(rooms, std::memory_order_relaxed);
+        wsRoomShards_.store(shards, std::memory_order_relaxed);
+        wsRoomSubscribers_.store(subscribers, std::memory_order_relaxed);
+        wsRoomMaxSubscribers_.store(maxRoomSubscribers, std::memory_order_relaxed);
+    }
+
     // 生成标准 Prometheus 文本格式导出
     std::string exportPrometheusText() const {
         std::ostringstream ss;
@@ -82,7 +102,24 @@ public:
            << "ws_messages_received_total " << wsTotalMessages_.load(std::memory_order_relaxed) << "\n\n"
            << "# HELP ws_messages_dropped_total Total WebSocket messages dropped due to backpressure.\n"
            << "# TYPE ws_messages_dropped_total counter\n"
-           << "ws_messages_dropped_total " << wsDroppedMessages_.load(std::memory_order_relaxed) << "\n\n";
+           << "ws_messages_dropped_total " << wsDroppedMessages_.load(std::memory_order_relaxed) << "\n\n"
+           << "# HELP ws_evicted_idle_total WebSocket connections force-closed after the 60s idle timeout.\n"
+           << "# TYPE ws_evicted_idle_total counter\n"
+           << "ws_evicted_idle_total " << wsEvictedIdle_.load(std::memory_order_relaxed) << "\n\n";
+
+        // 房间注册表度量（由 5 秒定时任务推送，最多 5 秒滞后）
+        ss << "# HELP ws_rooms_active Number of active chat rooms.\n"
+           << "# TYPE ws_rooms_active gauge\n"
+           << "ws_rooms_active " << wsRoomsActive_.load(std::memory_order_relaxed) << "\n"
+           << "# HELP ws_room_shards_active Number of non-empty shards across all rooms.\n"
+           << "# TYPE ws_room_shards_active gauge\n"
+           << "ws_room_shards_active " << wsRoomShards_.load(std::memory_order_relaxed) << "\n"
+           << "# HELP ws_room_subscribers_total Total subscribers across all rooms.\n"
+           << "# TYPE ws_room_subscribers_total gauge\n"
+           << "ws_room_subscribers_total " << wsRoomSubscribers_.load(std::memory_order_relaxed) << "\n"
+           << "# HELP ws_room_max_subscribers Subscriber count of the largest room (fanout cost driver).\n"
+           << "# TYPE ws_room_max_subscribers gauge\n"
+           << "ws_room_max_subscribers " << wsRoomMaxSubscribers_.load(std::memory_order_relaxed) << "\n\n";
 
         // HTTP 度量
         ss << "# HELP http_requests_total Total HTTP requests handled.\n"
@@ -126,6 +163,11 @@ private:
     std::atomic<int64_t> wsOnlineConnections_{0};
     std::atomic<uint64_t> wsTotalMessages_{0};
     std::atomic<uint64_t> wsDroppedMessages_{0};
+    std::atomic<uint64_t> wsEvictedIdle_{0};
+    std::atomic<uint64_t> wsRoomsActive_{0};
+    std::atomic<uint64_t> wsRoomShards_{0};
+    std::atomic<uint64_t> wsRoomSubscribers_{0};
+    std::atomic<uint64_t> wsRoomMaxSubscribers_{0};
 };
 
 } // namespace Metrics

@@ -360,6 +360,36 @@ class RoomRegistryT
         return opt_;
     }
 
+    // 一次性快照（单锁单遍），供周期性指标采集使用。
+    // 分开调 activeRooms()/activeShards()/totalSubscribers() 会各加一次锁、
+    // 且几次读数之间房间集合可能已变，得到的是一组自相矛盾的数。
+    struct Stats
+    {
+        size_t rooms = 0;              // 活跃房间数
+        size_t shards = 0;             // 全体房间的「非空分片」总数
+        size_t subscribers = 0;        // 全体房间的订阅者总数
+        size_t maxRoomSubscribers = 0; // 最大单房间订阅者数（扇出成本的关键指标）
+    };
+
+    Stats stats() const
+    {
+        std::shared_lock lock(roomsMtx_);
+        Stats s;
+        s.rooms = rooms_.size();
+        for (const auto& [name, r] : rooms_)
+        {
+            (void)name;
+            s.shards += r->nonEmptyShards.load(std::memory_order_relaxed);
+            const size_t n = r->subCount.load(std::memory_order_relaxed);
+            s.subscribers += n;
+            if (n > s.maxRoomSubscribers)
+            {
+                s.maxRoomSubscribers = n;
+            }
+        }
+        return s;
+    }
+
   private:
     struct Entry
     {

@@ -537,6 +537,7 @@ void ChatWebsocket::checkAndEvictIdleConnections()
                 if (idleNanos > idleTimeoutNanos)
                 {
                     LOG_WARN << "Evicting idle connection: " << name << " (idle > 60s)";
+                    Metrics::PrometheusRegistry::instance().recordWsEvictedIdle();
                     conn->forceClose(); // 主动切断死连接
                 }
             }
@@ -546,4 +547,11 @@ void ChatWebsocket::checkAndEvictIdleConnections()
     {
         LOG_ERROR << "Error in checkAndEvictIdleConnections: " << e.what();
     }
+}
+
+void ChatWebsocket::publishRoomMetrics()
+{
+    const auto s = roomRegistry_.stats();
+    Metrics::PrometheusRegistry::instance().setRoomStats(
+        s.rooms, s.shards, s.subscribers, s.maxRoomSubscribers);
 }
