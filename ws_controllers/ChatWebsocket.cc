@@ -489,7 +489,10 @@ void ChatWebsocket::checkAndEvictIdleConnections()
     try
     {
         const auto now = Subscriber::nowNanos();
-        // 60 秒无心跳/无交互视为僵尸连接
+        // 60 秒无交互视为僵尸连接。
+        // 注意：活动时间只在【收到客户端消息】时刷新（Subscriber::touch()），
+        // drogon 协议层的 ping/pong 不计入；因此「只收不发」的客户端也会被踢。
+        // 前端需要自行定期发心跳（当前 chat.html 尚未实现，属已知待办）。
         constexpr int64_t idleTimeoutNanos =
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::seconds(60)).count();
 

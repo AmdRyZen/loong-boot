@@ -56,6 +56,8 @@ int main(int argc, char* argv[])
     } catch (const std::exception& e)
     {
         std::cout << "Application: err  " << e.what() << std::endl;
+        // 启动/运行失败必须以非零码退出，否则 K8s、systemd、CI 都看不到失败
+        return 1;
     }
     return 0;
 }

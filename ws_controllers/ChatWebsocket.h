@@ -33,10 +33,9 @@ public:
         std::mt19937_64 rng(std::random_device{}());
         instanceId_ = "inst_" + std::to_string(rng());
 
-        // 注册定时任务：心跳探测与空闲超时连接驱逐
+        // 注册定时任务：空闲超时连接驱逐
         HttpAppFramework::instance().getLoop()->runEvery(5.0, [this] {
             checkAndEvictIdleConnections();
-            sendHeartbeatToAll();
         });
 
         // 初始化 Redis 分布式集群网关总线
@@ -51,8 +50,11 @@ public:
     void handleConnectionClosed(const WebSocketConnectionPtr&) override;
 
     WS_PATH_LIST_BEGIN
+    // 只注册精确路径 /chat。
+    // 原先还挂了 WS_ADD_PATH_VIA_REGEX("/[^/]*", Get)：任何「单段路径」都会被当成
+    // WebSocket 升级请求处理，既扩大了攻击面，又可能吞掉本该 404 的请求。
+    // /chat 由上面的精确匹配覆盖，删掉正则不影响客户端。
     WS_PATH_ADD("/chat");
-    WS_ADD_PATH_VIA_REGEX("/[^/]*", Get);
     WS_PATH_LIST_END
 
 private:
@@ -65,8 +67,6 @@ private:
     // 原先的 name -> 单连接 语义在「同名多连接」时会串号：旧连接断开时会把新连接的
     // 记录一并 erase 掉，导致新用户从此收不到私聊。
     phmap::parallel_flat_hash_map<std::string, std::vector<WebSocketConnectionPtr>> userNameToConn_;
-
-    phmap::flat_hash_set<std::string> excludedUsers_ = {"dog", "cat", "mouse"};
 
     // 保护 userNameToConn_ 的复合操作与遍历。
     // 读路径（私聊查表 / 定时任务遍历）走共享锁，连接注册与注销走独占锁，
@@ -143,54 +143,6 @@ private:
         // 恢复：取消下行注释，并确认 custom_config.enable_kafka_persistence 为 true。
         // produceKafkaAsync("chat_messages_topic", json);
         return ok;
-    }
-
-    void sendHeartbeatToAll()
-    {
-        // 先加共享锁做一次快照，再在锁外发送。
-        // 原实现无锁遍历 userNameToConn_，与 IO 线程的注册/注销并发修改容器 = UB。
-        std::vector<std::pair<std::string, WebSocketConnectionPtr>> snapshot;
-        {
-            std::shared_lock lock(connMutex_);
-            snapshot.reserve(userNameToConn_.size());
-            for (const auto& [name, sessions] : userNameToConn_)
-            {
-                for (const auto& conn : sessions)
-                {
-                    snapshot.emplace_back(name, conn);
-                }
-            }
-        }
-
-        roomRegistry_.publish("001", std::string("房间公告消息"));
-
-        // 遍历并发送心跳给 excludedUsers_ 内的用户
-        for (const auto& [userName, wsConnPtr] : snapshot)
-        {
-            // 跳过未连接或不在排除列表的用户
-            if (!wsConnPtr || !wsConnPtr->connected() || !excludedUsers_.contains(userName))
-                continue;
-
-            // monotonic_buffer_resource 不会自动回收，每轮显式 release 防止长期运行内存单调增长
-            thread_local std::pmr::monotonic_buffer_resource pool(1024 * 1024);
-            pool.release();
-
-            chatMessageVo messageVo{
-                .code = 200,
-                .id = 0,
-                .name = std::pmr::string(userName, &pool),
-                .message = std::pmr::string(std::format("{} 心跳检测 正常 这是定制消息", userName), &pool)
-            };
-
-            std::pmr::string json(&pool);
-            (void)glz::write_json(messageVo, json);
-
-            // 发送给客户端
-            wsConnPtr->send(json);
-
-            // [压测隔离] Kafka 推送已关闭（同上），避免压测时无消费者导致磁盘被写满。
-            // produceKafkaAsync("message_topic_one", std::string(json.data(), json.size()));
-        }
     }
 
     struct chatMessageDto
