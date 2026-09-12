@@ -294,7 +294,16 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 )
 
 # 处理测试子目录
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/CMakeLists.txt")
+#
+# 测试目标默认构建（本地与 CI 直接可用），生产/发布构建可用
+# -DBUILD_TESTING=OFF 关掉，避免连带编译测试可执行文件。
+# BUILD_TESTING 同时也是 CTest 模块的标准变量名，语义一致。
+option(BUILD_TESTING "构建单元测试目标" ON)
+
+if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/CMakeLists.txt")
+    # 必须在顶层启用 testing：否则 CTestTestfile.cmake 只生成在 test/ 下，
+    # 在 build 根目录执行 `ctest` 会报 "No tests were found"。
+    enable_testing()
     add_subdirectory(test)
 endif()
 

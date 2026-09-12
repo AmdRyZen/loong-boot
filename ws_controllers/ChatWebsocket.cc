@@ -11,49 +11,9 @@
 #include <vector>
 #include <drogon/nosql/RedisSubscriber.h>
 
-struct Subscriber
-{
-    std::string topic_;
-    std::string userName_;
-    RoomRegistry::SubscriberID id_{};
-
-    // 跨线程访问：IO 线程写入（收到任意帧即刷新），主循环定时任务读取（空闲驱逐）。
-    // 原先是非原子的 time_point —— 跨线程读写属于 data race（形式上 UB），
-    // 这里用原子量存 steady_clock 纳秒计数消除竞争。
-    static int64_t nowNanos()
-    {
-        return std::chrono::duration_cast<std::chrono::nanoseconds>(
-                   std::chrono::steady_clock::now().time_since_epoch())
-            .count();
-    }
-
-    void touch()
-    {
-        lastActiveNanos_.store(nowNanos(), std::memory_order_relaxed);
-    }
-
-    // 过载通知（503「消息未投递」）的按连接限流。
-    //
-    // 为什么必须限流：饱和时「丢弃」是 O(丢弃数) 的，而每条丢弃若都回一帧通知，
-    // 丢弃路径的成本就和真实投递一样高 —— 实测 30s 回声饱和压测里 14.36M 次丢弃
-    // 曾产生 14.36M 次额外 send（外加 1.6GB 逐条 WARN 日志）。
-    // 限流后既不静默（客户端仍会被明确告知过载），也不再随丢弃数线性放大。
-    //
-    // CAS 语义：只有成功把时间戳推进的那一方返回 true，天然去重，无需额外锁。
-    bool shouldSendOverloadNotice(int64_t minIntervalNanos = 1'000'000'000LL)
-    {
-        const int64_t now = nowNanos();
-        int64_t last = lastOverloadNoticeNanos_.load(std::memory_order_relaxed);
-        if (now - last < minIntervalNanos)
-        {
-            return false;
-        }
-        return lastOverloadNoticeNanos_.compare_exchange_strong(last, now, std::memory_order_relaxed);
-    }
-
-    std::atomic<int64_t> lastActiveNanos_{nowNanos()};
-    std::atomic<int64_t> lastOverloadNoticeNanos_{0};
-};
+// 注：Subscriber / Session / Core 的定义都在 ChatWebsocket.h 里。
+// Subscriber 原先定义在本文件，为了让定时器与启动回调能够按值捕获 Core
+//（而不是捕获 this）而整体上移到头文件。
 
 void ChatWebsocket::produceKafkaAsync(std::string topicName, std::string payload)
 {
@@ -114,17 +74,18 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                 auto& subscriber = wsConn->getContextRef<Subscriber>();
                 subscriber.touch();
             }
-            wsConn->send("pong_ms", WebSocketMessageType::Pong);
-            // 降级为 DEBUG：这是「每帧一条」的路径，而 config.json 的 log_level 是 INFO
-            // → 原来每个心跳都会落一行盘。前端本来就必须定期发心跳（60s 空闲驱逐只看
-            // handleNewMessage，协议层 ping/pong 不计入），所以连接数一上来就是
-            // 每秒数千行的纯噪声。连接存活与否已有 ws_evicted_idle_total 覆盖。
+            // 不再手动回 Pong：drogon 的 WebSocketConnectionImpl 收到对端的 Ping 帧时
+            // 已经自动回过一帧（见 lib/src/WebSocketConnectionImpl.cc 的 Ping 分支），
+            // 这里再回一次会让客户端收到两个 Pong，影响它按 Pong 计数做的 RTT/存活判断。
+            // 本分支只负责续期。
             LOG_DEBUG << "Received a ping";
             return;
         }
 
         if (type == WebSocketMessageType::Pong)
         {
+            // 客户端回的 Pong 会走到这里（drogon 只在收到【对端】帧时才回调），
+            // 据此续期 —— 所以「只收不发」的标准客户端不会被 60s 空闲驱逐误杀。
             if (wsConn->hasContext())
             {
                 auto& subscriber = wsConn->getContextRef<Subscriber>();
@@ -145,11 +106,14 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
             chatMessageDto msg_dto{};
             if (glz::read_json(msg_dto, msg))
             {
-                chatMessageVo err_msg{};
-                std::string json{};
-                (void)glz::write_json(err_msg, json);
-                wsConn->send(json, WebSocketMessageType::Text);
                 Metrics::PrometheusRegistry::instance().recordWsJsonParseError();
+
+                // 回一个可读的错误。原先回的是默认构造的空 VO，客户端只能收到
+                // {"code":-1,"id":0,"name":"","message":""} —— 既不知道原因，
+                // 也没法对应到具体请求（与 503/404 的 code 体系也不一致）。
+                wsConn->send(buildNoticeJson(-1, "系统通知", "消息格式错误：无法解析 JSON"),
+                             WebSocketMessageType::Text);
+
                 // 触发频率完全由客户端决定（狂发非法负载即可无限刷），必须限流。
                 // 是真错误所以不静默。行内给出「本次覆盖多少条」；
                 // 累计总量看 ws_json_parse_errors_total（限流会让日志少报，
@@ -166,13 +130,15 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
 
             // hasContext() 必须判：连接在 handleNewConnection 中途失败时上下文可能未落，
             // getContextRef 会直接解引用空指针（UB），而不是抛异常。
-            if (!wsConn->disconnected() && wsConn->hasContext())
+            //
+            // 用 connected() 而不是 !disconnected()：drogon 在 Connecting/Disconnecting
+            // 中间态下 send 会被 sendInLoop 静默丢弃，「尚未彻底关闭」并不等于「可投递」。
+            if (wsConn->connected() && wsConn->hasContext())
             {
                 auto& subscriber = wsConn->getContextRef<Subscriber>();
                 subscriber.touch();
                 const std::string& topic = subscriber.topic_;
                 const std::string& senderName = subscriber.userName_;
-                const auto id = subscriber.id_;
 
                 if (!msg_dto.action.empty() && msg_dto.action == "message")
                 {
@@ -184,10 +150,11 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                         const std::string targetUser(msg_dto.toUser);
 
                         // 拷贝目标会话列表后在锁外发送，避免持锁做 IO
-                        std::vector<WebSocketConnectionPtr> targets;
+                        std::vector<Session> targets;
                         {
-                            std::shared_lock lock(connMutex_);
-                            if (const auto it = userNameToConn_.find(targetUser); it != userNameToConn_.end())
+                            std::shared_lock lock(core_->connMutex);
+                            if (const auto it = core_->userNameToConn.find(targetUser);
+                                it != core_->userNameToConn.end())
                             {
                                 targets = it->second;
                             }
@@ -195,7 +162,7 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
 
                         chatMessageVo msg_vo{};
                         msg_vo.code = 200;
-                        msg_vo.id = id;
+                        msg_vo.id = nextMessageId();
                         msg_vo.name = std::string_view(senderName);
                         msg_vo.message = std::format("[私聊] {}", std::string_view(msg_dto.msgContent));
 
@@ -205,15 +172,15 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                         // 投递给目标用户的所有在线会话（多端登录），发送者自己只回显一次
                         bool delivered = false;
                         bool echoedToSender = false;
-                        for (const auto& conn : targets)
+                        for (const auto& s : targets)
                         {
-                            if (!conn || !conn->connected())
+                            if (!s.conn || !s.conn->connected())
                             {
                                 continue;
                             }
-                            conn->send(json);
+                            s.conn->send(json);
                             delivered = true;
-                            if (conn == wsConn)
+                            if (s.conn == wsConn)
                             {
                                 echoedToSender = true;
                             }
@@ -232,9 +199,9 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                             wsConn->send(json);
                         }
 
-                        // [压测隔离] Kafka 推送已关闭（同上），避免压测时无消费者导致磁盘被写满。
-                        // 生产环境持久化：私聊消息异步推至 Kafka 私聊主题
-                        // produceKafkaAsync("chat_direct_topic", json);
+                        // 生产环境持久化：私聊消息异步推至 Kafka 私聊主题。
+                        // 受 custom_config.enable_kafka_persistence 控制，关闭时零开销。
+                        produceKafkaAsync("chat_direct_topic", json);
                         return;
                     }
 
@@ -244,7 +211,7 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                     // 也不再经 TBB 池（多线程池会打乱入队顺序，下游再怎么串行都救不回来）。
                     chatMessageVo msg_vo{};
                     msg_vo.code = 200;
-                    msg_vo.id = id;
+                    msg_vo.id = nextMessageId();
                     msg_vo.name = std::string_view(senderName);
                     msg_vo.message = std::move(msg_dto.msgContent);
 
@@ -254,7 +221,7 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                     // 1. 本实例本地房间广播（分片并行扇出）
                     // 2. 分布式总线：同步广播给集群其他实例
                     // 3. 生产环境持久化：异步投递到 Kafka 历史消息流
-                    if (!fanOutRoom(topic, json))
+                    if (!fanOutRoom(*core_, topic, json))
                     {
                         auto& metrics = Metrics::PrometheusRegistry::instance();
                         metrics.recordWsMessageDropped();
@@ -334,14 +301,16 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
         //
         // 取不到 loop 时（返回 nullptr）句柄按「本线程」处理，即回退到逐份直接 send，
         // 语义与优化前一致，只是没有加速，不会出错。
-        subscriber->id_ = roomRegistry_.subscribe(
+        subscriber->id_ = core_->roomRegistry.subscribe(
             topic, wsConn, TrantorLoopHandle{trantor::EventLoop::getEventLoopOfCurrentThread()});
 
         // 同一昵称允许多端并存：注册为「昵称 -> 会话列表」，多端都能收到私聊。
         // 原实现用 emplace 存单连接，同名时静默失败，且断开时按昵称 erase 会误删新连接。
+        // 同时把 Subscriber 一并存下来，供空闲驱逐在锁内直接取用（避免跨线程读连接的 context）。
         {
-            std::unique_lock lock(connMutex_);
-            userNameToConn_[userName].push_back(wsConn);
+            std::unique_lock lock(core_->connMutex);
+            core_->userNameToConn[userName].push_back(Session{wsConn, subscriber});
+            core_->connCount.fetch_add(1, std::memory_order_relaxed);
         }
 
         // 每连接一条的诊断信息，不是「有问题」的信号 → DEBUG
@@ -350,7 +319,7 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
 
         chatMessageVo msg_vo;
         msg_vo.code = 200;
-        msg_vo.id = subscriber->id_;
+        msg_vo.id = nextMessageId();
         msg_vo.name = topic;
         msg_vo.message = std::format("欢迎 {} 加入我们 {}", userName, topic);
 
@@ -358,8 +327,11 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
         std::string json{};
         (void)glz::write_json(msg_vo, json);
 
-        // 与聊天消息共用同一房间的发布锁，保证「入群公告」与其他消息的相对顺序稳定
-        if (!fanOutRoom(topic, json))
+        // 与聊天消息共用同一房间的发布锁，保证「入群公告」与其他消息的相对顺序稳定。
+        //
+        // broadcastToCluster = false：在线状态是本实例的本地事实。广播给其他实例后，
+        // 那边的同名用户会收到与自己无关的「XX 已加入」；退群公告同理（见下）。
+        if (!fanOutRoom(*core_, topic, json, /*broadcastToCluster=*/false))
         {
             Metrics::PrometheusRegistry::instance().recordWsMessageDropped();
             // 与消息丢弃共用同一个限流器：同属「房间积压」这一种过载现象。
@@ -375,6 +347,17 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
     catch (const std::exception& e)
     {
         LOG_ERROR << "Error in handleNewConnection: " << e.what();
+
+        // 半初始化状态不能留：连接若已建立却没登记完整，就主动关掉，让
+        // handleConnectionClosed 走完整清理路径。
+        //
+        // 否则会出现「活着但不在 userNameToConn 里」的僵尸连接 ——
+        // 空闲驱逐是按 userNameToConn 遍历的，看不到它；而它每帧都 touch()，
+        // 于是永远不会被驱逐（原实现正是如此，会一直占着连接与内存）。
+        if (wsConn)
+        {
+            wsConn->forceClose();
+        }
     }
 }
 
@@ -382,7 +365,9 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
 {
     try
     {
-        // 未登记成功的连接直接放过，避免 getContextRef 解引用空上下文（UB）
+        // 未登记成功的连接直接放过，避免 getContextRef 解引用空上下文（UB）。
+        // 这条路径与 handleNewConnection 的 setContext 失败路径对称：
+        // 那时 recordWsConnect 也没记过，所以这里不记 disconnect 是正确的。
         if (!wsConn || !wsConn->hasContext())
         {
             LOG_WARN << "Closed a connection without subscriber context, skip cleanup";
@@ -397,27 +382,48 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
         // 只摘除「本连接自己」这一条记录：
         // 原实现按昵称直接 erase，同名的新连接会被旧连接的断开事件误删，
         // 导致新用户从此收不到私聊、且残留幽灵条目。
+        bool removed = false;
         {
-            std::unique_lock lock(connMutex_);
-            if (const auto it = userNameToConn_.find(userName); it != userNameToConn_.end())
+            std::unique_lock lock(core_->connMutex);
+            if (const auto it = core_->userNameToConn.find(userName);
+                it != core_->userNameToConn.end())
             {
                 auto& sessions = it->second;
-                std::erase(sessions, wsConn);
+                const auto before = sessions.size();
+                std::erase_if(sessions,
+                              [&wsConn](const Session& s) { return s.conn == wsConn; });
+                removed = sessions.size() != before;
                 if (sessions.empty())
                 {
-                    userNameToConn_.erase(it);
+                    core_->userNameToConn.erase(it);
                 }
             }
         }
+        if (removed)
+        {
+            core_->connCount.fetch_sub(1, std::memory_order_relaxed);
+        }
         LOG_DEBUG << "Removed user: " << userName;
 
-        roomRegistry_.unsubscribe(topic, id);
+        // 先记 disconnect 再做 unsubscribe：unsubscribe 万一抛异常（例如分配失败），
+        // 也不能让指标与本地登记失衡。recordWsConnect 已在建连路径记过，这里必须成对。
         Metrics::PrometheusRegistry::instance().recordWsDisconnect();
+
+        try
+        {
+            core_->roomRegistry.unsubscribe(topic, id);
+        }
+        catch (const std::exception& e)
+        {
+            // RoomRegistry 内部有锁，抛异常只可能是分配失败；记录后继续走公告流程。
+            // 残留条目由房间回收兜底，不会永久泄漏。
+            LOG_ERROR << "unsubscribe failed for topic " << topic << ", ID: " << id << ": " << e.what();
+        }
         LOG_DEBUG << "Unsubscribed from topic: " << topic << ", ID: " << id;
 
         chatMessageVo msg_vo;
         msg_vo.code = 200;
-        msg_vo.id = id;
+        msg_vo.id = nextMessageId();
         msg_vo.name = topic;
         msg_vo.message = std::format("{} 已离开 {}", userName, topic);
 
@@ -425,8 +431,9 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
         std::string json{};
         (void)glz::write_json(msg_vo, json);
 
-        // 与聊天消息共用同一房间的发布锁，保证「离群公告」与其他消息的相对顺序稳定
-        if (!fanOutRoom(topic, json))
+        // 与聊天消息共用同一房间的发布锁，保证「离群公告」与其他消息的相对顺序稳定。
+        // 同样不跨实例广播（理由见 handleNewConnection 的入群公告）。
+        if (!fanOutRoom(*core_, topic, json, /*broadcastToCluster=*/false))
         {
             Metrics::PrometheusRegistry::instance().recordWsMessageDropped();
             // 同上：与消息丢弃共用限流器。
@@ -466,8 +473,11 @@ bool ChatWebsocket::clusterBusEnabled()
 
 void ChatWebsocket::initClusterBus()
 {
-    // 延迟注册到框架启动事件中，确保 Redis 客户端已完全初始化并建立连接
-    HttpAppFramework::instance().registerBeginningAdvice([this]() {
+    // 延迟注册到框架启动事件中，确保 Redis 客户端已完全初始化并建立连接。
+    //
+    // 按值捕获 core_（shared_ptr）而不是 this：回调持有的引用会让 Core 活到回调结束，
+    // 因此不依赖「控制器一定比定时器/回调活得久」这一脆弱的静态析构顺序假设。
+    HttpAppFramework::instance().registerBeginningAdvice([core = core_] {
         try
         {
             if (!clusterBusEnabled())
@@ -488,10 +498,10 @@ void ChatWebsocket::initClusterBus()
             }
 
             // 订阅分布式集群广播主题：通过 newSubscriber 获取长连接订阅者对象
-            clusterSubscriber_ = redisClient->newSubscriber();
-            clusterSubscriber_->subscribe(
+            core->clusterSubscriber = redisClient->newSubscriber();
+            core->clusterSubscriber->subscribe(
                 "chat_cluster_bus",
-                [this](const std::string& channel, const std::string& message) {
+                [core](const std::string& channel, const std::string& message) {
                     try
                     {
                         ClusterPacket packet{};
@@ -501,20 +511,20 @@ void ChatWebsocket::initClusterBus()
                         }
 
                         // 避免本实例回环消费自己刚发出的消息
-                        if (packet.instId == instanceId_)
+                        if (packet.instId == core->instanceId)
                         {
                             return;
                         }
 
                         // 收到来自其他实例的广播，推给本实例房间内的所有客户端（同样分片并行扇出）
-                        roomRegistry_.publish(packet.topic, packet.json);
+                        core->roomRegistry.publish(packet.topic, packet.json);
                     }
                     catch (...)
                     {
                     }
                 });
 
-            LOG_DEBUG << "Redis Cluster Bus initialized successfully, instanceId: " << instanceId_;
+            LOG_DEBUG << "Redis Cluster Bus initialized successfully, instanceId: " << core->instanceId;
         }
         catch (const std::exception& e)
         {
@@ -523,7 +533,7 @@ void ChatWebsocket::initClusterBus()
     });
 }
 
-void ChatWebsocket::publishToCluster(const std::string& topic, const std::string& json) const
+void ChatWebsocket::publishToCluster(const Core& core, const std::string& topic, const std::string& json)
 {
     // 未启用集群总线时直接返回：既省开销，也避免踩 drogon getRedisClient 的空条目坑
     if (!clusterBusEnabled())
@@ -533,7 +543,13 @@ void ChatWebsocket::publishToCluster(const std::string& topic, const std::string
 
     try
     {
-        // fast 客户端按线程持有（IOThreadStorage），调用线程即其所属 loop 线程
+        // fast 客户端按线程持有（IOThreadStorage），调用线程即其所属 loop 线程。
+        //
+        // ⚠️ 必须从 loop 线程调用：getFastRedisClient() 在非 loop 线程会越界访问
+        //（IOThreadStorage 用 getCurrentThreadIndex() 索引，无 loop 时返回 SIZE_MAX），
+        // 且 execCommandAsync 首行就 assertInLoopThread（失败会 LOG_FATAL + exit）。
+        // 本函数的调用方（handleNewMessage / handleNewConnection / handleConnectionClosed）
+        // 都在连接所属的 IO 线程内，满足该前提。
         auto redisClient = drogon::app().getFastRedisClient();
         if (!redisClient)
         {
@@ -541,7 +557,7 @@ void ChatWebsocket::publishToCluster(const std::string& topic, const std::string
         }
 
         ClusterPacket packet{
-            .instId = instanceId_,
+            .instId = core.instanceId,
             .topic = topic,
             .json = json
         };
@@ -566,7 +582,7 @@ void ChatWebsocket::publishToCluster(const std::string& topic, const std::string
     }
 }
 
-void ChatWebsocket::checkAndEvictIdleConnections()
+void ChatWebsocket::checkAndEvictIdleConnections(Core& core)
 {
     try
     {
@@ -577,51 +593,50 @@ void ChatWebsocket::checkAndEvictIdleConnections()
         //   1. 业务文本消息（action == "message" / "ping" 等）；
         //   2. drogon 协议层自动收发的 Ping/Pong —— drogon 的 HttpServer 对每条
         //      WebSocket 连接默认执行 setPingMessage("", 30s)，即每 30 秒主动发一次
-        //      Ping，浏览器/undici 等标准实现会自动回 Pong，从而触发 touch()。
+        //      Ping，浏览器/undici 等标准实现会自动回 Pong；客户端回的 Pong 会经
+        //      WebSocketConnectionImpl 交给 handleNewMessage → touch()。
         // 因此「只收不发」的客户端【不会】被误杀；只有真正失联（不回 Pong）的连接
         // 才会在 60 秒后被驱逐。实测：不自动回 Pong 的裸客户端在空闲 64.8 秒时被踢。
+        //
+        // 注：服务端自己发的协议层 Ping 不会进 handleNewMessage（drogon 只在收到
+        // 【对端】的 Ping/Pong 帧时才回调），所以协议层心跳不会替失联连接续期。
         //
         // chat.html 仍会额外发应用层心跳（action="ping"，25 秒一次），
         // 用于探测「协议栈还活着但前端 JS 已卡死」的场景，属于纵深防御而非必需。
         constexpr int64_t idleTimeoutNanos =
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::seconds(60)).count();
 
-        // 先在共享锁内做一次快照，再在锁外做 connected()/forceClose()，
-        // 避免长时间独占锁阻塞 IO 线程的连接注册与注销。
-        std::vector<std::pair<WebSocketConnectionPtr, std::string>> snapshot;
+        // 先在共享锁内做一次快照（连 Subscriber 一起拷出来），再在锁外判定与关闭。
+        //
+        // 快照带 Subscriber 是关键：判定完全不需要再碰 WebSocketConnection 的 context
+        // —— drogon 的 connected()/hasContext()/getContextRef() 读的都是非原子成员，
+        // 从主循环定时器跨线程调用属于 data race（形式上 UB）。Subscriber 里的
+        // lastActiveNanos_ 是原子量，跨线程读安全。
+        std::vector<Session> snapshot;
         {
-            std::shared_lock lock(connMutex_);
-            snapshot.reserve(userNameToConn_.size());
-            for (const auto& [name, sessions] : userNameToConn_)
+            std::shared_lock lock(core.connMutex);
+            snapshot.reserve(core.connCount.load(std::memory_order_relaxed));
+            for (const auto& [name, sessions] : core.userNameToConn)
             {
-                for (const auto& conn : sessions)
-                {
-                    snapshot.emplace_back(conn, name);
-                }
+                (void)name;
+                snapshot.insert(snapshot.end(), sessions.begin(), sessions.end());
             }
         }
 
-        for (const auto& [conn, name] : snapshot)
+        for (const auto& s : snapshot)
         {
-            if (!conn)
+            if (!s.conn || !s.sub)
             {
                 continue;
             }
-            if (!conn->connected())
+            const auto idleNanos = now - s.sub->lastActiveNanos_.load(std::memory_order_relaxed);
+            if (idleNanos > idleTimeoutNanos)
             {
-                conn->forceClose();
-                continue;
-            }
-            if (conn->hasContext())
-            {
-                const auto& sub = conn->getContextRef<Subscriber>();
-                const auto idleNanos = now - sub.lastActiveNanos_.load(std::memory_order_relaxed);
-                if (idleNanos > idleTimeoutNanos)
-                {
-                    LOG_WARN << "Evicting idle connection: " << name << " (idle > 60s)";
-                    Metrics::PrometheusRegistry::instance().recordWsEvictedIdle();
-                    conn->forceClose(); // 主动切断死连接
-                }
+                LOG_WARN << "Evicting idle connection: " << s.sub->userName_ << " (idle > 60s)";
+                Metrics::PrometheusRegistry::instance().recordWsEvictedIdle();
+                // forceClose 内部走 runInLoop 投递到连接所属 loop，跨线程调用安全；
+                // 对已断开的连接是幂等的 no-op。
+                s.conn->forceClose();
             }
         }
     }
@@ -631,14 +646,13 @@ void ChatWebsocket::checkAndEvictIdleConnections()
     }
 }
 
-void ChatWebsocket::publishRoomMetrics()
+void ChatWebsocket::publishRoomMetrics(const Core& core)
 {
     auto& m = Metrics::PrometheusRegistry::instance();
-    const auto s = roomRegistry_.stats();
+    const auto s = core.roomRegistry.stats();
     m.setRoomStats(s.rooms, s.shards, s.subscribers, s.maxRoomSubscribers);
     // 扇出分组效果（counter，看增量）：batches = 唤醒次数，deliveries = 实际份数
-    m.setFanoutStats(roomRegistry_.inLoopDeliveries(),
-                     roomRegistry_.crossThreadBatches(),
-                     roomRegistry_.crossThreadDeliveries());
+    m.setFanoutStats(core.roomRegistry.inLoopDeliveries(),
+                     core.roomRegistry.crossThreadBatches(),
+                     core.roomRegistry.crossThreadDeliveries());
 }
-

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <format>
 #include <memory_resource>
 #include <shared_mutex>
 #include <string>
@@ -17,8 +18,10 @@
 #include <thread>
 #include <vector>
 
+// getpid()：用于生成可诊断的实例 ID（见构造函数）
+#include <unistd.h>
+
 #include <drogon/nosql/RedisClient.h>
-#include <random>
 #include <chrono>
 
 using namespace drogon;
@@ -26,19 +29,24 @@ using namespace drogon;
 class ChatWebsocket final : public WebSocketController<ChatWebsocket>
 {
 public:
-    ChatWebsocket() : roomRegistry_(makeFanoutOptions())
+    ChatWebsocket() : core_(std::make_shared<Core>(makeFanoutOptions()))
     {
-        constexpr size_t estimatedUserCount = 10000; // 可用配置替代硬编码
-        userNameToConn_.reserve(estimatedUserCount);
+        // 生成当前服务实例唯一的 Instance ID（防止集群跨机广播回环）。
+        // 用「进程号 + 启动纳秒时间戳」而不是 std::random_device：
+        // 同样唯一（同机 PID 不同、跨机时间戳不同），但不会像 random_device 那样
+        // 在某些平台上阻塞或在熵不足时抛异常，出问题时也能直接从 ID 看出是哪个进程。
+        core_->instanceId =
+            std::format("inst_{}_{}", static_cast<long long>(::getpid()), Subscriber::nowNanos());
 
-        // 生成当前服务实例唯一的 Instance ID (防止集群跨机广播回环)
-        std::mt19937_64 rng(std::random_device{}());
-        instanceId_ = "inst_" + std::to_string(rng());
-
-        // 注册定时任务：空闲超时连接驱逐 + 房间指标采集
-        HttpAppFramework::instance().getLoop()->runEvery(5.0, [this] {
-            checkAndEvictIdleConnections();
-            publishRoomMetrics();
+        // 注册定时任务：空闲超时连接驱逐 + 房间指标采集。
+        //
+        // 回调按值捕获 core_（shared_ptr），而不是捕获 this：
+        // 回调持有的引用会让 Core 活到本次回调结束，因此即使控制器已析构、
+        // 或静态析构顺序与预期不同，也不会出现 use-after-free。
+        // （原先捕获 this 且丢弃了 TimerId，退出阶段存在悬空访问窗口。）
+        HttpAppFramework::instance().getLoop()->runEvery(5.0, [core = core_] {
+            checkAndEvictIdleConnections(*core);
+            publishRoomMetrics(*core);
         });
 
         // 初始化 Redis 分布式集群网关总线
@@ -61,25 +69,100 @@ public:
     WS_PATH_LIST_END
 
 private:
-    // 房间注册表：按订阅者分片 + 多核并行扇出，严格保序。
-    // 取代了原先的 drogon::PubSubService（它单线程扇出，房间越大越慢）
-    // 与 RoomSerialDispatcher（保序职责已内聚到 RoomRegistry 的房间级发布锁）。
-    RoomRegistry roomRegistry_;
+    // ── 单连接状态（存在 WebSocketConnection 的 context 里，每条连接一份）──────
+    struct Subscriber
+    {
+        std::string topic_;
+        std::string userName_;
+        RoomRegistry::SubscriberID id_{};
 
-    // 用户名 -> 该用户名下的所有在线会话（同一昵称允许多端并存，多端都能收到私聊）
-    // 原先的 name -> 单连接 语义在「同名多连接」时会串号：旧连接断开时会把新连接的
-    // 记录一并 erase 掉，导致新用户从此收不到私聊。
-    phmap::parallel_flat_hash_map<std::string, std::vector<WebSocketConnectionPtr>> userNameToConn_;
+        // 跨线程访问：IO 线程写入（收到任意帧即刷新），主循环定时任务读取（空闲驱逐）。
+        // 原先是非原子的 time_point —— 跨线程读写属于 data race（形式上 UB），
+        // 这里用原子量存 steady_clock 纳秒计数消除竞争。
+        static int64_t nowNanos()
+        {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        }
 
-    // 保护 userNameToConn_ 的复合操作与遍历。
-    // 读路径（私聊查表 / 定时任务遍历）走共享锁，连接注册与注销走独占锁，
-    // 彻底消除原实现「无锁遍历 vs IO 线程 emplace/erase」的数据竞争。
-    mutable std::shared_mutex connMutex_;
+        void touch()
+        {
+            lastActiveNanos_.store(nowNanos(), std::memory_order_relaxed);
+        }
 
-    std::string instanceId_;
-    std::shared_ptr<drogon::nosql::RedisSubscriber> clusterSubscriber_;
+        // 过载通知（503「消息未投递」）的按连接限流。
+        //
+        // 为什么必须限流：饱和时「丢弃」是 O(丢弃数) 的，而每条丢弃若都回一帧通知，
+        // 丢弃路径的成本就和真实投递一样高 —— 实测 30s 回声饱和压测里 14.36M 次丢弃
+        // 曾产生 14.36M 次额外 send（外加 1.6GB 逐条 WARN 日志）。
+        // 限流后既不静默（客户端仍会被明确告知过载），也不再随丢弃数线性放大。
+        //
+        // CAS 语义：只有成功把时间戳推进的那一方返回 true，天然去重，无需额外锁。
+        bool shouldSendOverloadNotice(int64_t minIntervalNanos = 1'000'000'000LL)
+        {
+            const int64_t now = nowNanos();
+            int64_t last = lastOverloadNoticeNanos_.load(std::memory_order_relaxed);
+            if (now - last < minIntervalNanos)
+            {
+                return false;
+            }
+            return lastOverloadNoticeNanos_.compare_exchange_strong(
+                last, now, std::memory_order_relaxed);
+        }
+
+        std::atomic<int64_t> lastActiveNanos_{nowNanos()};
+        std::atomic<int64_t> lastOverloadNoticeNanos_{0};
+    };
+
+    // 一个在线会话：连接 + 它的 Subscriber。
+    //
+    // 快照里同时带上 Subscriber 的 shared_ptr，是为了让空闲驱逐**完全不必**再去访问
+    // WebSocketConnection 的 context —— drogon 的 hasContext()/getContextRef() 读的是
+    // 非原子成员（WebSocketConnection.h 的 contextPtr_），从主循环定时器跨线程调用
+    // 属于 data race（形式上 UB）。Subscriber 里的字段都是原子量，跨线程读是安全的。
+    struct Session
+    {
+        WebSocketConnectionPtr conn;
+        std::shared_ptr<Subscriber> sub;
+    };
+
+    // ── 共享状态 ─────────────────────────────────────────────────────────────
+    // 用 shared_ptr 持有：定时器与启动回调按值捕获它，让这些状态的生命周期不再依赖
+    // 「控制器一定比定时器活得久」这一脆弱假设（drogon 的静态析构顺序并无保证）。
+    struct Core
+    {
+        explicit Core(RoomRegistry::Options opt) : roomRegistry(std::move(opt))
+        {
+        }
+
+        // 房间注册表：按订阅者分片 + 多核并行扇出，严格保序。
+        // 取代了原先的 drogon::PubSubService（它单线程扇出，房间越大越慢）
+        // 与 RoomSerialDispatcher（保序职责已内聚到 RoomRegistry 的房间级发布锁）。
+        RoomRegistry roomRegistry;
+
+        // 用户名 -> 该用户名下的所有在线会话（同一昵称允许多端并存，多端都能收到私聊）
+        // 原先的 name -> 单连接 语义在「同名多连接」时会串号：旧连接断开时会把新连接的
+        // 记录一并 erase 掉，导致新用户从此收不到私聊。
+        phmap::parallel_flat_hash_map<std::string, std::vector<Session>> userNameToConn;
+
+        // 保护 userNameToConn 的复合操作与遍历。
+        // 读路径（私聊查表 / 定时任务遍历）走共享锁，连接注册与注销走独占锁，
+        // 彻底消除原实现「无锁遍历 vs IO 线程 emplace/erase」的数据竞争。
+        mutable std::shared_mutex connMutex;
+
+        // 在线连接总数：只用于给驱逐快照的 reserve 做估算。
+        //（原先按「用户数」预留，同名多端时会严重低估，导致每次快照都重新分配。）
+        std::atomic<size_t> connCount{0};
+
+        std::string instanceId;
+        std::shared_ptr<drogon::nosql::RedisSubscriber> clusterSubscriber;
+    };
+
+    std::shared_ptr<Core> core_;
+
     void initClusterBus();
-    void publishToCluster(const std::string& topic, const std::string& json) const;
+    static void publishToCluster(const Core& core, const std::string& topic, const std::string& json);
     static void produceKafkaAsync(std::string topicName, std::string payload);
 
     // 集群总线开关：读 custom_config.enable_cluster_bus，缺省为 false。
@@ -134,12 +217,23 @@ private:
         return opt;
     }
 
-    void checkAndEvictIdleConnections();
+    // 下面两个都由 5 秒定时任务驱动，因此做成静态函数 + 显式传入 Core：
+    // 定时器回调捕获的是 core_（shared_ptr），不依赖控制器的生命周期。
+    static void checkAndEvictIdleConnections(Core& core);
 
     // 把 RoomRegistry 的房间侧快照与扇出分组计数推送到 Prometheus registry。
     // 由 5 秒定时任务驱动：/metrics 抓取时就不必再去加房间表的锁，
     // 代价是最多 5 秒的滞后（gauge 类指标可以接受；counter 看增量也不受影响）。
-    void publishRoomMetrics();
+    static void publishRoomMetrics(const Core& core);
+
+    // 全局单调消息序号（进程内唯一）。
+    // 原先用 subscriber.id_（RoomRegistry 的房间内自增订阅号）当消息 id ——
+    // 同一发送者的所有消息 id 相同、跨房间重复，客户端若拿它做去重/排序会错乱。
+    static uint64_t nextMessageId() noexcept
+    {
+        static std::atomic<uint64_t> seq{0};
+        return seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
 
     // ── 客户端可控频率的日志限流 ────────────────────────────────────────────
     //
@@ -157,15 +251,25 @@ private:
     loong::log::RateLimiter overloadLogLimiter_{1000};
     loong::log::RateLimiter jsonParseErrorLogLimiter_{1000};
 
-    // 把 room 内的消息投递到本地房间 + 集群总线（+ Kafka 持久化，已按需关闭）
-    // 返回 false 表示本地分片积压达上限、消息被丢弃（调用方需计数并告知客户端）
-    bool fanOutRoom(const std::string& topic, const std::string& json)
+    // 把 room 内的消息投递到本地房间（+ 集群总线 + Kafka 持久化，后两者按需开启）
+    // 返回 false 表示「任一分片积压达上限 → 整条消息未入队」（调用方需计数并告知客户端）
+    //
+    // broadcastToCluster：是否把这条消息同步广播给集群其他实例。
+    //   聊天消息 → true；入群/退群公告 → false。
+    //   公告只描述「本实例上某个连接的状态变化」，而其他实例上可能恰有同名用户在
+    //   同一房间 —— 广播过去会让对方收到「XX 已离开」这种与自己无关的误导信息。
+    bool fanOutRoom(Core& core, const std::string& topic, const std::string& json,
+                    bool broadcastToCluster = true)
     {
-        const bool ok = roomRegistry_.publish(topic, json);
-        publishToCluster(topic, json);
-        // [压测隔离] Kafka 推送已关闭：压测只生产不消费会把磁盘写满。
-        // 恢复：取消下行注释，并确认 custom_config.enable_kafka_persistence 为 true。
-        // produceKafkaAsync("chat_messages_topic", json);
+        const bool ok = core.roomRegistry.publish(topic, json);
+        if (broadcastToCluster)
+        {
+            publishToCluster(core, topic, json);
+        }
+        // Kafka 持久化：由 custom_config.enable_kafka_persistence 控制，
+        // 关闭时 produceKafkaAsync 首行即短路返回（零开销）。
+        // 压测/开发环境务必置 false —— 只生产不消费会把磁盘写满。
+        produceKafkaAsync("chat_messages_topic", json);
         return ok;
     }
 

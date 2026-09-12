@@ -6,6 +6,7 @@
 //   3. 背压：分片积压达上限时 publish 返回 false 且计数精确，不静默丢。
 //   4. 并发订阅/退订与发布并发进行不崩、不丢唤醒，全部退订后房间被回收。
 //   5. 空房间回收 / 无订阅者发布 / 退订幂等。
+//   6. 直投与排队混用时的保序（7c 回归：本线程直投不得抢跑已排队的批次）。
 #include "../ws_controllers/RoomRegistry.h"
 
 #include <atomic>
@@ -538,6 +539,9 @@ static void testReshapeOrdering()
 // 稍后执行。isCurrentThread() 恒为 false，从而强制走「跨线程分组」分支。
 struct LoopState
 {
+    // 该 loop 的身份。DynamicLoopHandle 用它判断「当前是否就在这个 loop 的线程上」，
+    // 从而支持「同一 loop 既可能被直投、也可能被排队」的真实场景（见 7c）。
+    int id{-1};
     std::mutex m;
     std::vector<std::function<void()>> pending;
     std::atomic<int> wakeups{0};
@@ -593,6 +597,39 @@ struct AlwaysCurrentHandle
 
 using RegGrouped = RoomRegistryT<MockPtr, MockLoopHandle>;
 using RegDirect = RoomRegistryT<MockPtr, AlwaysCurrentHandle>;
+
+// 「动态」句柄：isCurrentThread() 取决于【当前正在扮演哪个 loop 的线程】
+//（tlsCurrentLoop）。这是唯一能覆盖「同一 loop 既被直投、又被排队」的句柄类型
+// —— MockLoopHandle 恒 false、AlwaysCurrentHandle 恒 true，两者从不混用，
+// 所以那条路径在 7c 之前完全没有被测试触及。
+static thread_local int tlsCurrentLoop = -1;
+
+struct DynamicLoopHandle
+{
+    LoopState* st{nullptr};
+
+    bool valid() const noexcept
+    {
+        return st != nullptr;
+    }
+    bool isCurrentThread() const noexcept
+    {
+        return st != nullptr && st->id == tlsCurrentLoop;
+    }
+    template <typename F>
+    void dispatch(F&& f) const
+    {
+        st->wakeups.fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard lock(st->m);
+        st->pending.emplace_back(std::forward<F>(f));
+    }
+    bool operator==(const DynamicLoopHandle& o) const noexcept
+    {
+        return st == o.st;
+    }
+};
+
+using RegDynamic = RoomRegistryT<MockPtr, DynamicLoopHandle>;
 
 static void testLoopGrouping()
 {
@@ -714,6 +751,70 @@ static void testLoopGrouping()
     }
 }
 
+// ---- 7c. 直投与排队混用：保序回归（2026-09-12 修复的真实缺陷）----
+//
+// 缺陷机制（原实现）：fanOutToSnapshot 对「命中本线程」的组直接 send、对「跨线程」的组
+// 走 queueInLoop；而抽干线程 = 消息发布者所在的 IO 线程（默认 fanoutThreads == 0，
+// 全部内联抽干）。于是同一个目标 loop 会同时存在两条投递路径：
+//     M1 由 loop A 的线程抽干 → 对 loop B 走 queueInLoop（排队，尚未执行）
+//     M2 由 loop B 的线程抽干 → 对 loop B 走「本线程直投」，抢在 M1 那个批次之前送达
+//   ⇒ loop B 上的订阅者先收到 M2、后收到 M1（顺序颠倒，聊天场景直接可见）。
+//
+// 修复：同一分片的投递一律走 dispatch，使每个目标 loop 只剩一条 FIFO 入口。
+// 本用例把这条路径永久焊住 —— 一旦有人改回「本线程直投」，它会立刻失败。
+static void testMixedDeliveryOrdering()
+{
+    std::printf("test: 直投与排队混用时的保序（回归）\n");
+
+    RegDynamic::Options opt;
+    opt.maxShards = 1;     // 把变量收敛到「投递路径」这一件事上
+    opt.fanoutThreads = 0; // 内联抽干：抽干线程 == 消息发布者所在线程
+    RegDynamic reg(opt);
+
+    LoopState loopA;
+    loopA.id = 0;
+    LoopState loopB;
+    loopB.id = 1;
+
+    auto cA = std::make_shared<MockConn>();
+    auto cB = std::make_shared<MockConn>();
+    reg.subscribe("mix", cA, DynamicLoopHandle{&loopA});
+    reg.subscribe("mix", cB, DynamicLoopHandle{&loopB});
+
+    // M1 由 loop A 的线程发布并抽干：对 loop B 只是排队
+    tlsCurrentLoop = 0;
+    reg.publish("mix", std::string("M1"));
+    // M2 由 loop B 的线程发布并抽干：此时 loop B 队列里 M1 的批次尚未执行
+    tlsCurrentLoop = 1;
+    reg.publish("mix", std::string("M2"));
+    tlsCurrentLoop = -1;
+
+    // 两个 loop 各自执行排队的批次（模拟事件循环处理 pending functors）
+    auto drainLoop = [](LoopState& l) {
+        std::vector<std::function<void()>> take;
+        {
+            std::lock_guard lock(l.m);
+            take.swap(l.pending);
+        }
+        for (auto& f : take)
+        {
+            f();
+        }
+    };
+    drainLoop(loopA);
+    drainLoop(loopB);
+
+    auto seqOf = [](const std::shared_ptr<MockConn>& c) {
+        std::lock_guard lock(c->m);
+        return c->received;
+    };
+
+    const std::vector<std::string> want{"M1", "M2"};
+    CHECK(seqOf(cB) == want,
+          "loop B 订阅者顺序 = M1,M2（本线程直投不得抢跑已排队的批次）");
+    CHECK(seqOf(cA) == want, "loop A 订阅者顺序 = M1,M2");
+}
+
 int main()
 {
     testStrictOrdering(0, "线程池并行扇出");
@@ -724,6 +825,7 @@ int main()
     testReshapeOrdering();
     testEdgeCases();
     testLoopGrouping();
+    testMixedDeliveryOrdering();
 
     std::printf("\n%s (failures=%d)\n", g_failures == 0 ? "ALL PASSED" : "FAILED", g_failures);
     return g_failures == 0 ? 0 : 1;

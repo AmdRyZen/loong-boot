@@ -129,7 +129,7 @@
     }
   ],
   "custom_config": {
-    "enable_kafka_persistence": true,
+    "enable_kafka_persistence": false,
     "enable_cluster_bus": false,
     "image-default": "https://github.com/an-tao/drogon/wiki/images/drogon-white.jpg",
     "jwt-secret": "nRvyYC4soFxBdZ-F-5Nnzz5USXstR1YylsTd-mA0aKtI9HUlriGrtkf-TiuDapkLiUCogO3JOK7kwZisrHp6wA",

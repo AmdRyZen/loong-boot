@@ -63,6 +63,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -247,6 +248,13 @@ class RoomRegistryT
      */
     SubscriberID subscribe(const std::string& room, ConnPtr conn, LoopH loop = LoopH{})
     {
+        // reshape 前的「等排空」不能持 pubMtx 做无界自旋 —— 那会阻塞该房间的
+        // 全部 publish 与 unsubscribe（只要有一个分片长时间 busy，整个房间就卡住）。
+        // 这里改成「持锁检查 → 放锁让出 → 重新加锁复查」的循环；连续多轮未排空
+        // 再退避一小段，避免纯自旋烧 CPU。
+        constexpr int kMaxSpinRounds = 64;
+        int spinRounds = 0;
+
         for (;;)
         {
             std::shared_ptr<Room> r = getOrCreateRoom(room);
@@ -261,26 +269,53 @@ class RoomRegistryT
                 continue;
             }
 
-            const SubscriberID id = ++r->nextId;
             const size_t after = r->subCount.load(std::memory_order_relaxed) + 1;
             const size_t want = shardsFor(after);
 
             if (want != r->shards.size())
             {
-                // 分片数跨越阶梯：走安全重建协议（见 reshapeLocked 注释）
-                reshapeLocked(*r, want, Entry{id, conn, loop});
-            }
-            else
-            {
-                const size_t idx = static_cast<size_t>(id % want);
-                if (r->dist[idx].empty())
+                // 分片数跨越阶梯：必须等全部分片排空才能重建（见 reshapeLocked 注释）。
+                // 锁内只做「检查」，等待放到锁外。
+                bool drained = true;
+                for (const auto& sh : r->shards)
                 {
-                    r->nonEmptyShards.fetch_add(1, std::memory_order_relaxed);
+                    if (sh && sh->busy.load(std::memory_order_acquire))
+                    {
+                        drained = false;
+                        break;
+                    }
                 }
-                r->dist[idx].push_back(Entry{id, conn, loop});
-                r->idToShard[id] = idx;
-                r->shards[idx] = refreshSnapshot(r->shards[idx], r->dist[idx]);
+                if (!drained)
+                {
+                    pubLock.unlock();
+                    if (++spinRounds >= kMaxSpinRounds)
+                    {
+                        std::this_thread::sleep_for(std::chrono::microseconds(200));
+                        spinRounds = 0;
+                    }
+                    else
+                    {
+                        std::this_thread::yield();
+                    }
+                    continue; // 重新取房间并复查
+                }
+
+                // 走安全重建协议（见 reshapeLocked 注释）
+                const SubscriberID id = ++r->nextId;
+                reshapeLocked(*r, want, Entry{id, conn, loop});
+                r->subCount.store(after, std::memory_order_relaxed);
+                return id;
             }
+
+            const SubscriberID id = ++r->nextId;
+            const size_t idx = static_cast<size_t>(id % want);
+            if (r->dist[idx].empty())
+            {
+                r->nonEmptyShards.fetch_add(1, std::memory_order_relaxed);
+            }
+            r->dist[idx].push_back(Entry{id, conn, loop});
+            r->idToShard[id] = idx;
+            r->shards[idx] = refreshSnapshot(r->shards[idx], r->dist[idx]);
             r->subCount.store(after, std::memory_order_relaxed);
             return id;
         }
@@ -371,10 +406,38 @@ class RoomRegistryT
             workers_.empty() || r->subCount.load(std::memory_order_relaxed) <= opt_.inlineMaxSubs;
 
         std::vector<std::shared_ptr<Shard>> needWake;
-        bool ok = true;
         {
             // 房间级发布锁：消息顺序的唯一来源。只做「入队」，不做扇出。
             std::lock_guard pubLock(r->pubMtx);
+
+            // ── 第一阶段：预检查（全有或全无）──────────────────────────────
+            // 只要有一个非空分片已满，整条消息就都不入队并返回 false。
+            //
+            // 原实现是「逐分片判断、满的那个 continue」，于是过载时会出现
+            // 「一部分订阅者已收到、另一部分被丢」——调用方只能回一个 503，
+            // 客户端重试后已收到的人又会看到重复消息。多分片时必然发生。
+            //
+            // 同房间的所有 publish 都被 pubMtx 串行化，所以「预检查通过」到
+            // 「入队」之间不会有别的 publish 插入；drain 只会让队列更空、
+            // 不会让它变满，因此预检查的结论在第二阶段依然成立。
+            for (size_t i = 0; i < r->dist.size(); ++i)
+            {
+                if (r->dist[i].empty())
+                {
+                    continue;
+                }
+                const std::shared_ptr<Shard>& sh = r->shards[i];
+                std::lock_guard shardLock(sh->mtx);
+                if (sh->queue.size() >= opt_.backlogPerShard)
+                {
+                    // 整条消息按一次丢弃计数（而不是每个满分片各计一次），
+                    // 这样 dropped_ 与「被拒绝的 publish 次数」严格一致。
+                    dropped_.fetch_add(1, std::memory_order_relaxed);
+                    return false;
+                }
+            }
+
+            // ── 第二阶段：整条消息入队 ────────────────────────────────────
             for (size_t i = 0; i < r->dist.size(); ++i)
             {
                 if (r->dist[i].empty())
@@ -383,13 +446,6 @@ class RoomRegistryT
                 }
                 const std::shared_ptr<Shard>& sh = r->shards[i];
                 std::lock_guard shardLock(sh->mtx);
-                if (sh->queue.size() >= opt_.backlogPerShard)
-                {
-                    sh->dropped.fetch_add(1, std::memory_order_relaxed);
-                    dropped_.fetch_add(1, std::memory_order_relaxed);
-                    ok = false;
-                    continue;
-                }
                 sh->queue.push_back(payload);
                 // 门铃：仅在「空闲 → 忙」跳变时入池，热点分片不会每条消息都惊动线程池。
                 // exchange 与 drain 的 busy=false 都在分片锁内完成，不会丢唤醒。
@@ -400,7 +456,7 @@ class RoomRegistryT
             }
 
             // 在 pubMtx 内入池（内联模式除外）：保证「busy == true ⟹ 分片已在池中或正在被抽」，
-            // 让 reshapeLocked 的自旋等待一定有进展，不会等一个没人抽的分片。
+            // 让 reshape 的排空等待一定有进展，不会等一个没人抽的分片。
             if (!inlineMode)
             {
                 for (const auto& sh : needWake)
@@ -412,7 +468,7 @@ class RoomRegistryT
 
         if (needWake.empty())
         {
-            return ok; // 已有线程在抽这些分片，它会在循环里取到本条消息
+            return true; // 已有线程在抽这些分片，它会在循环里取到本条消息
         }
 
         if (inlineMode)
@@ -424,7 +480,7 @@ class RoomRegistryT
                 drainShard(sh, false);
             }
         }
-        return ok;
+        return true;
     }
 
     // ---- 观测 ----
@@ -549,7 +605,6 @@ class RoomRegistryT
         // copy-on-write 快照：扇出线程每条消息只拷贝一次 shared_ptr，无 O(N) 引用计数风暴
         std::shared_ptr<const Snapshot> snap = std::make_shared<const Snapshot>();
         std::atomic<bool> busy{false};
-        std::atomic<uint64_t> dropped{0};
     };
 
     struct Room
@@ -661,15 +716,17 @@ class RoomRegistryT
         return sh;
     }
 
-    // 分片数变化时的安全重建协议。调用方必须持有 r.pubMtx。
+    // 分片数变化时的安全重建协议。调用方必须持有 r.pubMtx，
+    // 且【必须先确认所有分片已排空（busy == false）】—— 该确认由 subscribe 在
+    // 锁内完成、等待在锁外进行，避免持锁自旋把整个房间的 publish 卡住。
     //
     // 核心约束：只有当【全体订阅者都收到了截止此刻的全部消息】时，重新分片才是安全的。
     // 否则会出现「某人已经收过、某人还没收」的错位 —— 那是重复投递的来源
     // （早期版本把各分片残留 payload 统一搬运再广播，实测必然产生重复）。
     //
-    // 而「全体排空」在本函数里是免费可得的：调用方持 pubMtx，不会再有新消息入队；
+    // 「排空」在持 pubMtx 时是免费可得的：调用方持 pubMtx，不会再有新消息入队；
     // 又因为 publishShared 在 pubMtx 内就把分片入池，所以 busy == true 一定意味着
-    // 「该分片在池中或正在被抽」，自旋等待 busy == false 必然收敛，且收敛时队列已空。
+    // 「该分片在池中或正在被抽」，等待 busy == false 必然收敛，且收敛时队列已空。
     // 换言之：持 pubMtx 时 busy == false ⟺ 队列为空且无在途扇出。
     //
     // 注意分组投递（A1）之后 busy == false 的语义收紧为「已把全部消息【派发】到目标
@@ -678,18 +735,6 @@ class RoomRegistryT
     // 所以即使批次还在目标 loop 队列里等待执行，它的收件人集合也不会因 reshape 而改变。
     void reshapeLocked(Room& r, size_t newK, const Entry& extra)
     {
-        for (auto& sh : r.shards)
-        {
-            if (!sh)
-            {
-                continue;
-            }
-            while (sh->busy.load(std::memory_order_acquire))
-            {
-                std::this_thread::yield();
-            }
-        }
-
         std::vector<Entry> all;
         all.reserve(r.subCount.load(std::memory_order_relaxed) + 1);
         for (const auto& bucket : r.dist)
@@ -851,7 +896,19 @@ class RoomRegistryT
                 continue;
             }
 
-            if (g.loop.isCurrentThread())
+            // ── 为什么「本线程的组」也一律排队，而不是直接 send ──────────────
+            // 直投与排队混用会破坏「同一订阅者看到的消息顺序」：
+            //   抽干线程 = 消息发布者所在的 IO 线程（默认 fanoutThreads == 0 时全内联抽干）。
+            //   M1 由 loop A 抽干 → 对 loop B 的组走 queueInLoop（排队，尚未执行）；
+            //   M2 由 loop B 抽干 → 对 loop B 的组若走直投，就会抢在 M1 那个批次之前送达。
+            //   于是 loop B 上的订阅者先收到 M2、后收到 M1 —— 顺序颠倒。
+            // 统一排队后，每个目标 loop 只有「一条 FIFO 入口」，入队顺序即投递顺序。
+            // 代价：本线程的组多一次本地入队（无系统调用）；跨线程唤醒次数仍是
+            // O(loop 数)，A1 优化的收益（O(订阅者数) → O(loop 数) 次唤醒）不受影响。
+            //
+            // loop 句柄无效时无处可排队（单测 / 未提供 loop 的调用方），退化为直投，
+            // 语义与优化前一致。
+            if (!g.loop.valid())
             {
                 const std::string_view view(*payload);
                 for (const auto& c : *g.conns)
@@ -859,18 +916,27 @@ class RoomRegistryT
                     c->send(view);
                 }
                 inLoopDeliveries_.fetch_add(g.conns->size(), std::memory_order_relaxed);
+                continue;
+            }
+
+            const bool sameThread = g.loop.isCurrentThread();
+            // 只捕获两个 shared_ptr（payload + 连接组），不复制连接列表本身。
+            // 连接对象因此至少活到这个批次被执行完，之后才可能析构。
+            g.loop.dispatch([payload, conns = g.conns] {
+                const std::string_view view(*payload);
+                for (const auto& c : *conns)
+                {
+                    c->send(view);
+                }
+            });
+
+            if (sameThread)
+            {
+                // 指标语义保持不变：这一组原本走直投，现在只是改为经本线程队列。
+                inLoopDeliveries_.fetch_add(g.conns->size(), std::memory_order_relaxed);
             }
             else
             {
-                // 只捕获两个 shared_ptr（payload + 连接组），不复制连接列表本身。
-                // 连接对象因此至少活到这个批次被执行完，之后才可能析构。
-                g.loop.dispatch([payload, conns = g.conns] {
-                    const std::string_view view(*payload);
-                    for (const auto& c : *conns)
-                    {
-                        c->send(view);
-                    }
-                });
                 crossThreadBatches_.fetch_add(1, std::memory_order_relaxed);
                 // 份数在派发时就能确定：批次一旦入队必然整批执行，收件人集合不可变。
                 crossThreadDeliveries_.fetch_add(g.conns->size(), std::memory_order_relaxed);
