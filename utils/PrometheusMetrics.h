@@ -74,6 +74,18 @@ public:
         wsRoomMaxSubscribers_.store(maxRoomSubscribers, std::memory_order_relaxed);
     }
 
+    // 扇出分组效果（A1 优化的效果观测，同样由 5 秒定时任务推送）。
+    //
+    // 判读：一次扇出共 M 条消息、N 个订阅者、K 个 IO 线程时
+    //   快速路径生效 → crossthreadBatches 增量 ≈ M×K，inloopDeliveries 增量 ≈ M×N；
+    //   分组没生效（loop 抓取失败 / 回退直投）→ crossthreadBatches 会与 M×N 同量级，
+    //   而 inloopDeliveries 增量接近 0。
+    // 两个数都是 counter，看增量而不是绝对值。
+    void setFanoutStats(uint64_t inloopDeliveries, uint64_t crossthreadBatches) {
+        wsFanoutInLoop_.store(inloopDeliveries, std::memory_order_relaxed);
+        wsFanoutCrossThread_.store(crossthreadBatches, std::memory_order_relaxed);
+    }
+
     // 生成标准 Prometheus 文本格式导出
     std::string exportPrometheusText() const {
         std::ostringstream ss;
@@ -120,6 +132,16 @@ public:
            << "# HELP ws_room_max_subscribers Subscriber count of the largest room (fanout cost driver).\n"
            << "# TYPE ws_room_max_subscribers gauge\n"
            << "ws_room_max_subscribers " << wsRoomMaxSubscribers_.load(std::memory_order_relaxed) << "\n\n";
+
+        // 扇出分组效果（A1）。两个都是 counter：看增量，不看绝对值。
+        // 健康形态：crossthread_batches 增量 ≈ 消息数 × IO线程数，远小于
+        // inloop_deliveries 增量；若前者与「消息数 × 订阅者数」同量级，说明分组没生效。
+        ss << "# HELP ws_fanout_inloop_deliveries_total Fanout deliveries executed on the caller's own loop (no cross-thread hop).\n"
+           << "# TYPE ws_fanout_inloop_deliveries_total counter\n"
+           << "ws_fanout_inloop_deliveries_total " << wsFanoutInLoop_.load(std::memory_order_relaxed) << "\n"
+           << "# HELP ws_fanout_crossthread_batches_total Fanout batches dispatched to another IO loop (one wakeup each).\n"
+           << "# TYPE ws_fanout_crossthread_batches_total counter\n"
+           << "ws_fanout_crossthread_batches_total " << wsFanoutCrossThread_.load(std::memory_order_relaxed) << "\n\n";
 
         // HTTP 度量
         ss << "# HELP http_requests_total Total HTTP requests handled.\n"
@@ -168,6 +190,8 @@ private:
     std::atomic<uint64_t> wsRoomShards_{0};
     std::atomic<uint64_t> wsRoomSubscribers_{0};
     std::atomic<uint64_t> wsRoomMaxSubscribers_{0};
+    std::atomic<uint64_t> wsFanoutInLoop_{0};
+    std::atomic<uint64_t> wsFanoutCrossThread_{0};
 };
 
 } // namespace Metrics

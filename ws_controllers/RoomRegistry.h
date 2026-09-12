@@ -28,9 +28,32 @@
 //
 // 与旧实现的另一个差异：去掉了 std::function 回调中转，分片直接持有连接指针。
 //
+// ---------------------------------------------------------------------------
+// 投递侧的第二个瓶颈（A1，2026-09-12）—— 跨线程唤醒
+// ---------------------------------------------------------------------------
+// 去掉 std::function 中转之后，扇出循环本身已经不再是瓶颈，但吞吐仍卡在
+// ~40 万次投递/s。真正的原因在 drogon/trantor 的 send 路径：
+//   TcpConnectionImpl::send() 若发现当前不在该连接的 loop 线程上，就
+//   loop->queueInLoop(lambda) —— 一次 std::function 构造 + 入队 + 一次唤醒
+//   系统调用（macOS 上是对 socketpair 的 write，再让 kevent 从等待中返回），
+//   实测合计 ≈ 2.5µs/份。
+// 而本工程 IO 线程数是 hardware_concurrency()*2（main.cc 在 loadConfigFile
+// 之后又调了一次 setThreadNum，会覆盖 config.json 的 number_of_threads），
+// 订阅者被分散到各个 loop，于是【一次扇出里绝大多数投递都是跨线程的】。
+//
+// 解法就是本文件的 LoopH 分组：快照按「连接所属 loop」预分组，每个目标 loop
+// 每条消息只唤醒一次、携带整批连接，实际 send 在目标 loop 线程内完成 →
+// 唤醒次数由 O(订阅者数) 降为 O(IO 线程数)。
+//
+// 这也解释了为什么「多分片并行扇出」从来没用：它并行的是扇出循环，而瓶颈
+// 在扇出循环之外的唤醒路径上，加线程只多付记账与上下文切换成本。
+// ---------------------------------------------------------------------------
+//
 // 连接类型做成模板参数，唯一要求是「可 bool 判空 + 有 send(std::string_view)」。
-// 生产环境实例化为 RoomRegistry（= RoomRegistryT<drogon::WebSocketConnectionPtr>），
-// 单测则用轻量 mock 连接，无需拉起 drogon 运行时。
+// LoopH 是第二个模板参数（事件循环句柄），默认 NullLoopHandle = 不分组的直投，
+// 单测因此不需要拉起 drogon 运行时。
+// 生产环境实例化为 RoomRegistry（= RoomRegistryT<drogon::WebSocketConnectionPtr,
+// TrantorLoopHandle>），单测用轻量 mock 连接 + mock loop。
 // ===========================================================================
 //
 #ifndef LOONG_BOOT_ROOM_REGISTRY_H
@@ -38,6 +61,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
@@ -53,9 +77,82 @@
 #include <vector>
 
 #include <drogon/WebSocketConnection.h>
+#include <trantor/net/EventLoop.h>
 #include "parallel_hashmap/phmap.h"
 
-template <typename ConnT>
+// ===========================================================================
+// Loop 句柄：扇出分组的依据（A1 优化）
+// ===========================================================================
+// 为什么必须分组：drogon 的投递路径 TcpConnectionImpl::send(std::string&&) 在
+// 【非本 loop 线程】时会走 loop->queueInLoop(lambda)，代价 = 一次 std::function
+// 构造 + 入队 + 一次唤醒系统调用（macOS 上是对 socketpair 的 write + 让 kevent
+// 从等待中返回），实测合计 ≈ 2.5µs/份。
+//
+// 而本工程的 IO 线程数是 hardware_concurrency()*2（见 main.cc —— 注意它在
+// loadConfigFile 之后又调了一次 setThreadNum，会覆盖 config.json 里的
+// number_of_threads），订阅者被内核轮询分散到各个 loop。于是【一次房间扇出里
+// 绝大多数投递都是跨线程的】，这才是单房间扇出卡在 ~40 万次投递/s 的真正原因
+// ——不是扇出循环本身慢（分片并行因此毫无收益）。
+//
+// 分组后：每个目标 loop 每条消息只 queueInLoop 一次、携带该 loop 上的整批连接，
+// 实际投递在各自 loop 的线程内完成 → 走 isInLoopThread() 快路径，
+// 唤醒次数从 O(订阅者数) 降到 O(IO 线程数)。
+//
+// 保序不受影响：分组在【快照重建】时一次性算好（连接所属 loop 永不改变），
+// 投递仍按分片 FIFO 逐个 payload 派发；同一 loop 的 queueInLoop 本身是 FIFO，
+// 所以同一订阅者看到的消息顺序与单线程直投完全一致。
+// ===========================================================================
+
+// 无 loop（单测、或调用方没提供 loop 时的回退）：永远视作「就在本线程」，直接投递。
+struct NullLoopHandle
+{
+    bool valid() const noexcept
+    {
+        return false;
+    }
+    bool isCurrentThread() const noexcept
+    {
+        return true;
+    }
+    template <typename F>
+    void dispatch(F&& f) const
+    {
+        std::forward<F>(f)();
+    }
+    bool operator==(const NullLoopHandle&) const noexcept
+    {
+        return true;
+    }
+};
+
+// 生产用：包装 trantor::EventLoop*。
+// dispatch 刻意做成模板成员 —— 只有真正被实例化时才引用 EventLoop::queueInLoop，
+// 因此不链接 drogon/trantor 的单测不会产生未定义符号。
+struct TrantorLoopHandle
+{
+    trantor::EventLoop* loop = nullptr;
+
+    bool valid() const noexcept
+    {
+        return loop != nullptr;
+    }
+    // loop 为空时按「本线程」处理，即回退到直接投递（安全兜底）
+    bool isCurrentThread() const noexcept
+    {
+        return loop == nullptr || loop->isInLoopThread();
+    }
+    template <typename F>
+    void dispatch(F&& f) const
+    {
+        loop->queueInLoop(std::forward<F>(f));
+    }
+    bool operator==(const TrantorLoopHandle& o) const noexcept
+    {
+        return loop == o.loop;
+    }
+};
+
+template <typename ConnT, typename LoopH = NullLoopHandle>
 class RoomRegistryT
 {
   public:
@@ -66,10 +163,12 @@ class RoomRegistryT
     {
         // 单房间最大分片槽位数 = 单房间最大并行扇出度。
         // 默认 1：单分片 + 内联扇出，与旧实现语义等价，但少了 std::function 中转与双层队列。
-        // 实测单房间扇出吞吐与旧实现持平（确定性基准 200 订阅者：约 35~42 万次投递/s，
-        // 两侧差异落在噪声内）；瓶颈在 drogon 每份投递的 send 路径
-        // （跨线程 queueInLoop + 每份一次堆分配 ≈ 2.5µs/份），不在扇出循环本身，
-        // 所以分片并行无法突破该上限（详见下方 fanoutThreads 说明）。
+        //
+        // 实测：单房间扇出吞吐与旧实现持平（确定性基准 200 订阅者：约 35~42 万次投递/s）。
+        // 瓶颈不在扇出循环本身，而在 drogon 每份投递的 send 路径（跨线程 queueInLoop
+        // + 每份一次堆分配），所以【分片并行无法突破该上限】——它并行的是扇出循环，
+        // 而瓶颈在循环之外。真正有效的是按 IO 线程分组投递（见文件头 A1 说明与 LoopH），
+        // 那把跨线程唤醒从 O(订阅者数) 降到 O(IO 线程数)。
         // 调大即可启用多分片并行扇出（需要同时把 fanoutThreads 设为 > 0）。
         size_t maxShards = 1;
         // 每多少个订阅者增加一个分片（分片数随房间规模阶梯增长：1/2/4/.../maxShards）
@@ -139,9 +238,14 @@ class RoomRegistryT
 
     /**
      * @brief 订阅一个房间
+     * @param loop 该连接所属的事件循环句柄。传入后，投递会在该 loop 的线程内完成
+     *             （一次扇出对每个 loop 只唤醒一次）；不传则回退到直接 send。
+     *             生产代码应从【连接的 IO 线程】里取
+     *             trantor::EventLoop::getEventLoopOfCurrentThread() 传入
+     *             —— drogon 的 handleNewConnection 正是在该线程内同步调用的。
      * @return 订阅 ID，用于 unsubscribe
      */
-    SubscriberID subscribe(const std::string& room, ConnPtr conn)
+    SubscriberID subscribe(const std::string& room, ConnPtr conn, LoopH loop = LoopH{})
     {
         for (;;)
         {
@@ -164,7 +268,7 @@ class RoomRegistryT
             if (want != r->shards.size())
             {
                 // 分片数跨越阶梯：走安全重建协议（见 reshapeLocked 注释）
-                reshapeLocked(*r, want, Entry{id, conn});
+                reshapeLocked(*r, want, Entry{id, conn, loop});
             }
             else
             {
@@ -173,7 +277,7 @@ class RoomRegistryT
                 {
                     r->nonEmptyShards.fetch_add(1, std::memory_order_relaxed);
                 }
-                r->dist[idx].push_back(Entry{id, conn});
+                r->dist[idx].push_back(Entry{id, conn, loop});
                 r->idToShard[id] = idx;
                 r->shards[idx] = refreshSnapshot(r->shards[idx], r->dist[idx]);
             }
@@ -390,12 +494,43 @@ class RoomRegistryT
         return s;
     }
 
+    // 分组投递的效果观测 —— 用来在生产上确认 A1 的快速路径真的生效了
+    // （否则又会变成「优化了但没人知道有没有生效」的盲区）。
+    //
+    // 判读方式：一次房间扇出共 M 条消息、N 个订阅者、K 个 IO 线程时，
+    //   快速路径生效 → crossThreadBatches ≈ M×K 量级，inLoopDeliveries ≈ M×N 量级；
+    //   分组没生效（loop 抓错 / 回退）→ crossThreadBatches 会与 M×N 同量级，
+    //   且 inLoopDeliveries 接近 0。
+    size_t inLoopDeliveries() const noexcept
+    {
+        return inLoopDeliveries_.load(std::memory_order_relaxed);
+    }
+
+    size_t crossThreadBatches() const noexcept
+    {
+        return crossThreadBatches_.load(std::memory_order_relaxed);
+    }
+
   private:
     struct Entry
     {
         SubscriberID id{0};
         ConnPtr conn;
+        // 该连接所属的事件循环（订阅时抓取，终身不变）
+        LoopH loop{};
     };
+
+    // 投递计划的一个分组：同一 loop 上的若干连接。
+    // conns 用 shared_ptr<const> 共享，扇出时每个跨线程批次只拷贝一个指针，
+    // 不产生「按连接逐个拷贝」的开销。
+    struct Group
+    {
+        LoopH loop;
+        std::shared_ptr<const std::vector<ConnPtr>> conns;
+    };
+
+    // 分组后的投递计划（只读，扇出热路径直接遍历）
+    using Snapshot = std::vector<Group>;
 
     struct Shard
     {
@@ -404,7 +539,7 @@ class RoomRegistryT
         std::mutex mtx;
         std::deque<std::shared_ptr<const std::string>> queue;
         // copy-on-write 快照：扇出线程每条消息只拷贝一次 shared_ptr，无 O(N) 引用计数风暴
-        std::shared_ptr<const std::vector<Entry>> snap = std::make_shared<const std::vector<Entry>>();
+        std::shared_ptr<const Snapshot> snap = std::make_shared<const Snapshot>();
         std::atomic<bool> busy{false};
         std::atomic<uint64_t> dropped{0};
     };
@@ -424,11 +559,46 @@ class RoomRegistryT
         SubscriberID nextId{0};
     };
 
+    // 把「分片成员表」编成「按 loop 分组的投递计划」。
+    // 只在订阅 / 退订 / reshape 时执行（O(该分片成员数)），扇出热路径只读不建。
+    //
+    // 分片成员数通常远小于全局订阅者数，且 loop 种类很少（≤ IO 线程数），
+    // 所以这里用线性查找而非哈希表 —— 避免每次重建都付一次哈希表构造成本。
+    static std::shared_ptr<const Snapshot> buildSnapshot(const std::vector<Entry>& bucket)
+    {
+        std::vector<std::pair<LoopH, std::vector<ConnPtr>>> tmp;
+        tmp.reserve(bucket.size() > 16 ? 16 : bucket.size());
+        for (const auto& e : bucket)
+        {
+            if (!e.conn)
+            {
+                continue; // 空连接不参与投递，也不该占一个分组
+            }
+            auto it = std::find_if(tmp.begin(), tmp.end(),
+                                   [&e](const auto& p) { return p.first == e.loop; });
+            if (it == tmp.end())
+            {
+                tmp.emplace_back(e.loop, std::vector<ConnPtr>{});
+                it = std::prev(tmp.end());
+            }
+            it->second.push_back(e.conn);
+        }
+
+        auto snap = std::make_shared<Snapshot>();
+        snap->reserve(tmp.size());
+        for (auto& [loop, conns] : tmp)
+        {
+            snap->push_back(
+                Group{loop, std::make_shared<const std::vector<ConnPtr>>(std::move(conns))});
+        }
+        return snap;
+    }
+
     // 重建某个分片的 COW 快照。O(该分片成员数)，不触发 O(N) 全量拷贝。
     static std::shared_ptr<Shard> refreshSnapshot(const std::shared_ptr<Shard>& sh,
                                                   const std::vector<Entry>& bucket)
     {
-        auto next = std::make_shared<const std::vector<Entry>>(bucket);
+        auto next = buildSnapshot(bucket);
         if (!sh)
         {
             auto created = std::make_shared<Shard>();
@@ -479,7 +649,7 @@ class RoomRegistryT
     static std::shared_ptr<Shard> makeShard(const std::vector<Entry>& bucket)
     {
         auto sh = std::make_shared<Shard>();
-        sh->snap = std::make_shared<const std::vector<Entry>>(bucket);
+        sh->snap = buildSnapshot(bucket);
         return sh;
     }
 
@@ -493,6 +663,11 @@ class RoomRegistryT
     // 又因为 publishShared 在 pubMtx 内就把分片入池，所以 busy == true 一定意味着
     // 「该分片在池中或正在被抽」，自旋等待 busy == false 必然收敛，且收敛时队列已空。
     // 换言之：持 pubMtx 时 busy == false ⟺ 队列为空且无在途扇出。
+    //
+    // 注意分组投递（A1）之后 busy == false 的语义收紧为「已把全部消息【派发】到目标
+    // loop」，而不是「已送达」。这不影响本函数的正确性：reshape 只在既有订阅者之间
+    // 重新分配分片，不增删成员，而每个已派发批次的连接列表是快照里的不可变集合，
+    // 所以即使批次还在目标 loop 队列里等待执行，它的收件人集合也不会因 reshape 而改变。
     void reshapeLocked(Room& r, size_t newK, const Entry& extra)
     {
         for (auto& sh : r.shards)
@@ -622,7 +797,7 @@ class RoomRegistryT
         for (;;)
         {
             std::shared_ptr<const std::string> payload;
-            std::shared_ptr<const std::vector<Entry>> snap;
+            std::shared_ptr<const Snapshot> snap;
             bool requeue = false;
             {
                 std::lock_guard lock(sh->mtx);
@@ -642,7 +817,7 @@ class RoomRegistryT
             }
 
             // 先投递本条，再决定是否让出 worker —— 顺序不能颠倒，否则本条会被丢掉
-            fanOutToSnapshot(*snap, *payload);
+            fanOutToSnapshot(*snap, payload);
 
             if (requeue)
             {
@@ -653,15 +828,42 @@ class RoomRegistryT
         }
     }
 
-    // 真正的扇出：锁外执行，多分片并行跑在多个核上
-    static void fanOutToSnapshot(const std::vector<Entry>& snap, const std::string& payload)
+    // 真正的扇出：锁外执行。
+    //
+    // 逐组投递：命中本线程的组直接 send（零跨线程开销）；跨线程的组只唤醒一次、
+    // 携带整批连接，实际 send 在目标 loop 的线程内完成 → 走 drogon/trantor 的
+    // isInLoopThread() 快路径。唤醒次数由 O(订阅者数) 降为 O(目标 loop 数)。
+    void fanOutToSnapshot(const Snapshot& snap,
+                          const std::shared_ptr<const std::string>& payload) const
     {
-        const std::string_view view(payload);
-        for (const auto& e : snap)
+        for (const auto& g : snap)
         {
-            if (e.conn)
+            if (!g.conns || g.conns->empty())
             {
-                e.conn->send(view);
+                continue;
+            }
+
+            if (g.loop.isCurrentThread())
+            {
+                const std::string_view view(*payload);
+                for (const auto& c : *g.conns)
+                {
+                    c->send(view);
+                }
+                inLoopDeliveries_.fetch_add(g.conns->size(), std::memory_order_relaxed);
+            }
+            else
+            {
+                // 只捕获两个 shared_ptr（payload + 连接组），不复制连接列表本身。
+                // 连接对象因此至少活到这个批次被执行完，之后才可能析构。
+                g.loop.dispatch([payload, conns = g.conns] {
+                    const std::string_view view(*payload);
+                    for (const auto& c : *conns)
+                    {
+                        c->send(view);
+                    }
+                });
+                crossThreadBatches_.fetch_add(1, std::memory_order_relaxed);
             }
         }
     }
@@ -681,9 +883,13 @@ class RoomRegistryT
     std::vector<std::thread> workers_;
 
     std::atomic<size_t> dropped_{0};
+
+    // 分组投递效果计数（扇出热路径上每个分组各一次，即 O(loop 数) 而非 O(订阅者数)）
+    mutable std::atomic<size_t> inLoopDeliveries_{0};
+    mutable std::atomic<size_t> crossThreadBatches_{0};
 };
 
-// 生产实例：drogon WebSocket 连接
-using RoomRegistry = RoomRegistryT<drogon::WebSocketConnectionPtr>;
+// 生产实例：drogon WebSocket 连接 + trantor 事件循环句柄
+using RoomRegistry = RoomRegistryT<drogon::WebSocketConnectionPtr, TrantorLoopHandle>;
 
 #endif // LOONG_BOOT_ROOM_REGISTRY_H

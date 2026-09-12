@@ -531,6 +531,189 @@ static void testReshapeOrdering()
     std::printf("       共投递 %zu 条（订阅者陆续加入，各自收到的起点不同）\n", totalReceived);
 }
 
+// ---------------------------------------------------------------------------
+// 7. 按 IO 线程分组投递（A1）
+// ---------------------------------------------------------------------------
+// 模拟一个事件循环：记录被唤醒（queueInLoop）的次数，把批次存起来等「loop 线程」
+// 稍后执行。isCurrentThread() 恒为 false，从而强制走「跨线程分组」分支。
+struct LoopState
+{
+    std::mutex m;
+    std::vector<std::function<void()>> pending;
+    std::atomic<int> wakeups{0};
+};
+
+struct MockLoopHandle
+{
+    LoopState* st{nullptr};
+
+    bool valid() const noexcept
+    {
+        return st != nullptr;
+    }
+    // 恒 false → 永远走「跨线程」分支；st 为空时退化为直投（不该发生）
+    bool isCurrentThread() const noexcept
+    {
+        return st == nullptr;
+    }
+    template <typename F>
+    void dispatch(F&& f) const
+    {
+        st->wakeups.fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard lock(st->m);
+        st->pending.emplace_back(std::forward<F>(f));
+    }
+    bool operator==(const MockLoopHandle& o) const noexcept
+    {
+        return st == o.st;
+    }
+};
+
+// 恒「就在本线程」的句柄 → 走直投分支
+struct AlwaysCurrentHandle
+{
+    bool valid() const noexcept
+    {
+        return false;
+    }
+    bool isCurrentThread() const noexcept
+    {
+        return true;
+    }
+    template <typename F>
+    void dispatch(F&& f) const
+    {
+        std::forward<F>(f)();
+    }
+    bool operator==(const AlwaysCurrentHandle&) const noexcept
+    {
+        return true;
+    }
+};
+
+using RegGrouped = RoomRegistryT<MockPtr, MockLoopHandle>;
+using RegDirect = RoomRegistryT<MockPtr, AlwaysCurrentHandle>;
+
+static void testLoopGrouping()
+{
+    std::printf("test: 按 IO 线程分组投递（A1）\n");
+
+    constexpr int kLoops = 4;
+    constexpr int kPerLoop = 10;
+    constexpr int kMsgs = 50;
+    constexpr int kSubs = kLoops * kPerLoop;
+
+    // ---- 7a. 跨线程分组：唤醒次数必须由 O(订阅者) 降到 O(loop) ----
+    {
+        RegGrouped::Options opt;
+        opt.maxShards = 1;     // 单分片：把变量收敛到「分组」这一件事上
+        opt.fanoutThreads = 0; // 内联扇出，发布线程直接投递
+        RegGrouped reg(opt);
+
+        std::vector<std::unique_ptr<LoopState>> loops;
+        for (int i = 0; i < kLoops; ++i)
+        {
+            loops.push_back(std::make_unique<LoopState>());
+        }
+
+        std::vector<std::shared_ptr<MockConn>> conns;
+        for (int i = 0; i < kSubs; ++i)
+        {
+            auto c = std::make_shared<MockConn>();
+            conns.push_back(c);
+            reg.subscribe("grp", c, MockLoopHandle{loops[i % kLoops].get()});
+        }
+
+        for (int i = 0; i < kMsgs; ++i)
+        {
+            reg.publish("grp", std::to_string(i));
+        }
+
+        int totalWakeups = 0;
+        for (const auto& l : loops)
+        {
+            totalWakeups += l->wakeups.load();
+        }
+        CHECK(totalWakeups == kLoops * kMsgs,
+              "唤醒次数 = loop 数 × 消息数（而非订阅者数 × 消息数）");
+        CHECK(reg.crossThreadBatches() == static_cast<size_t>(kLoops * kMsgs),
+              "跨线程批次数精确等于 loop 数 × 消息数");
+        CHECK(reg.inLoopDeliveries() == 0, "全跨线程时本线程直投计数为 0");
+
+        // 扮演「各 loop 的线程」执行批次
+        for (const auto& l : loops)
+        {
+            std::vector<std::function<void()>> take;
+            {
+                std::lock_guard lock(l->m);
+                take.swap(l->pending);
+            }
+            for (auto& f : take)
+            {
+                f();
+            }
+        }
+
+        bool allCount = true;
+        bool allOrdered = true;
+        for (const auto& c : conns)
+        {
+            std::lock_guard lock(c->m);
+            if (c->received.size() != static_cast<size_t>(kMsgs))
+            {
+                allCount = false;
+            }
+            for (size_t i = 0; i < c->received.size(); ++i)
+            {
+                if (c->received[i] != std::to_string(i))
+                {
+                    allOrdered = false;
+                    break;
+                }
+            }
+        }
+        CHECK(allCount, "分组投递不丢消息（每个订阅者都收满）");
+        CHECK(allOrdered, "分组投递不破坏保序（每个订阅者顺序与发布顺序一致）");
+        std::printf("       唤醒数=%d（若逐份跨线程投递应为 %d）\n",
+                    totalWakeups,
+                    kSubs * kMsgs);
+    }
+
+    // ---- 7b. 直投分支：命中本线程时不应产生任何唤醒 ----
+    {
+        RegDirect::Options opt;
+        opt.maxShards = 1;
+        opt.fanoutThreads = 0;
+        RegDirect reg(opt);
+
+        std::vector<std::shared_ptr<MockConn>> conns;
+        for (int i = 0; i < 5; ++i)
+        {
+            auto c = std::make_shared<MockConn>();
+            conns.push_back(c);
+            reg.subscribe("direct", c, AlwaysCurrentHandle{});
+        }
+        for (int i = 0; i < 20; ++i)
+        {
+            reg.publish("direct", std::to_string(i));
+        }
+
+        CHECK(reg.crossThreadBatches() == 0, "命中本线程时不产生跨线程批次");
+        CHECK(reg.inLoopDeliveries() == 5 * 20, "本线程直投计数 = 订阅者数 × 消息数");
+
+        bool allOk = true;
+        for (const auto& c : conns)
+        {
+            std::lock_guard lock(c->m);
+            if (c->received.size() != 20)
+            {
+                allOk = false;
+            }
+        }
+        CHECK(allOk, "直投分支全部送达");
+    }
+}
+
 int main()
 {
     testStrictOrdering(0, "线程池并行扇出");
@@ -540,6 +723,7 @@ int main()
     testConcurrentChurn();
     testReshapeOrdering();
     testEdgeCases();
+    testLoopGrouping();
 
     std::printf("\n%s (failures=%d)\n", g_failures == 0 ? "ALL PASSED" : "FAILED", g_failures);
     return g_failures == 0 ? 0 : 1;

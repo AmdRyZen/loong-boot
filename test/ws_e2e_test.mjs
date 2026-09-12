@@ -203,6 +203,68 @@ async function testMalformedPayload() {
   await sleep(200);
 }
 
+// 跨 IO 线程分组投递的保序回归（A1）
+//
+// 为什么必须单独测：A1 之后每个目标 EventLoop 各自持有一个投递队列，消息由
+// 「发布者所在 loop」派发到「订阅者所在 loop」。保序现在依赖两个前提：
+//   1) 同一分片的 payload 按 FIFO 逐个派发；
+//   2) 目标 loop 的 queueInLoop 本身是 FIFO。
+// 只要有一条不成立，同一订阅者就会看到乱序 —— 而这是最难在生产上发现的一类缺陷。
+//
+// 关键点：订阅者必须足够多，才能被分散到多个 IO 线程上（本机 IO 线程数 =
+// CPU 核数 × 2）。只用 2 个订阅者可能刚好落在同一个 loop 上，测不出跨 loop 路径。
+async function testCrossLoopOrdering() {
+  console.log('test: 跨 IO 线程分组投递保序（A1）');
+
+  const N = 60; // 订阅者数：远超单 loop 承载量，强制跨多个 IO 线程
+  const M = 400; // 消息数
+
+  const subs = [];
+  for (let i = 0; i < N; i++) subs.push(await connect(`cl_${i}`));
+  const pub = subs[0];
+  await sleep(800); // 等入群公告散尽
+  for (const s of subs) s.drain();
+
+  for (let i = 0; i < M; i++) {
+    pub.send({ key: ROOM, action: 'message', msgContent: `cseq_${i}`, toUser: '' });
+  }
+
+  const seqOf = (c) =>
+    c.inbox
+      .filter((m) => typeof m.message === 'string' && m.message.startsWith('cseq_'))
+      .map((m) => Number(m.message.slice(5)));
+
+  // 等全部订阅者收满（各 loop 排空进度不同步，必须等最后一个）
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    if (subs.every((s) => seqOf(s).length >= M)) break;
+    await sleep(20);
+  }
+
+  let minGot = Infinity;
+  let allOrdered = true;
+  let unorderedSample = '';
+  for (const s of subs) {
+    const seq = seqOf(s);
+    minGot = Math.min(minGot, seq.length);
+    for (let i = 1; i < seq.length; i++) {
+      if (seq[i] !== seq[i - 1] + 1) {
+        allOrdered = false;
+        if (!unorderedSample) {
+          unorderedSample = `${s.name}: ${seq[i - 1]} 之后出现 ${seq[i]}`;
+        }
+        break;
+      }
+    }
+  }
+
+  ok(allOrdered, `全部 ${N} 个订阅者跨 loop 收包严格递增无乱序${unorderedSample ? `（${unorderedSample}）` : ''}`);
+  ok(minGot === M, `每个订阅者都收满 ${M} 条（最少收到 ${minGot} 条）`);
+
+  for (const s of subs) s.ws.close();
+  await sleep(300);
+}
+
 async function main() {
   console.log(`目标: ${BASE}  房间: ${ROOM}\n`);
   try {
@@ -211,6 +273,7 @@ async function main() {
     await testDuplicateNameIsolation();
     await testOfflineNotice();
     await testMalformedPayload();
+    await testCrossLoopOrdering();
   } catch (e) {
     console.log(`  [FAIL] 未捕获异常: ${e.message}`);
     failures++;

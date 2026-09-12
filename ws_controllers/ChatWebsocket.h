@@ -134,9 +134,9 @@ private:
 
     void checkAndEvictIdleConnections();
 
-    // 把 RoomRegistry 的房间侧快照推送到 Prometheus registry。
+    // 把 RoomRegistry 的房间侧快照与扇出分组计数推送到 Prometheus registry。
     // 由 5 秒定时任务驱动：/metrics 抓取时就不必再去加房间表的锁，
-    // 代价是最多 5 秒的滞后（gauge 类指标可以接受）。
+    // 代价是最多 5 秒的滞后（gauge 类指标可以接受；counter 看增量也不受影响）。
     void publishRoomMetrics();
 
     // 把 room 内的消息投递到本地房间 + 集群总线（+ Kafka 持久化，已按需关闭）

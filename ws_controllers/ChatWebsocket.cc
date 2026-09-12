@@ -266,8 +266,18 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
 
         Metrics::PrometheusRegistry::instance().recordWsConnect();
 
-        // 注册到房间注册表：分片直接持有连接指针，省掉 std::function 回调中转的开销
-        subscriber->id_ = roomRegistry_.subscribe(topic, wsConn);
+        // 注册到房间注册表：分片直接持有连接指针，省掉 std::function 回调中转的开销。
+        //
+        // 同时登记「该连接所属的事件循环」：drogon 的 handleNewConnection 是在
+        // 该连接的 IO 线程里同步调用的（HttpServer::websocketRequestHandling →
+        // WebsocketControllerBinder::handleNewConnection），所以此刻取到的当前线程
+        // loop 就是这条连接的归属 loop。扇出据此分组，每个目标 loop 每条消息只唤醒
+        // 一次，投递在各自 loop 线程内完成 —— 唤醒次数由 O(订阅者数) 降为 O(loop 数)。
+        //
+        // 取不到 loop 时（返回 nullptr）句柄按「本线程」处理，即回退到逐份直接 send，
+        // 语义与优化前一致，只是没有加速，不会出错。
+        subscriber->id_ = roomRegistry_.subscribe(
+            topic, wsConn, TrantorLoopHandle{trantor::EventLoop::getEventLoopOfCurrentThread()});
 
         // 同一昵称允许多端并存：注册为「昵称 -> 会话列表」，多端都能收到私聊。
         // 原实现用 emplace 存单连接，同名时静默失败，且断开时按昵称 erase 会误删新连接。
@@ -551,7 +561,9 @@ void ChatWebsocket::checkAndEvictIdleConnections()
 
 void ChatWebsocket::publishRoomMetrics()
 {
+    auto& m = Metrics::PrometheusRegistry::instance();
     const auto s = roomRegistry_.stats();
-    Metrics::PrometheusRegistry::instance().setRoomStats(
-        s.rooms, s.shards, s.subscribers, s.maxRoomSubscribers);
+    m.setRoomStats(s.rooms, s.shards, s.subscribers, s.maxRoomSubscribers);
+    // 扇出分组效果（counter，看增量）
+    m.setFanoutStats(roomRegistry_.inLoopDeliveries(), roomRegistry_.crossThreadBatches());
 }
