@@ -7,6 +7,8 @@ void PlaintextCtrl::asyncHandleHttpRequest(const HttpRequestPtr& req, std::funct
     resp->setStatusCode(k200OK);
     resp->setContentTypeCode(CT_TEXT_HTML);
     //resp->setBody("Hello World!");
-    resp->setExpiredTime(0);
+    // ⚠️ drogon 语义：0 = 永久缓存，负数 = 不缓存（默认 -1）。写 0 会把响应
+    // 按 IO 线程永久冻结。这里没有正文，但同样不该被缓存。
+    resp->setExpiredTime(-1);
     callback(resp);
 }

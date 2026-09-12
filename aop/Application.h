@@ -175,7 +175,12 @@ Application::Application()
             resp->setStatusCode(drogon::k200OK);
             resp->setContentTypeString("text/plain; version=0.0.4; charset=utf-8");
             resp->setBody(Metrics::PrometheusRegistry::instance().exportPrometheusText());
-            resp->setExpiredTime(0);
+            // ⚠️ 这里必须用负数。drogon 的 setExpiredTime 语义与直觉相反：
+            //    0 = **永久缓存**，负数 = 不缓存，默认 -1。
+            // 之前写的 0 会让每个 IO 线程把「它服务的第一个 /metrics 请求」的
+            // 快照永久冻结（缓存是 IOThreadStorage，每线程一份），之后该线程上
+            // 的所有抓取都返回旧值 —— 监控静默失真，排查时极易被误导。
+            resp->setExpiredTime(-1);
             callback(resp);
         },
         {drogon::Get});
