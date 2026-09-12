@@ -7,6 +7,7 @@
 #include "parallel_hashmap/phmap.h"
 #include "RoomRegistry.h"
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <memory_resource>
 #include <shared_mutex>
@@ -33,10 +34,11 @@ public:
         std::mt19937_64 rng(std::random_device{}());
         instanceId_ = "inst_" + std::to_string(rng());
 
-        // 注册定时任务：空闲超时连接驱逐 + 房间指标采集
+        // 注册定时任务：空闲超时连接驱逐 + 房间指标采集 + 过载日志聚合
         HttpAppFramework::instance().getLoop()->runEvery(5.0, [this] {
             checkAndEvictIdleConnections();
             publishRoomMetrics();
+            flushOverloadLog();
         });
 
         // 初始化 Redis 分布式集群网关总线
@@ -139,6 +141,14 @@ private:
     // 代价是最多 5 秒的滞后（gauge 类指标可以接受；counter 看增量也不受影响）。
     void publishRoomMetrics();
 
+    // 把「房间积压导致的丢弃」按 5 秒窗口聚合成一行日志。
+    // 逐条 LOG_WARN 在饱和时会写出 GB 级日志（实测 30s → 1.6GB / 13.8M 行），
+    // 日志 I/O 反过来拖垮扇出，因此热路径只做一次原子累加，输出交给定时任务。
+    void flushOverloadLog();
+
+    // 距上次日志汇总以来被丢弃的消息数（热路径只碰这一个原子量）。
+    std::atomic<uint64_t> overloadDropsSinceFlush_{0};
+
     // 把 room 内的消息投递到本地房间 + 集群总线（+ Kafka 持久化，已按需关闭）
     // 返回 false 表示本地分片积压达上限、消息被丢弃（调用方需计数并告知客户端）
     bool fanOutRoom(const std::string& topic, const std::string& json)
@@ -178,7 +188,11 @@ private:
         return json;
     }
 
-    // 过载时明确告知客户端消息未投递，避免「静默丢消息」让上层误以为已送达
+    // 过载时明确告知客户端消息未投递，避免「静默丢消息」让上层误以为已送达。
+    //
+    // ⚠️ 调用方必须先过 Subscriber::shouldSendOverloadNotice() 限流。
+    // 本函数本身不做限流，逐条调用会把丢弃路径变得和投递一样贵
+    // （实测 14.36M 次丢弃 → 14.36M 次额外 send）。
     static void sendOverloadNotice(const WebSocketConnectionPtr& conn)
     {
         if (conn && conn->connected())

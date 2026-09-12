@@ -61,6 +61,18 @@ public:
         wsEvictedIdle_.fetch_add(count, std::memory_order_relaxed);
     }
 
+    // 过载通知（503「消息未投递」）被限流抑制的次数。
+    //
+    // 为什么必须限流：饱和时丢弃是 O(丢弃数) 的。若每条丢弃都回一帧通知，
+    // 丢弃路径的成本就和真实投递一样高 —— 实测 30s 回声饱和压测中
+    // 14.36M 次丢弃曾产生 14.36M 次额外 send。现在按连接限流（最快 1 秒一条），
+    // 被抑制的部分记在这里。
+    // 判读：该值快速增长说明服务端确实在持续过载，应扩实例；
+    //       它本身不是错误，而是「已丢弃但未逐条告知」的差额。
+    void recordWsOverloadNoticeSuppressed(uint64_t count = 1) {
+        wsOverloadNoticeSuppressed_.fetch_add(count, std::memory_order_relaxed);
+    }
+
     // 房间侧快照（由 ChatWebsocket 的 5 秒定时任务推送）。
     // 这里存的是上一次采样的值：/metrics 抓取时无需再去加房间表的锁，
     // 代价是最多 5 秒的滞后 —— 对 gauge 类指标完全够用。
@@ -81,9 +93,15 @@ public:
     //   分组没生效（loop 抓取失败 / 回退直投）→ crossthreadBatches 会与 M×N 同量级，
     //   而 inloopDeliveries 增量接近 0。
     // 两个数都是 counter，看增量而不是绝对值。
-    void setFanoutStats(uint64_t inloopDeliveries, uint64_t crossthreadBatches) {
+    // crossthreadBatches 是「唤醒次数」，crossthreadDeliveries 是「份数」。
+    // 两者必须分开记：只看 batches 无法还原实际送达份数（batch 里裹了几个连接
+    // 是运行时才知道的），线上就少了一个「实际投递总量」的判据。
+    void setFanoutStats(uint64_t inloopDeliveries,
+                        uint64_t crossthreadBatches,
+                        uint64_t crossthreadDeliveries) {
         wsFanoutInLoop_.store(inloopDeliveries, std::memory_order_relaxed);
         wsFanoutCrossThread_.store(crossthreadBatches, std::memory_order_relaxed);
+        wsFanoutCrossThreadDeliveries_.store(crossthreadDeliveries, std::memory_order_relaxed);
     }
 
     // 生成标准 Prometheus 文本格式导出
@@ -117,7 +135,10 @@ public:
            << "ws_messages_dropped_total " << wsDroppedMessages_.load(std::memory_order_relaxed) << "\n\n"
            << "# HELP ws_evicted_idle_total WebSocket connections force-closed after the 60s idle timeout.\n"
            << "# TYPE ws_evicted_idle_total counter\n"
-           << "ws_evicted_idle_total " << wsEvictedIdle_.load(std::memory_order_relaxed) << "\n\n";
+           << "ws_evicted_idle_total " << wsEvictedIdle_.load(std::memory_order_relaxed) << "\n\n"
+           << "# HELP ws_overload_notice_suppressed_total Overload (503) notices suppressed by the per-connection rate limit.\n"
+           << "# TYPE ws_overload_notice_suppressed_total counter\n"
+           << "ws_overload_notice_suppressed_total " << wsOverloadNoticeSuppressed_.load(std::memory_order_relaxed) << "\n\n";
 
         // 房间注册表度量（由 5 秒定时任务推送，最多 5 秒滞后）
         ss << "# HELP ws_rooms_active Number of active chat rooms.\n"
@@ -141,7 +162,16 @@ public:
            << "ws_fanout_inloop_deliveries_total " << wsFanoutInLoop_.load(std::memory_order_relaxed) << "\n"
            << "# HELP ws_fanout_crossthread_batches_total Fanout batches dispatched to another IO loop (one wakeup each).\n"
            << "# TYPE ws_fanout_crossthread_batches_total counter\n"
-           << "ws_fanout_crossthread_batches_total " << wsFanoutCrossThread_.load(std::memory_order_relaxed) << "\n\n";
+           << "ws_fanout_crossthread_batches_total " << wsFanoutCrossThread_.load(std::memory_order_relaxed) << "\n"
+           << "# HELP ws_fanout_crossthread_deliveries_total Deliveries carried inside those cross-thread batches.\n"
+           << "# TYPE ws_fanout_crossthread_deliveries_total counter\n"
+           << "ws_fanout_crossthread_deliveries_total " << wsFanoutCrossThreadDeliveries_.load(std::memory_order_relaxed) << "\n"
+           << "# HELP ws_fanout_deliveries_total Total successful fanout deliveries (in-loop + cross-thread).\n"
+           << "# TYPE ws_fanout_deliveries_total counter\n"
+           << "ws_fanout_deliveries_total "
+           << (wsFanoutInLoop_.load(std::memory_order_relaxed) +
+               wsFanoutCrossThreadDeliveries_.load(std::memory_order_relaxed))
+           << "\n\n";
 
         // HTTP 度量
         ss << "# HELP http_requests_total Total HTTP requests handled.\n"
@@ -186,12 +216,14 @@ private:
     std::atomic<uint64_t> wsTotalMessages_{0};
     std::atomic<uint64_t> wsDroppedMessages_{0};
     std::atomic<uint64_t> wsEvictedIdle_{0};
+    std::atomic<uint64_t> wsOverloadNoticeSuppressed_{0};
     std::atomic<uint64_t> wsRoomsActive_{0};
     std::atomic<uint64_t> wsRoomShards_{0};
     std::atomic<uint64_t> wsRoomSubscribers_{0};
     std::atomic<uint64_t> wsRoomMaxSubscribers_{0};
     std::atomic<uint64_t> wsFanoutInLoop_{0};
     std::atomic<uint64_t> wsFanoutCrossThread_{0};
+    std::atomic<uint64_t> wsFanoutCrossThreadDeliveries_{0};
 };
 
 } // namespace Metrics

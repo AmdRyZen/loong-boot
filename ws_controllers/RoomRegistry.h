@@ -511,6 +511,14 @@ class RoomRegistryT
         return crossThreadBatches_.load(std::memory_order_relaxed);
     }
 
+    // 跨线程批次里「裹了多少份」—— batches 是唤醒次数，这个是实际投递份数。
+    // 必须分开记：只知道 batches 无法还原投递总量（一个 batch 裹几个连接
+    // 只有运行时才知道），线上就少了一个「到底投出去多少」的判据。
+    size_t crossThreadDeliveries() const noexcept
+    {
+        return crossThreadDeliveries_.load(std::memory_order_relaxed);
+    }
+
   private:
     struct Entry
     {
@@ -864,6 +872,8 @@ class RoomRegistryT
                     }
                 });
                 crossThreadBatches_.fetch_add(1, std::memory_order_relaxed);
+                // 份数在派发时就能确定：批次一旦入队必然整批执行，收件人集合不可变。
+                crossThreadDeliveries_.fetch_add(g.conns->size(), std::memory_order_relaxed);
             }
         }
     }
@@ -887,6 +897,7 @@ class RoomRegistryT
     // 分组投递效果计数（扇出热路径上每个分组各一次，即 O(loop 数) 而非 O(订阅者数)）
     mutable std::atomic<size_t> inLoopDeliveries_{0};
     mutable std::atomic<size_t> crossThreadBatches_{0};
+    mutable std::atomic<size_t> crossThreadDeliveries_{0};
 };
 
 // 生产实例：drogon WebSocket 连接 + trantor 事件循环句柄

@@ -32,7 +32,27 @@ struct Subscriber
         lastActiveNanos_.store(nowNanos(), std::memory_order_relaxed);
     }
 
+    // 过载通知（503「消息未投递」）的按连接限流。
+    //
+    // 为什么必须限流：饱和时「丢弃」是 O(丢弃数) 的，而每条丢弃若都回一帧通知，
+    // 丢弃路径的成本就和真实投递一样高 —— 实测 30s 回声饱和压测里 14.36M 次丢弃
+    // 曾产生 14.36M 次额外 send（外加 1.6GB 逐条 WARN 日志）。
+    // 限流后既不静默（客户端仍会被明确告知过载），也不再随丢弃数线性放大。
+    //
+    // CAS 语义：只有成功把时间戳推进的那一方返回 true，天然去重，无需额外锁。
+    bool shouldSendOverloadNotice(int64_t minIntervalNanos = 1'000'000'000LL)
+    {
+        const int64_t now = nowNanos();
+        int64_t last = lastOverloadNoticeNanos_.load(std::memory_order_relaxed);
+        if (now - last < minIntervalNanos)
+        {
+            return false;
+        }
+        return lastOverloadNoticeNanos_.compare_exchange_strong(last, now, std::memory_order_relaxed);
+    }
+
     std::atomic<int64_t> lastActiveNanos_{nowNanos()};
+    std::atomic<int64_t> lastOverloadNoticeNanos_{0};
 };
 
 void ChatWebsocket::produceKafkaAsync(std::string topicName, std::string payload)
@@ -220,9 +240,23 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                     // 3. 生产环境持久化：异步投递到 Kafka 历史消息流
                     if (!fanOutRoom(topic, json))
                     {
-                        Metrics::PrometheusRegistry::instance().recordWsMessageDropped();
-                        LOG_WARN << "Room backlog full, dropped message for room: " << topic;
-                        sendOverloadNotice(wsConn);
+                        auto& metrics = Metrics::PrometheusRegistry::instance();
+                        metrics.recordWsMessageDropped();
+
+                        // 告知客户端「未投递」是设计约定（背压不得静默），但必须限流：
+                        // 逐条回通知会把丢弃路径变得和投递一样贵。
+                        if (subscriber.shouldSendOverloadNotice())
+                        {
+                            sendOverloadNotice(wsConn);
+                        }
+                        else
+                        {
+                            metrics.recordWsOverloadNoticeSuppressed();
+                        }
+
+                        // 日志同样按窗口聚合：逐条 WARN 在饱和时会写出 GB 级日志，
+                        // 磁盘 I/O 反过来拖垮扇出。这里只累加，由 5 秒定时任务汇总输出。
+                        overloadDropsSinceFlush_.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
             }
@@ -564,6 +598,25 @@ void ChatWebsocket::publishRoomMetrics()
     auto& m = Metrics::PrometheusRegistry::instance();
     const auto s = roomRegistry_.stats();
     m.setRoomStats(s.rooms, s.shards, s.subscribers, s.maxRoomSubscribers);
-    // 扇出分组效果（counter，看增量）
-    m.setFanoutStats(roomRegistry_.inLoopDeliveries(), roomRegistry_.crossThreadBatches());
+    // 扇出分组效果（counter，看增量）：batches = 唤醒次数，deliveries = 实际份数
+    m.setFanoutStats(roomRegistry_.inLoopDeliveries(),
+                     roomRegistry_.crossThreadBatches(),
+                     roomRegistry_.crossThreadDeliveries());
+}
+
+void ChatWebsocket::flushOverloadLog()
+{
+    // 把窗口内被丢弃的消息数汇总成一行日志。
+    //
+    // 原实现是「每条丢弃一行 LOG_WARN」：30 秒回声饱和压测实测写出 1.6GB 日志
+    // （13.8M 行全是同一句 "Room backlog full"），日志本身成了比扇出更重的负担。
+    // 聚合后同样的负载只产生「每 5 秒一行」，信息量不减（仍能看出过载程度），
+    // 而磁盘写入量下降 5~6 个数量级。
+    const uint64_t dropped = overloadDropsSinceFlush_.exchange(0, std::memory_order_relaxed);
+    if (dropped > 0)
+    {
+        LOG_WARN << "Room backlog full: dropped " << dropped
+                 << " message(s) in the last 5s window "
+                 << "(per-message logs suppressed; see ws_messages_dropped_total)";
+    }
 }
