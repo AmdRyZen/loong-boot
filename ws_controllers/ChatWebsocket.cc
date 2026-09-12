@@ -218,17 +218,6 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                     {
                         const std::string targetUser(msg_dto.toUser);
 
-                        // 拷贝目标会话列表后在锁外发送，避免持锁做 IO
-                        std::vector<Session> targets;
-                        {
-                            std::shared_lock lock(core_->connMutex);
-                            if (const auto it = core_->userNameToConn.find(targetUser);
-                                it != core_->userNameToConn.end())
-                            {
-                                targets = it->second;
-                            }
-                        }
-
                         chatMessageVo msg_vo{};
                         msg_vo.code = 200;
                         msg_vo.id = nextMessageId();
@@ -238,37 +227,44 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                         std::string json{};
                         (void)glz::write_json(msg_vo, json);
 
-                        // 投递给目标用户的所有在线会话（多端登录），发送者自己只回显一次
-                        bool delivered = false;
+                        // ① 本实例本地投递（多端登录：该昵称的所有在线会话都收到）
                         bool echoedToSender = false;
-                        for (const auto& s : targets)
-                        {
-                            if (!s.conn || !s.conn->connected())
-                            {
-                                continue;
-                            }
-                            s.conn->send(json);
-                            delivered = true;
-                            if (s.conn == wsConn)
-                            {
-                                echoedToSender = true;
-                            }
-                        }
+                        const size_t localDelivered =
+                            deliverDirectLocally(*core_, targetUser, json, wsConn, &echoedToSender);
 
-                        if (!delivered)
+                        // 本实例查无此人，且没开集群总线 → 可以确定不在线，明确告知。
+                        // 开了总线就不能这么断言了：对方可能在别的实例上，同步无法确认，
+                        // 只能投出去让总线去找（宁可静默，也不能误报「不在线」）。
+                        if (localDelivered == 0 && !clusterBusEnabled())
                         {
-                            // 目标离线提示
                             wsConn->send(buildNoticeJson(
                                 404, "系统通知", std::format("用户 {} 当前不在线", targetUser).c_str()));
                             return;
                         }
 
+                        // ② 回显给发送者：他本人不在目标会话列表里（没收到自己那一份）才补。
+                        //    注意条件是「没回显过」而不是「本地投递成功过」——
+                        //    跨实例投递的结果同步不可知，但发送方自己的聊天窗口
+                        //    无论如何都该出现这条消息。
                         if (!echoedToSender)
                         {
                             wsConn->send(json);
                         }
 
+                        // ③ 跨实例投递。
+                        //
+                        // 昵称即身份：与本工程「同一昵称多端并存」的既有约定一致，
+                        // 因此【总是】广播给其他实例，让它们各自投给本地的同名会话。
+                        // 若改成「本地命中就不广播」，则同一昵称在别的实例上的会话
+                        // 会漏收 —— 与房间广播的语义（全实例可见）不一致。
+                        //
+                        // 代价：同实例内的 1:1 私聊也要过一次 Redis。若私聊量远超房间消息，
+                        // 更省的做法是维护 userName→实例 的路由表（需心跳与失效处理），
+                        // 但那是另一套复杂度，当前规模下不值得。
+                        publishToCluster(*core_, /*topic=*/{}, json, targetUser);
+
                         // 生产环境持久化：私聊消息异步推至 Kafka 私聊主题。
+                        // 只在发送方实例落库（接收方实例投递时不落），避免跨实例重复。
                         // 受 custom_config.enable_kafka_persistence 控制，关闭时零开销。
                         produceKafkaAsync("chat_direct_topic", json);
                         return;
@@ -533,6 +529,50 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
     }
 }
 
+size_t ChatWebsocket::deliverDirectLocally(Core& core,
+                                          const std::string& targetUser,
+                                          const std::string& json,
+                                          const WebSocketConnectionPtr& sender,
+                                          bool* echoedToSender)
+{
+    // 先在锁内拷出目标会话列表，投递放在锁外 —— 不持锁做 IO。
+    std::vector<Session> targets;
+    {
+        std::shared_lock lock(core.connMutex);
+        if (const auto it = core.userNameToConn.find(targetUser); it != core.userNameToConn.end())
+        {
+            targets = it->second;
+        }
+    }
+
+    size_t delivered = 0;
+    bool echoed = false;
+    for (const auto& s : targets)
+    {
+        if (!s.conn)
+        {
+            continue;
+        }
+        // ⚠️ 刻意不判 s.conn->connected()：那是非原子成员，而本函数可能运行在
+        // Redis 订阅回调线程上（跨实例私聊），目标连接却属于另一个 IO 线程 ——
+        // 跨线程读它就是 data race（形式上 UB，且会把整条集群路径变成随机炸弹）。
+        // 已断开的连接上调用 send 是安全的：drogon 在 sendInLoop 里静默丢弃。
+        // 「表里有」≈「在线」也成立：条目在 handleConnectionClosed 里摘除。
+        s.conn->send(json);
+        ++delivered;
+        if (sender && s.conn == sender)
+        {
+            echoed = true;
+        }
+    }
+
+    if (echoedToSender != nullptr)
+    {
+        *echoedToSender = echoed;
+    }
+    return delivered;
+}
+
 bool ChatWebsocket::clusterBusEnabled()
 {
     static const bool enabled = []() {
@@ -598,7 +638,16 @@ void ChatWebsocket::initClusterBus()
                             return;
                         }
 
-                        // 收到来自其他实例的广播，推给本实例房间内的所有客户端（同样分片并行扇出）
+                        if (!packet.toUser.empty())
+                        {
+                            // 私聊：投给本实例上该用户名的所有在线会话。
+                            // sender 传空 —— 消息来自其他实例，本实例的发送者不可能是它，
+                            // 不存在「回显给自己」的问题；本实例没有这个昵称就自然投递 0 份。
+                            deliverDirectLocally(*core, packet.toUser, packet.json, nullptr);
+                            return;
+                        }
+
+                        // 房间广播：推给本实例房间内的所有客户端（同样分片并行扇出）
                         core->roomRegistry.publish(packet.topic, packet.json);
                     }
                     catch (...)
@@ -615,7 +664,8 @@ void ChatWebsocket::initClusterBus()
     });
 }
 
-void ChatWebsocket::publishToCluster(const Core& core, const std::string& topic, const std::string& json)
+void ChatWebsocket::publishToCluster(const Core& core, const std::string& topic,
+                                     const std::string& json, const std::string& toUser)
 {
     // 未启用集群总线时直接返回：既省开销，也避免踩 drogon getRedisClient 的空条目坑
     if (!clusterBusEnabled())
@@ -641,7 +691,8 @@ void ChatWebsocket::publishToCluster(const Core& core, const std::string& topic,
         ClusterPacket packet{
             .instId = core.instanceId,
             .topic = topic,
-            .json = json
+            .json = json,
+            .toUser = toUser
         };
 
         std::string payload{};

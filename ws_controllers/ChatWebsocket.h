@@ -175,7 +175,34 @@ private:
     std::shared_ptr<Core> core_;
 
     void initClusterBus();
-    static void publishToCluster(const Core& core, const std::string& topic, const std::string& json);
+    // 把一条消息广播给集群其他实例。
+    //
+    // toUser 为空 → 房间广播（接收方按 topic 投给本地房间订阅者）
+    // toUser 非空 → 私聊（接收方按 toUser 投给本地同名会话）
+    //
+    // 两种模式共用同一条 Redis 频道、同一个 instId 回环过滤、同一个 JSON 结构，
+    // 只靠 toUser 空/非空区分 —— 少一套解析与订阅生命周期，代价是私聊也要过一次
+    // 房间广播那条路（详见 publishToCluster 实现里的取舍说明）。
+    static void publishToCluster(const Core& core, const std::string& topic,
+                                 const std::string& json, const std::string& toUser = {});
+
+    // 把一条已序列化的私聊消息投递给【本实例上】该用户名的所有在线会话。
+    // 返回投递到的会话数（0 = 本实例上没有该用户名的在线会话）。
+    //
+    // sender 用来判断「发送者本人是否也在目标会话列表里」（同昵称多端）：
+    // 在，说明他已经收到自己那一份，调用方不必再补一帧回显。
+    //
+    // ⚠️ 本函数会被两个线程调用：① 发送方的 IO 线程（本地投递）
+    //    ② Redis 订阅回调线程（跨实例收到的私聊）。
+    //    因此内部【不得】读目标连接的非原子成员（connected()/hasContext()）——
+    //    目标连接属于另一个 IO 线程，跨线程读它们是 data race（形式上 UB）。
+    //    已断开连接上调用 send 是安全的（drogon 静默丢弃），且条目会在
+    //    handleConnectionClosed 里摘除，所以「表里有」≈「在线」。
+    static size_t deliverDirectLocally(Core& core,
+                                       const std::string& targetUser,
+                                       const std::string& json,
+                                       const WebSocketConnectionPtr& sender,
+                                       bool* echoedToSender = nullptr);
     // 形参用 string_view：开关关闭时（压测/开发常态）调用方不必先构造 std::string，
     // 避免「已经拷贝完了才在函数里 short-circuit」这种白付的分配。
     // 需要所有权的地方（TBB worker）在 lambda 捕获里再落成 std::string。
@@ -218,6 +245,13 @@ private:
         std::string instId;
         std::string topic;
         std::string json;
+        // 私聊目标用户名：为空 = 房间广播（按 topic 投给本地房间），
+        // 非空 = 私聊（投给本实例上该用户名的所有在线会话）。
+        //
+        // 加这个字段是向后兼容的：glaze 对 JSON 里缺失的键不报错、成员保持默认值
+        //（已实测 error_code=0），所以旧版本实例发来的包仍能正常解析。
+        // 反向（新发旧收）会让旧实例遇到未知键而丢弃该包 —— 只在滚动升级窗口内出现。
+        std::string toUser;
     };
 
     // 扇出参数：默认值适配本机，可用环境变量覆盖（便于压测 A/B 调参，不依赖配置加载时序）
