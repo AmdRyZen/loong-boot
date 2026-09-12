@@ -12,7 +12,7 @@ std::string resolveConfigFile()
         std::string profileFile = std::string("config-") + env_profile + ".json";
         if (std::filesystem::exists(profileFile))
         {
-            LOG_INFO << "Loading config from profile environment: " << profileFile;
+            LOG_DEBUG << "Loading config from profile environment: " << profileFile;
             return profileFile;
         }
     }
@@ -36,7 +36,7 @@ int main(int argc, char* argv[])
     {
         // 允许通过命令行传参指定配置文件，如 ./loong-boot config-prod.json
         const std::string configFile = argc > 1 && argv[1] != nullptr ? argv[1] : resolveConfigFile();
-        LOG_INFO << "Active configuration: " << configFile;
+        LOG_DEBUG << "Active configuration: " << configFile;
 
         // 加载配置
         drogon::app().loadConfigFile(configFile);
@@ -103,7 +103,7 @@ int main(int argc, char* argv[])
 
         // 同时写 stdout 与日志：stdout 不受 log_level 影响（WARN 级别下 LOG_INFO
         // 是不落盘的），确保这个值在任何配置下都看得见。
-        LOG_INFO << "IO threads: " << ioThreads << " (source: " << ioThreadsSource << ")";
+        LOG_DEBUG << "IO threads: " << ioThreads << " (source: " << ioThreadsSource << ")";
         std::cout << "IO threads: " << ioThreads << " (source: " << ioThreadsSource << ")"
                   << std::endl;
 

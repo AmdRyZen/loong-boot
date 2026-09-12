@@ -5,6 +5,7 @@
 #include "rapidjson/stringbuffer.h"
 #include "threadPool/threadPool.h"
 #include "utils/redisUtils.h"
+#include "utils/DemoLog.h"
 #include <drogon/HttpClient.h>
 #include <taskflow/taskflow.hpp>  // Taskflow is header-only
 #include "boost/version.hpp"
@@ -182,7 +183,7 @@ Task<> OpenApi::tbb(const HttpRequestPtr req, std::function<void(const HttpRespo
         std::plus<>()
     ) * step;
 
-    std::cout << "tbb π ≈ " << pi_tbb << std::endl;
+    LOONG_DEMO_OUT << "tbb π ≈ " << pi_tbb << std::endl;
 
     co_return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
 }
@@ -281,20 +282,20 @@ Task<> OpenApi::algorithm(const HttpRequestPtr req, std::function<void(const Htt
     std::ranges::sort(vec);
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = end - start;
-    std::cout << "std::ranges::sort: " << elapsed.count() << " seconds\n";
+    LOONG_DEMO_OUT << "std::ranges::sort: " << elapsed.count() << " seconds\n";
 
     start = std::chrono::high_resolution_clock::now();
     std::stable_sort(std::execution::par, vec_copy.begin(), vec_copy.end());
     end = std::chrono::high_resolution_clock::now();
     elapsed = end - start;
-    std::cout << "std::ranges::stable_sort: " << elapsed.count() << " seconds\n";
+    LOONG_DEMO_OUT << "std::ranges::stable_sort: " << elapsed.count() << " seconds\n";
 
     start = std::chrono::high_resolution_clock::now();
     // C++17 引入了并行算法，通过指定执行策略（如 std::execution::par），可以利用多线程和多核处理器来加速排序。
     std::sort(std::execution::par, vec_copy1.begin(), vec_copy1.end());
     end = std::chrono::high_resolution_clock::now();
     elapsed = end - start;
-    std::cout << "std::sort std::execution::par: " << elapsed.count() << " seconds\n";
+    LOONG_DEMO_OUT << "std::sort std::execution::par: " << elapsed.count() << " seconds\n";
 
     start = std::chrono::high_resolution_clock::now();
     // std::execution::par_unseq 是一种并行执行策略，其含义是允许算法在多个线程上并行执行，并且在某些情况下可以使用向量化来优化性能。
@@ -302,15 +303,15 @@ Task<> OpenApi::algorithm(const HttpRequestPtr req, std::function<void(const Htt
     std::sort(std::execution::par_unseq, vec_copy2.begin(), vec_copy2.end());
     end = std::chrono::high_resolution_clock::now();
     elapsed = end - start;
-    std::cout << "std::sort std::execution::par_unseq: " << elapsed.count() << " seconds\n";
+    LOONG_DEMO_OUT << "std::sort std::execution::par_unseq: " << elapsed.count() << " seconds\n";
 
     std::sort(vec.begin() + 2, vec.begin() + 7); // 只排序索引从2到6的元素
 
     const bool found = std::ranges::binary_search(vec.begin(), vec.end(), 1003);
-    std::cout << "found: " << found << "\n";
+    LOONG_DEMO_OUT << "found: " << found << "\n";
 
     const auto sum = std::accumulate(vec.begin(), vec.end(), 0);
-    std::cout << "sum: " << sum << "\n";
+    LOONG_DEMO_OUT << "sum: " << sum << "\n";
 
     std::ranges::for_each(vec, [](int &x) { x += 1; });
     auto sum1 = 0;
@@ -318,27 +319,27 @@ Task<> OpenApi::algorithm(const HttpRequestPtr req, std::function<void(const Htt
     {
         sum1 += v;
     }
-    std::cout << "sum1: " << sum1 << "\n";
+    LOONG_DEMO_OUT << "sum1: " << sum1 << "\n";
 
     for(const auto& elem : vec) {
         if (elem < 0) {
-            //std::cout << "Element: " << elem << "\n";
+            //LOONG_DEMO_OUT << "Element: " << elem << "\n";
         }
     }
 
     const auto max_value = *std::ranges::max_element(vec);
     const auto min_value = *std::ranges::min_element(vec);
-    std::cout << "Max element: " << max_value << ", Min element: " << min_value << "\n";
+    LOONG_DEMO_OUT << "Max element: " << max_value << ", Min element: " << min_value << "\n";
 
     // 已排序的向量
     const bool is_sorted_flag = std::ranges::is_sorted(vec);
-    std::cout << "Is sorted: " << (is_sorted_flag ? "Yes" : "No") << "\n";
+    LOONG_DEMO_OUT << "Is sorted: " << (is_sorted_flag ? "Yes" : "No") << "\n";
 
     std::ranges::reverse(vec);
 
     // 已按倒序排列的向量
     const bool is_desc_sorted_flag = std::ranges::is_sorted(vec, std::greater<>());
-    std::cout << "Is desc_sorted_flag: " << (is_desc_sorted_flag ? "Yes" : "No") << "\n";
+    LOONG_DEMO_OUT << "Is desc_sorted_flag: " << (is_desc_sorted_flag ? "Yes" : "No") << "\n";
 
     // 排序是为了确保相同元素相邻，这样才能正确去重
     // 使用 std::unique 移动相邻的重复元素到末尾，并返回新的结尾
@@ -347,14 +348,14 @@ Task<> OpenApi::algorithm(const HttpRequestPtr req, std::function<void(const Htt
 
     // 计算去重后的和
     const auto new_sum = std::accumulate(vec.begin(), unique_end.begin(), 0);
-    std::cout << "Sum of unique elements: " << new_sum << '\n';
+    LOONG_DEMO_OUT << "Sum of unique elements: " << new_sum << '\n';
 
     // 去掉末尾重复元素
     vec.erase(unique_end.begin(), vec.end());
 
     // 输出最终去重后的向量的和  new_sum == new_sum1
     const auto new_sum1 = std::accumulate(vec.begin(), vec.end(), 0);
-    std::cout << "Sum1 of unique elements: " << new_sum1 << '\n';
+    LOONG_DEMO_OUT << "Sum1 of unique elements: " << new_sum1 << '\n';
 
 
     //std::set_union: 计算两个有序范围的并集。
@@ -363,19 +364,19 @@ Task<> OpenApi::algorithm(const HttpRequestPtr req, std::function<void(const Htt
     //std::set_symmetric_difference: 计算两个有序范围的对称差集。
     std::vector<int> result;
     std::ranges::set_union(vec.begin(), vec.end(), vec_copy.begin(), vec_copy.end(), std::back_inserter(result));
-    std::cout << "set_union size: " << result.size() << '\n';
+    LOONG_DEMO_OUT << "set_union size: " << result.size() << '\n';
 
     std::vector<int> result1;
     std::ranges::set_intersection(vec.begin(), vec.end(), vec_copy.begin(), vec_copy.end(), std::back_inserter(result1));
-    std::cout << "set_intersection size: " << result1.size() << '\n';
+    LOONG_DEMO_OUT << "set_intersection size: " << result1.size() << '\n';
 
     std::vector<int> result2;
     std::ranges::set_difference(vec.begin(), vec.end(), vec_copy.begin(), vec_copy.end(), std::back_inserter(result2));
-    std::cout << "set_difference size: " << result2.size() << '\n';
+    LOONG_DEMO_OUT << "set_difference size: " << result2.size() << '\n';
 
     std::vector<int> result3;
     std::ranges::set_symmetric_difference(vec.begin(), vec.end(), vec_copy.begin(), vec_copy.end(), std::back_inserter(result3));
-    std::cout << "set_symmetric_difference size: " << result3.size() << '\n';
+    LOONG_DEMO_OUT << "set_symmetric_difference size: " << result3.size() << '\n';
 
     co_return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
 }
@@ -390,25 +391,25 @@ Task<> OpenApi::aes(const HttpRequestPtr req, std::function<void(const HttpRespo
         const std::string input = "123456";
 
         aes_response_data_vo.hash = opensslCrypto::sha3_256(input);
-        //std::cout << "SHA-256 Hash: " << hash << std::endl;
+        //LOONG_DEMO_OUT << "SHA-256 Hash: " << hash << std::endl;
 
         // 不建议使用md5 虽然性能更好
         aes_response_data_vo.md5_hash = opensslCrypto::md5(input);
-        //std::cout << "MD5: " << md5_hash << std::endl;
+        //LOONG_DEMO_OUT << "MD5: " << md5_hash << std::endl;
 
         const std::string keyHex = "0123456789abcdef0123456789abcdef";
         const std::string ivHex = "0123456789abcdef0123456789abcdef";
         const std::string plaintext = "谢谢谢谢谢寻寻👀👀👀👀你好啊👀👀xxxx";
 
         aes_response_data_vo.encrypted = opensslCrypto::AesCBCPk5EncryptBase64(plaintext, keyHex, ivHex);
-        //std::cout << "Encrypted: " << encrypted << std::endl;
+        //LOONG_DEMO_OUT << "Encrypted: " << encrypted << std::endl;
 
         aes_response_data_vo.decrypted = opensslCrypto::AesCBCPk5DecryptBase64(aes_response_data_vo.encrypted, keyHex, ivHex);
-        //std::cout << "Decrypted: " << decrypted << std::endl;
+        //LOONG_DEMO_OUT << "Decrypted: " << decrypted << std::endl;
 
     } catch (const std::exception& e)
     {
-        std::cout << "aes: err  " << e.what() << std::endl;
+        LOONG_DEMO_OUT << "aes: err  " << e.what() << std::endl;
     }
     co_return callback(Base<AesResponseDataVo>::createHttpSuccessResponse(StatusOK, Success, aes_response_data_vo));
 }
@@ -449,8 +450,8 @@ void add_arrays(const mp::cpp_dec_float_100* a, const mp::cpp_dec_float_100* b, 
 #define ARRAY_SIZE 4
 Task<> OpenApi::boost(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
 {
-    std::cout << BOOST_LIB_VERSION << std::endl;
-    std::cout << BOOST_VERSION << std::endl;
+    LOONG_DEMO_OUT << BOOST_LIB_VERSION << std::endl;
+    LOONG_DEMO_OUT << BOOST_VERSION << std::endl;
 
 
     mp::cpp_dec_float_100 a1[ARRAY_SIZE] = {1.1, 2.2, 3.3, 4.4};
@@ -459,11 +460,11 @@ Task<> OpenApi::boost(const HttpRequestPtr req, std::function<void(const HttpRes
 
     add_arrays(a1, b1, result, ARRAY_SIZE);
 
-    std::cout << "Result:" << std::endl;
+    LOONG_DEMO_OUT << "Result:" << std::endl;
     for (const auto & i : result) {
-        std::cout <<  std::fixed << std::setprecision(2) << i << "； ";
+        LOONG_DEMO_OUT <<  std::fixed << std::setprecision(2) << i << "； ";
     }
-    std::cout << std::endl;
+    LOONG_DEMO_OUT << std::endl;
 
 
     // 定义固定精度的十进制浮点数，精度为100位
@@ -473,7 +474,7 @@ Task<> OpenApi::boost(const HttpRequestPtr req, std::function<void(const HttpRes
     money += 10; // 加上10元
 
     // 设置输出格式并输出结果
-    std::cout << "Money: " << std::fixed << std::setprecision(2) << money << std::endl;
+    LOONG_DEMO_OUT << "Money: " << std::fixed << std::setprecision(2) << money << std::endl;
 
 
     // 定义两个高精度的十进制浮点数
@@ -482,59 +483,59 @@ Task<> OpenApi::boost(const HttpRequestPtr req, std::function<void(const HttpRes
 
     // 加法
     mp::cpp_dec_float_100 sum = a + b;
-    std::cout << "Sum: " << sum << std::endl;
+    LOONG_DEMO_OUT << "Sum: " << sum << std::endl;
 
     // 减法
     mp::cpp_dec_float_100 diff = a - b;
-    std::cout << "Difference: " << diff << std::endl;
+    LOONG_DEMO_OUT << "Difference: " << diff << std::endl;
 
     // 乘法
     mp::cpp_dec_float_100 prod = a * b;
-    std::cout << "Product: " << prod << std::endl;
+    LOONG_DEMO_OUT << "Product: " << prod << std::endl;
 
     // 除法
     mp::cpp_dec_float_100 quot = a / b;
-    std::cout << "Quotient: " << quot << std::endl;
+    LOONG_DEMO_OUT << "Quotient: " << quot << std::endl;
 
 
-    std::cout << "multiprecision end : ------------------" << std::endl;
+    LOONG_DEMO_OUT << "multiprecision end : ------------------" << std::endl;
 
     // std::async函数启动一个异步任务，传入func1和一个int值作为参数
     //std::future<void> f = std::async(printerFunc);
 
     // 在主线程中做一些其他事情
-    std::cout << "Doing something else in main thread." << std::endl;
+    LOONG_DEMO_OUT << "Doing something else in main thread." << std::endl;
 
-    std::cout << boost::format("Hello %s! You are %d years old.") % "Tom" % 25 << std::endl;
+    LOONG_DEMO_OUT << boost::format("Hello %s! You are %d years old.") % "Tom" % 25 << std::endl;
 
     std::string email = "someone@example.com";
     boost::regex pattern(R"(\b[a-zA-Z0-9._%-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,4}\b)");
     if (boost::regex_match(email, pattern))
-        std::cout << "Valid email address." << std::endl;
+        LOONG_DEMO_OUT << "Valid email address." << std::endl;
     else
-        std::cout << "Invalid email address." << std::endl;
+        LOONG_DEMO_OUT << "Invalid email address." << std::endl;
 
     boost::random::mt19937 rng;                            // create a random number generator
     boost::random::uniform_int_distribution<> dist(0, 9);  // create a uniform distribution
     for (int i = 0; i < 10; ++i)                           // generate and print 10 random numbers
-        std::cout << dist(rng) << " ";
-    std::cout << std::endl;
+        LOONG_DEMO_OUT << dist(rng) << " ";
+    LOONG_DEMO_OUT << std::endl;
 
     // 创建一个date对象，表示今天的日期
     date today = day_clock::local_day();
-    std::cout << "Today is: " << today << std::endl;
+    LOONG_DEMO_OUT << "Today is: " << today << std::endl;
 
     // 创建一个date对象，表示2023年2月14日
     date valentine(2023, Feb, 14);
-    std::cout << "Valentine's day is: " << valentine << std::endl;
+    LOONG_DEMO_OUT << "Valentine's day is: " << valentine << std::endl;
 
     // 创建一个date对象，表示从字符串解析的日期
     date birthday(from_string("2000-01-01"));
-    std::cout << "Birthday is: " << birthday << std::endl;
+    LOONG_DEMO_OUT << "Birthday is: " << birthday << std::endl;
 
     // 计算两个日期之间的差值，返回一个date_duration对象
     date_duration days_to_valentine = valentine - today;
-    std::cout << "Days to Valentine's day: " << days_to_valentine.days() << std::endl;
+    LOONG_DEMO_OUT << "Days to Valentine's day: " << days_to_valentine.days() << std::endl;
 
     co_return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
 }
@@ -549,9 +550,9 @@ void OpenApi::curlPost(const HttpRequestPtr& req, std::function<void(const HttpR
     std::string ciphertext = aes.encrypt(plaintext);
     std::string decryptedtext = aes.decrypt(ciphertext);
 
-    std::cout << "Plaintext: " << plaintext << std::endl;
-    std::cout << "Ciphertext: " << ciphertext << std::endl;
-    std::cout << "Decryptedtext: " << decryptedtext << std::endl;*/
+    LOONG_DEMO_OUT << "Plaintext: " << plaintext << std::endl;
+    LOONG_DEMO_OUT << "Ciphertext: " << ciphertext << std::endl;
+    LOONG_DEMO_OUT << "Decryptedtext: " << decryptedtext << std::endl;*/
 
 
 
@@ -562,9 +563,9 @@ void OpenApi::curlPost(const HttpRequestPtr& req, std::function<void(const HttpR
     const auto client = drogon::HttpClient::newHttpClient(url);
     // aes
     /*std::string encryptedText = cipherUtils::encrypt_cbc(SbcConvertService::ws2s(SbcConvertService::s2ws(param)), aes128Key, aes128Key);
-    std::cout << "encryptedText = " << encryptedText << std::endl;
+    LOONG_DEMO_OUT << "encryptedText = " << encryptedText << std::endl;
     const std::string& pwd = cipherUtils::decrypt_cbc(encryptedText, aes128Key, aes128Key);
-    std::cout << "pwd = " << pwd << std::endl;*/
+    LOONG_DEMO_OUT << "pwd = " << pwd << std::endl;*/
 
     // md5
     /*unsigned char encrypt[] = "id=1111&timestamp=1638263374&key=xxxxx";
@@ -577,7 +578,7 @@ void OpenApi::curlPost(const HttpRequestPtr& req, std::function<void(const HttpR
     {
         printf("%02x", i);
     }
-    std::cout << std::endl;*/
+    LOONG_DEMO_OUT << std::endl;*/
 
     Json::Value params;
     params["channelId"] = "1111111111";
@@ -585,7 +586,7 @@ void OpenApi::curlPost(const HttpRequestPtr& req, std::function<void(const HttpR
     params["param"] = "encryptedText";
     params["sign"] = "8482024d6c64fe364873725ea0e19008";
 
-    std::cout << "__params = " << params.toStyledString() << std::endl;
+    LOONG_DEMO_OUT << "__params = " << params.toStyledString() << std::endl;
 
     const auto request = drogon::HttpRequest::newHttpRequest();
     request->addHeader("Content-Type", "application/json");
@@ -598,7 +599,7 @@ void OpenApi::curlPost(const HttpRequestPtr& req, std::function<void(const HttpR
         [](ReqResult result, const HttpResponsePtr& response) {
             if (result != ReqResult::Ok)
             {
-                std::cout
+                LOONG_DEMO_OUT
                     << "error while sending request to server! result: "
                     << result << std::endl;
                 return;
@@ -606,9 +607,9 @@ void OpenApi::curlPost(const HttpRequestPtr& req, std::function<void(const HttpR
 
             if (200 != response->statusCode())
             {
-                std::cout << "cpp-demo : 接收反馈error = " << response->statusCode() << std::endl;
+                LOONG_DEMO_OUT << "cpp-demo : 接收反馈error = " << response->statusCode() << std::endl;
             }
-            std::cout << "cpp-demo : 接收反馈result = " << response->getBody() << std::endl;
+            LOONG_DEMO_OUT << "cpp-demo : 接收反馈result = " << response->getBody() << std::endl;
         });
 
     callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
@@ -625,10 +626,10 @@ Task<> OpenApi::getValue(const HttpRequestPtr req,
     (void) glz::write_json(memberInfoVo, json_output);
 
     const bool setCoroRedisValue  = co_await redisUtils::setCoroRedisValue("aa", json_output);
-    std::cout << "setCoroRedisValue = " << setCoroRedisValue << std::endl;
+    LOONG_DEMO_OUT << "setCoroRedisValue = " << setCoroRedisValue << std::endl;
     const bool existsCoroRedisKey = co_await redisUtils::existsCoroRedisKey("aa");
-    std::cout << "existsCoroRedisKey = " << existsCoroRedisKey << std::endl;
-    std::cout << "ttlCoroRedisKey = " << co_await redisUtils::ttlCoroRedisKey("aa") << std::endl;
+    LOONG_DEMO_OUT << "existsCoroRedisKey = " << existsCoroRedisKey << std::endl;
+    LOONG_DEMO_OUT << "ttlCoroRedisKey = " << co_await redisUtils::ttlCoroRedisKey("aa") << std::endl;
     const std::string redis_value = co_await redisUtils::getCoroRedisValue("aa");
 
     MemberInfoVo memberInfo{};
@@ -639,9 +640,9 @@ Task<> OpenApi::getValue(const HttpRequestPtr req,
 
     co_await redisUtils::setExCoroRedisValue("bb", 10, "xxx");
     const std::string redis_value_bb = co_await redisUtils::getCoroRedisValue("bb");
-    std::cout << "redis_value_bb = " << redis_value_bb << std::endl;
+    LOONG_DEMO_OUT << "redis_value_bb = " << redis_value_bb << std::endl;
     const long redis_value_ttl = co_await redisUtils::ttlCoroRedisKey("bb");
-    std::cout << "redis_value_ttl = " << redis_value_ttl << std::endl;
+    LOONG_DEMO_OUT << "redis_value_ttl = " << redis_value_ttl << std::endl;
 
     co_return callback(Base<MemberInfoVo>::createHttpSuccessResponse(StatusOK, Success, memberInfo));
 }
@@ -855,35 +856,35 @@ double testJsonCppDeserialize(const std::string& json_str, const int loops) {
 Task<> OpenApi::fastJson(const HttpRequestPtr req, std::function<void(const HttpResponsePtr&)> callback)
 {
     /*GOOGLE_PROTOBUF_VERIFY_VERSION;
-    std::cout << "Protocol Buffers version: " << GOOGLE_PROTOBUF_VERSION << std::endl;*/
+    LOONG_DEMO_OUT << "Protocol Buffers version: " << GOOGLE_PROTOBUF_VERSION << std::endl;*/
 
     const MyStruct s{};
     constexpr int loops = 1000000;
 
     // 如果有 protobuf proto
     // auto protobufTime = testProtobuf(s, loops);
-    // std::cout << std::format("Protobuf serialize cost: {:.3f} us\n", protobufTime);
+    // LOONG_DEMO_OUT << std::format("Protobuf serialize cost: {:.3f} us\n", protobufTime);
 
     auto glazeJsonTime = testGlazeJson(s, loops);
-    std::cout << std::format("Glaze JSON serialize cost: {:.3f} us\n", glazeJsonTime);
+    LOONG_DEMO_OUT << std::format("Glaze JSON serialize cost: {:.3f} us\n", glazeJsonTime);
 
     auto glazeJsonTbbTime = testGlazeJsonTbb(s, loops);
-    std::cout << std::format("Glaze JSON TBB serialize cost: {:.3f} us\n", glazeJsonTbbTime);
+    LOONG_DEMO_OUT << std::format("Glaze JSON TBB serialize cost: {:.3f} us\n", glazeJsonTbbTime);
 
     auto glazeBeveTime = testGlazeBeve(s, loops);
-    std::cout << std::format("Glaze BEVE serialize cost: {:.3f} us\n", glazeBeveTime);
+    LOONG_DEMO_OUT << std::format("Glaze BEVE serialize cost: {:.3f} us\n", glazeBeveTime);
 
     auto glazeBeveTbbTime = testGlazeBeveTbb(s, loops);
-    std::cout << std::format("Glaze BEVE TBB serialize cost: {:.3f} us\n", glazeBeveTbbTime);
+    LOONG_DEMO_OUT << std::format("Glaze BEVE TBB serialize cost: {:.3f} us\n", glazeBeveTbbTime);
 
     auto nlohmannTime = testNlohmannJson(s, loops);
-    std::cout << std::format("nlohmann JSON serialize cost: {:.3f} us\n", nlohmannTime);
+    LOONG_DEMO_OUT << std::format("nlohmann JSON serialize cost: {:.3f} us\n", nlohmannTime);
 
     auto rapidjsonTime = testRapidJson(s, loops);
-    std::cout << std::format("RapidJSON serialize cost: {:.3f} us\n", rapidjsonTime);
+    LOONG_DEMO_OUT << std::format("RapidJSON serialize cost: {:.3f} us\n", rapidjsonTime);
 
     auto jsonCppTime = testJsonCpp(s, loops);
-    std::cout << std::format("jsonCpp serialize cost: {:.3f} us\n", jsonCppTime);
+    LOONG_DEMO_OUT << std::format("jsonCpp serialize cost: {:.3f} us\n", jsonCppTime);
 
     // 预先序列化得到字符串和二进制数据，供反序列化测试使用
     std::string glaze_json_str;
@@ -895,19 +896,19 @@ Task<> OpenApi::fastJson(const HttpRequestPtr req, std::function<void(const Http
 
     // 反序列化测试
     auto glazeJsonDesTime = testGlazeJsonDeserialize(glaze_json_str, loops);
-    std::cout << std::format("Glaze JSON deserialize cost: {:.3f} us\n", glazeJsonDesTime);
+    LOONG_DEMO_OUT << std::format("Glaze JSON deserialize cost: {:.3f} us\n", glazeJsonDesTime);
 
     auto glazeBeveDesTime = testGlazeBeveDeserialize(glaze_beve_buffer, loops);
-    std::cout << std::format("Glaze BEVE deserialize cost: {:.3f} us\n", glazeBeveDesTime);
+    LOONG_DEMO_OUT << std::format("Glaze BEVE deserialize cost: {:.3f} us\n", glazeBeveDesTime);
 
     auto nlohmannDesTime = testNlohmannJsonDeserialize(glaze_json_str, loops);
-    std::cout << std::format("nlohmann JSON deserialize cost: {:.3f} us\n", nlohmannDesTime);
+    LOONG_DEMO_OUT << std::format("nlohmann JSON deserialize cost: {:.3f} us\n", nlohmannDesTime);
 
     auto rapidjsonDesTime = testRapidJsonDeserialize(glaze_json_str, loops);
-    std::cout << std::format("RapidJSON deserialize cost: {:.3f} us\n", rapidjsonDesTime);
+    LOONG_DEMO_OUT << std::format("RapidJSON deserialize cost: {:.3f} us\n", rapidjsonDesTime);
 
     auto jsonCppDesTime = testJsonCppDeserialize(glaze_json_str, loops);
-    std::cout << std::format("jsoncpp deserialize cost: {:.3f} us\n", jsonCppDesTime);
+    LOONG_DEMO_OUT << std::format("jsoncpp deserialize cost: {:.3f} us\n", jsonCppDesTime);
 
 
     // protobuf
@@ -931,7 +932,7 @@ Task<> OpenApi::fastJson(const HttpRequestPtr req, std::function<void(const Http
     ofs.write(output.data(), static_cast<std::streamsize>(output.size()));
     ofs.close();*/
 
-    LOG_INFO << "Binary file generated successfully.";
+    LOG_DEBUG << "Binary file generated successfully.";
 
     co_return callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
 }
@@ -954,7 +955,7 @@ inline void threadF1()
         std::lock_guard<std::mutex> lk(mtx);
         thread_local int count = 0;
         ++count;
-        std::cout << "count: " << count << std::endl;
+        LOONG_DEMO_OUT << "count: " << count << std::endl;
         // 当前线程休眠1毫秒
         //std::this_thread::sleep_for(std::chrono::milliseconds(1));
         ++value1;
@@ -973,8 +974,8 @@ Task<> OpenApi::threadPool(const HttpRequestPtr req, std::function<void(const Ht
     });
     TbbCoroutinePool::instance().waitAll();
 
-    std::cout << "value = " << value << std::endl;
-    std::cout << "value1 = " << value1 << std::endl;
+    LOONG_DEMO_OUT << "value = " << value << std::endl;
+    LOONG_DEMO_OUT << "value1 = " << value1 << std::endl;
 
     // taskflow.github.io
     tf::Executor executor;
@@ -986,8 +987,8 @@ Task<> OpenApi::threadPool(const HttpRequestPtr req, std::function<void(const Ht
 
     // now - use std::future instead
     std::future<bool> fu = executor.async([&count]() {
-        std::cout << "async task returns boolean" << std::endl;
-        std::cout << "count = " << count << std::endl;
+        LOONG_DEMO_OUT << "async task returns boolean" << std::endl;
+        LOONG_DEMO_OUT << "count = " << count << std::endl;
         if (count >= 0)
         {
             return true;
@@ -997,13 +998,13 @@ Task<> OpenApi::threadPool(const HttpRequestPtr req, std::function<void(const Ht
     fu.get();
 
     executor.silent_async([]() {
-        std::cout << "async task of no return" << std::endl;
+        LOONG_DEMO_OUT << "async task of no return" << std::endl;
     });
 
     // launch an asynchronous task from a running task
     taskflow.emplace([&]() {
         executor.async([]() {
-            std::cout << "async task within a task" << std::endl;
+            LOONG_DEMO_OUT << "async task within a task" << std::endl;
         });
     });
 
@@ -1018,7 +1019,7 @@ Task<> OpenApi::threadPool(const HttpRequestPtr req, std::function<void(const Ht
     constexpr double foo = 0.0;
     constexpr double bar = 1.0;
     if (auto constexpr res = foo <=> bar; res < nullptr) [[likely]]
-        std::cout << "foo 小于 bar" << std::endl;
+        LOONG_DEMO_OUT << "foo 小于 bar" << std::endl;
 
     co_return callback(Base<bool>::createHttpSuccessResponse(StatusOK, Success, future_ret));
 }
@@ -1051,9 +1052,9 @@ Task<> OpenApi::fix(const HttpRequestPtr req, std::function<void(const HttpRespo
     //static std::aligned_storage<sizeof(Data), alignof(Data)>::type data;
     //Data* attr = new (&data) Data;
     //attr->data["data"] = "aligned_storage";
-    //std::cout << attr->data << std::endl;
-    //std::cout << "attr = " << sizeof(attr) << std::endl;
-    std::cout << "__data = " << sizeof(_data) << std::endl;
+    //LOONG_DEMO_OUT << attr->data << std::endl;
+    //LOONG_DEMO_OUT << "attr = " << sizeof(attr) << std::endl;
+    LOONG_DEMO_OUT << "__data = " << sizeof(_data) << std::endl;
 
     auto v = co_await clientPtr->execSqlCoro("select user_id from xxxxx where  original_number != 0 and op_number != 0  group by user_id having count(1) > 1 order by create_time");
     for (auto && n : v)
@@ -1089,7 +1090,7 @@ Task<> OpenApi::fix(const HttpRequestPtr req, std::function<void(const HttpRespo
         }
     }
 
-    std::cout << "size  = " << _data.data.size() << std::endl;
+    LOONG_DEMO_OUT << "size  = " << _data.data.size() << std::endl;
 
     co_return callback(Base<Json::Value>::createHttpSuccessResponse(StatusOK, Success, _data.data));
 }
@@ -1117,22 +1118,22 @@ Task<> OpenApi::random(const HttpRequestPtr req, std::function<void(const HttpRe
     {
         auto inta = int_dis(random);
         value.push_back(inta);
-        std::cout << inta << ' ';
+        LOONG_DEMO_OUT << inta << ' ';
     }
-    std::cout << std::endl;
+    LOONG_DEMO_OUT << std::endl;
 
     for (int i = 0; i < 10; ++i)
     {
-        std::cout << real_dis(random) << ' ';
+        LOONG_DEMO_OUT << real_dis(random) << ' ';
     }
-    std::cout << std::endl;
+    LOONG_DEMO_OUT << std::endl;
 
     auto const [first, second] = std::minmax_element(value.begin(), value.end());
-    std::cout << "min element at: " << *first << std::endl;
-    std::cout << "max element at: " << *second << std::endl;
+    LOONG_DEMO_OUT << "min element at: " << *first << std::endl;
+    LOONG_DEMO_OUT << "max element at: " << *second << std::endl;
     std::ranges::sort(value.begin(), value.end());
     std::ranges::for_each(value.begin(), value.end(), [&](const auto& item) {
-        std::cout << item << std::endl;
+        LOONG_DEMO_OUT << item << std::endl;
     });
     value.clear();
 
@@ -1150,13 +1151,13 @@ Task<> OpenApi::taskflow(HttpRequestPtr req, std::function<void(const HttpRespon
 
     // 创建一个循环，执行 5 次
     auto loop = taskflow.emplace([&count1](){
-                            std::cout << "Loop iteration " << count1 << std::endl;
+                            LOONG_DEMO_OUT << "Loop iteration " << count1 << std::endl;
                             count1++;
                         }).name("loop");
 
     // 创建一个条件任务，当 count2 小于 3 时执行
     auto condition = taskflow.emplace([&count2](){
-                                 std::cout << "Condition check " << count2 << std::endl;
+                                 LOONG_DEMO_OUT << "Condition check " << count2 << std::endl;
                                  count2++;
                                  return count2 < 3;
                              }).name("condition");
@@ -1168,13 +1169,13 @@ Task<> OpenApi::taskflow(HttpRequestPtr req, std::function<void(const HttpRespon
     // 执行任务流
     executor.run(taskflow).wait();
 
-    std::cout << "-----------------" << std::endl;
+    LOONG_DEMO_OUT << "-----------------" << std::endl;
 
     auto [A, B, C, D] = taskflow.emplace(  // create four tasks
-        [] () { std::cout << "TaskA\n"; },
-        [] () { std::cout << "TaskB\n"; },
-        [] () { std::cout << "TaskC\n"; },
-        [] () { std::cout << "TaskD\n"; }
+        [] () { LOONG_DEMO_OUT << "TaskA\n"; },
+        [] () { LOONG_DEMO_OUT << "TaskB\n"; },
+        [] () { LOONG_DEMO_OUT << "TaskC\n"; },
+        [] () { LOONG_DEMO_OUT << "TaskD\n"; }
     );
 
     A.precede(B, C);  // A runs before B and C
@@ -1208,10 +1209,10 @@ Task<> OpenApi::taskflow(HttpRequestPtr req, std::function<void(const HttpRespon
 
     // create asynchronous tasks directly from an executor
     std::future<int> future = executor.async([](){
-        std::cout << "async task returns 1\n";
+        LOONG_DEMO_OUT << "async task returns 1\n";
         return 1;
     });
-    executor.silent_async([](){ std::cout << "async task does not return\n"; });
+    executor.silent_async([](){ LOONG_DEMO_OUT << "async task does not return\n"; });
 
     // create asynchronous tasks with dynamic dependencies
     tf::AsyncTask A2 = executor.silent_dependent_async([](){ printf("A\n"); });

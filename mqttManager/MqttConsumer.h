@@ -81,7 +81,7 @@ private:
     }
 
     static void handleMqttMessage(const std::string& message) {
-        LOG_INFO << "Message received: " << message;
+        LOG_DEBUG << "Message received: " << message;
     }
 
     mqtt::async_client* client_{nullptr};

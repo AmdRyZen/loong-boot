@@ -25,7 +25,7 @@ public:
 
         try {
             client_->connect(connOpts)->wait();
-            LOG_INFO << "Connected to the MQTT broker.";
+            LOG_DEBUG << "Connected to the MQTT broker.";
         } catch (const mqtt::exception& exc) {
             LOG_ERROR << "Error: " << exc.what();
         }
@@ -51,14 +51,14 @@ public:
 
     ~MqttManager() {
         try {
-            LOG_INFO << "Disconnecting from MQTT broker...";
+            LOG_DEBUG << "Disconnecting from MQTT broker...";
             if (client_) {
                 if (client_->is_connected()) {
                     client_->disconnect()->wait();
                 }
                 client_.reset();
             }
-            LOG_INFO << "Disconnected from the MQTT broker.";
+            LOG_DEBUG << "Disconnected from the MQTT broker.";
         } catch (const mqtt::exception& e) {
             LOG_ERROR << "Exception during destruction: " << e.what();
         }

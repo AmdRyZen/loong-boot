@@ -325,7 +325,8 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
             userNameToConn_[userName].push_back(wsConn);
         }
 
-        LOG_INFO << "Added connection for user: " << userName << " Subscriber ID: " << subscriber->id_
+        // 每连接一条的诊断信息，不是「有问题」的信号 → DEBUG
+        LOG_DEBUG << "Added connection for user: " << userName << " Subscriber ID: " << subscriber->id_
                  << ", Topic: " << topic;
 
         chatMessageVo msg_vo;
@@ -382,11 +383,11 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
                 }
             }
         }
-        LOG_INFO << "Removed user: " << userName;
+        LOG_DEBUG << "Removed user: " << userName;
 
         roomRegistry_.unsubscribe(topic, id);
         Metrics::PrometheusRegistry::instance().recordWsDisconnect();
-        LOG_INFO << "Unsubscribed from topic: " << topic << ", ID: " << id;
+        LOG_DEBUG << "Unsubscribed from topic: " << topic << ", ID: " << id;
 
         chatMessageVo msg_vo;
         msg_vo.code = 200;
@@ -439,7 +440,7 @@ void ChatWebsocket::initClusterBus()
         {
             if (!clusterBusEnabled())
             {
-                LOG_INFO << "Redis Cluster Bus disabled (custom_config.enable_cluster_bus != true), "
+                LOG_DEBUG << "Redis Cluster Bus disabled (custom_config.enable_cluster_bus != true), "
                             "running in standalone mode.";
                 return;
             }
@@ -481,7 +482,7 @@ void ChatWebsocket::initClusterBus()
                     }
                 });
 
-            LOG_INFO << "Redis Cluster Bus initialized successfully, instanceId: " << instanceId_;
+            LOG_DEBUG << "Redis Cluster Bus initialized successfully, instanceId: " << instanceId_;
         }
         catch (const std::exception& e)
         {

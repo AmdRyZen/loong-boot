@@ -27,7 +27,7 @@ public:
         try
         {
             initializeConsumers(numThreads);
-            LOG_INFO << "AsyncKafkaConsumer consumer started with " << numThreads << " threads.";
+            LOG_DEBUG << "AsyncKafkaConsumer consumer started with " << numThreads << " threads.";
         }
         catch (const std::exception& e)
         {
@@ -47,7 +47,7 @@ public:
             }
         }
         consumers_.clear();
-        LOG_INFO << "AsyncKafkaConsumer consumer stopped.";
+        LOG_DEBUG << "AsyncKafkaConsumer consumer stopped.";
     }
 
 private:
@@ -102,7 +102,7 @@ private:
                 {
                     if (msg->err == RD_KAFKA_RESP_ERR__PARTITION_EOF)
                     {
-                        LOG_ERROR << "AsyncKafkaConsumer Reached end of partition.";
+                        LOG_DEBUG << "AsyncKafkaConsumer Reached end of partition.";
                     }
                     else
                     {

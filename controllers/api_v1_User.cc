@@ -1,6 +1,7 @@
 #include "api_v1_User.h"
 #include "jwt-cpp/jwt.h"
 #include "utils/redisUtils.h"
+#include "utils/DemoLog.h"
 #include "filters/SqlFilter.h"
 #include <filesystem>
 #include <fstream>
@@ -123,15 +124,15 @@ Task<> User::buildSql(HttpRequestPtr req, std::function<void(const HttpResponseP
             selectCount.where(column("id") < 3 and column("author") != "xxx");
         }
 
-        std::cout << "select: " << select.str() << std::endl;
-        std::cout << "selectCount: " << selectCount.str() << std::endl;
+        LOONG_DEMO_OUT << "select: " << select.str() << std::endl;
+        LOONG_DEMO_OUT << "selectCount: " << selectCount.str() << std::endl;
 
         auto clientPtr = drogon::app().getFastDbClient();
 
         auto xxx = co_await clientPtr->execSqlCoro(select.str());
         auto xxxCount = co_await clientPtr->execSqlCoro(selectCount.str());
-        std::cout << "xxx: " << xxx.size() << std::endl;
-        std::cout << "xxxCount: " <<  xxxCount[0][0].as<std::size_t>() << std::endl;
+        LOONG_DEMO_OUT << "xxx: " << xxx.size() << std::endl;
+        LOONG_DEMO_OUT << "xxxCount: " <<  xxxCount[0][0].as<std::size_t>() << std::endl;
 
     }
     catch (...)
@@ -284,6 +285,10 @@ Task<> User::getInfo(HttpRequestPtr req,
                      std::string userId,
                      const std::string token)
 {
+    // 访问审计：谁读了谁的资料。
+    // 有意保留在 INFO（不是 DEBUG）—— 它是「正常但值得留痕」的事件，
+    // 与那些纯诊断噪声不同。config.json 的 log_level 是 WARN，所以默认不落盘；
+    // 需要审计时把 log_level 调到 INFO 即可，不必改代码。
     LOG_INFO << "User " << userId << " get his information";
 
     auto clientPtr = app().getFastDbClient();
@@ -305,7 +310,7 @@ Task<> User::getInfo(HttpRequestPtr req,
             };
 
             auto sql = SqlFilter::BuildConditionsSQLWithParams(conditionsParams);
-            std::cout << "1111111 构建 WHERE 子句: " << sql << std::endl;
+            LOONG_DEMO_OUT << "1111111 构建 WHERE 子句: " << sql << std::endl;
             // sql: " WHERE (id > ? AND id < ?) OR author = ?"
             // params: ["10", "100", "admin"]
 
@@ -341,7 +346,7 @@ Task<> User::getInfo(HttpRequestPtr req,
 
             // 调用构造 SQL 字符串函数（改造后只返回字符串）
             std::string sql1 = SqlFilter::BuildSQLFromExprTreeWithValues(rootExpr);
-            std::cout << "2222222 生成的 SQL1 WHERE: " << sql1 << std::endl;
+            LOONG_DEMO_OUT << "2222222 生成的 SQL1 WHERE: " << sql1 << std::endl;
 
 
 
@@ -361,9 +366,9 @@ Task<> User::getInfo(HttpRequestPtr req,
             const std::string dynamicSql = baseSql + whereClause;
             const std::string dynamicCountSql = baseCountSql + whereClause;
             // 输出调试信息
-            std::cout << "构建 WHERE 子句: " << whereClause << std::endl;
-            std::cout << "动态 SQL 查询语句: " << dynamicSql << std::endl;
-            std::cout << "动态 Count 查询语句: " << dynamicCountSql << std::endl;
+            LOONG_DEMO_OUT << "构建 WHERE 子句: " << whereClause << std::endl;
+            LOONG_DEMO_OUT << "动态 SQL 查询语句: " << dynamicSql << std::endl;
+            LOONG_DEMO_OUT << "动态 Count 查询语句: " << dynamicCountSql << std::endl;
 
             auto result = co_await clientPtr->execSqlCoro(dynamicSql);
             auto count = co_await clientPtr->execSqlCoro(dynamicCountSql);
@@ -405,11 +410,11 @@ Task<> User::getInfo(HttpRequestPtr req,
             << "xxx" << 1
             >> [](const Result &result)
             {
-                std::cout << result.size() << " rows selected!" << std::endl;
+                LOONG_DEMO_OUT << result.size() << " rows selected!" << std::endl;
                 int i = 0;
                 for (const auto& row : result)
                 {
-                    std::cout << i++ << ": author is " << row["author"].as<std::string>() << std::endl;
+                    LOONG_DEMO_OUT << i++ << ": author is " << row["author"].as<std::string>() << std::endl;
                 }
             }
         >> [](const DrogonDbException &e)
@@ -429,13 +434,13 @@ Task<> User::getInfo(HttpRequestPtr req,
                   << "xxx"
                 >> [](const Result &result)
         {
-            std::cout << result.size() << " rows selected!" << std::endl;
+            LOONG_DEMO_OUT << result.size() << " rows selected!" << std::endl;
             int i = 0;
 
             //#pragma omp parallel for
             for (const auto& row : result)
             {
-                std::cout << i++ << ": author is " << row["author"].as<std::string>() << std::endl;
+                LOONG_DEMO_OUT << i++ << ": author is " << row["author"].as<std::string>() << std::endl;
             }
         }
             >> [](const DrogonDbException &e)
@@ -452,7 +457,7 @@ Task<> User::getInfo(HttpRequestPtr req,
             nn << value;
         }
         nn >> [](const Result &r) {
-            std::cout << "r.affectedRows() : " << r.affectedRows() << std::endl;
+            LOONG_DEMO_OUT << "r.affectedRows() : " << r.affectedRows() << std::endl;
         };
 
 
@@ -460,7 +465,7 @@ Task<> User::getInfo(HttpRequestPtr req,
         auto zz = clientPtr->execSqlCoro(sql1);
 
         auto r = co_await zz;
-        std::cout << "Affected rows: " << r.affectedRows() << std::endl;
+        LOONG_DEMO_OUT << "Affected rows: " << r.affectedRows() << std::endl;
     }
     catch (const std::exception& e)
     {
@@ -514,7 +519,7 @@ void User::getBanWord(const HttpRequestPtr& req,
 
         auto const t2 = std::chrono::steady_clock::now();
         double const dr_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
-        std::cout << "[cost: " << dr_ms << " ms]" << item << " => " << SbcConvertService::ws2s(result) << std::endl;
+        LOONG_DEMO_OUT << "[cost: " << dr_ms << " ms]" << item << " => " << SbcConvertService::ws2s(result) << std::endl;
     });
 
     callback(Base<std::string>::createHttpSuccessResponse(
@@ -531,7 +536,7 @@ void User::serdeJson(const HttpRequestPtr& req, std::function<void(const HttpRes
     std::ifstream ifs(word_path, std::ios_base::in);
     std::string str;
     getline(ifs, str);
-    //std::cout << " serdeJson = " << str << std::endl;
+    //LOONG_DEMO_OUT << " serdeJson = " << str << std::endl;
 
     auto t1 = std::chrono::steady_clock::now();
 
@@ -544,14 +549,14 @@ void User::serdeJson(const HttpRequestPtr& req, std::function<void(const HttpRes
     res = jsonReader->parse(str.c_str(), str.c_str() + str.length(), &root, &errs);
     if (!res || !errs.empty())
     {
-        std::cout << "parseJson err. " << errs << std::endl;
+        LOONG_DEMO_OUT << "parseJson err. " << errs << std::endl;
         return;
     }
 
     auto t2 = std::chrono::steady_clock::now();
     double dr_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
-    std::cout << "[cost: " << dr_ms << " ms]" << std::endl;
-    std::cout << "type: " << root["type"].asString() << std::endl;
+    LOONG_DEMO_OUT << "[cost: " << dr_ms << " ms]" << std::endl;
+    LOONG_DEMO_OUT << "type: " << root["type"].asString() << std::endl;
 
     callback(Base<std::string>::createHttpSuccessResponse(StatusOK, Success, ""));
 }

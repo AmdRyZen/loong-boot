@@ -162,7 +162,7 @@ Application::Application()
         stopped_path.append(std::filesystem::current_path()).append("/public/stopped.txt");
         TrieService::loadFromFile(word_path);
         TrieService::loadStopWordFromFile(stopped_path);
-        LOG_INFO << "TrieService load is success!";
+        LOG_DEBUG << "TrieService load is success!";
         std::cout << std::endl;
     });
 
