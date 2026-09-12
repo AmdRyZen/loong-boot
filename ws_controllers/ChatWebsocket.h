@@ -11,7 +11,6 @@
 #include <atomic>
 #include <cstdlib>
 #include <format>
-#include <memory_resource>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -75,6 +74,14 @@ private:
         std::string topic_;
         std::string userName_;
         RoomRegistry::SubscriberID id_{};
+
+        // 本连接所属房间的句柄（订阅成功后取一次，终身复用）。
+        //
+        // 缓存它是为了让「发布」这条热路径完全不过全局 roomsMtx_：
+        // 否则每条消息都要拿一次全局共享锁 + 按房间名做一次哈希查找，
+        // 而全站所有房间共用这一把锁 —— 那是唯一的全局串行点。
+        // 房间被回收后这个句柄会自动失效（retired），publish 回退查表，无需手动清理。
+        RoomRegistry::RoomHandle room_;
 
         // 跨线程访问：IO 线程写入（收到任意帧即刷新），主循环定时任务读取（空闲驱逐）。
         // 原先是非原子的 time_point —— 跨线程读写属于 data race（形式上 UB），
@@ -163,7 +170,10 @@ private:
 
     void initClusterBus();
     static void publishToCluster(const Core& core, const std::string& topic, const std::string& json);
-    static void produceKafkaAsync(std::string topicName, std::string payload);
+    // 形参用 string_view：开关关闭时（压测/开发常态）调用方不必先构造 std::string，
+    // 避免「已经拷贝完了才在函数里 short-circuit」这种白付的分配。
+    // 需要所有权的地方（TBB worker）在 lambda 捕获里再落成 std::string。
+    static void produceKafkaAsync(std::string_view topicName, std::string_view payload);
 
     // 集群总线开关：读 custom_config.enable_cluster_bus，缺省为 false。
     //
@@ -258,10 +268,15 @@ private:
     //   聊天消息 → true；入群/退群公告 → false。
     //   公告只描述「本实例上某个连接的状态变化」，而其他实例上可能恰有同名用户在
     //   同一房间 —— 广播过去会让对方收到「XX 已离开」这种与自己无关的误导信息。
+    //
+    // hint：发布者自己缓存的房间句柄（Subscriber::room_）。传进来即可跳过全局
+    //   房间表锁；为空或不匹配房间名时 publish 会自动回退查表，因此传错不会崩，
+    //   但会投错房间 —— 调用方必须保证 hint 与 topic 是同一个订阅者的成对字段。
     bool fanOutRoom(Core& core, const std::string& topic, const std::string& json,
-                    bool broadcastToCluster = true)
+                    bool broadcastToCluster = true,
+                    const RoomRegistry::RoomHandle& hint = {})
     {
-        const bool ok = core.roomRegistry.publish(topic, json);
+        const bool ok = core.roomRegistry.publish(topic, json, hint);
         if (broadcastToCluster)
         {
             publishToCluster(core, topic, json);
@@ -273,20 +288,27 @@ private:
         return ok;
     }
 
+    // 注：这里曾经用 std::pmr::string，但那是个半成品 —— 全工程从未创建过任何
+    // memory_resource，pmr 容器默认落到 new_delete_resource()，即与 std::string
+    // 同一条分配路径，却额外多带一个 allocator 指针（每字段 +8B，4 字段的 DTO
+    // 直接胖一圈）并多一层虚调用。比 std::string 更慢更大，故退回 std::string。
+    // 若将来真要做端到端 pmr，正确做法是在 IO 线程上挂
+    // thread_local std::pmr::monotonic_buffer_resource 并在构造 VO 时显式传 &res，
+    // 而不是只把字段类型换掉。
     struct chatMessageDto
     {
-        std::pmr::string key;
-        std::pmr::string action;
-        std::pmr::string msgContent;
-        std::pmr::string toUser;  // 点对点私聊目标用户名 (为空表示房间广播)
+        std::string key;
+        std::string action;
+        std::string msgContent;
+        std::string toUser;  // 点对点私聊目标用户名 (为空表示房间广播)
     };
 
     struct chatMessageVo
     {
         int code = -1;
         uint64_t id = 0;
-        std::pmr::string name;
-        std::pmr::string message;
+        std::string name;
+        std::string message;
     };
 
     static std::string buildNoticeJson(int code, const char* name, const char* message)

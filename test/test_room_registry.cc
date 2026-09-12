@@ -7,6 +7,7 @@
 //   4. 并发订阅/退订与发布并发进行不崩、不丢唤醒，全部退订后房间被回收。
 //   5. 空房间回收 / 无订阅者发布 / 退订幂等。
 //   6. 直投与排队混用时的保序（7c 回归：本线程直投不得抢跑已排队的批次）。
+//   7. 房间句柄 hint 快路径：命中投递、失效回退、单非空分片快路径不漏投。
 #include "../ws_controllers/RoomRegistry.h"
 
 #include <atomic>
@@ -60,6 +61,14 @@ struct MockConn : IConn
 
 using MockPtr = std::shared_ptr<IConn>;
 using Reg = RoomRegistryT<MockPtr>;
+
+// 加锁读快照：扇出线程池模式下 MockConn::received 会被池线程写入，
+// 直接读属于测试自身的数据竞争（TSan 下会报），统一走这个入口。
+static std::vector<std::string> snapshotOf(const std::shared_ptr<MockConn>& c)
+{
+    std::lock_guard lock(c->m);
+    return c->received;
+}
 
 static std::string encode(int producer, int seq)
 {
@@ -815,6 +824,89 @@ static void testMixedDeliveryOrdering()
     CHECK(seqOf(cA) == want, "loop A 订阅者顺序 = M1,M2");
 }
 
+// ---------------------------------------------------------------------------
+// 7. 房间句柄 hint 快路径 + 单非空分片快路径
+// ---------------------------------------------------------------------------
+static void testRoomHandleHint()
+{
+    std::printf("test: 房间句柄 hint 快路径 / 单非空分片快路径\n");
+
+    // ── 7a. 句柄命中：带 hint 与不带 hint 必须投到同一个房间 ──────────────
+    {
+        Reg reg;
+        auto c1 = std::make_shared<MockConn>();
+        auto c2 = std::make_shared<MockConn>();
+        reg.subscribe("hint_room", c1);
+        reg.subscribe("hint_room", c2);
+
+        const auto h = reg.acquireRoomHandle("hint_room");
+        CHECK(h, "acquireRoomHandle 命中已存在的房间");
+        CHECK(!reg.acquireRoomHandle("no_such_room"), "acquireRoomHandle 对不存在的房间返回空句柄");
+
+        CHECK(reg.publish("hint_room", std::string("A"), h), "带 hint 发布成功");
+        CHECK(reg.publish("hint_room", std::string("B")), "不带 hint 发布成功");
+
+        const std::vector<std::string> want{"A", "B"};
+        CHECK(snapshotOf(c1) == want, "hint 路径投递内容与顺序正确");
+        CHECK(snapshotOf(c2) == want, "hint 路径对全部订阅者生效");
+    }
+
+    // ── 7b. 句柄失效回退：房间回收后旧句柄不得把消息吞掉 ──────────────────
+    {
+        Reg reg;
+        auto c1 = std::make_shared<MockConn>();
+        const auto id1 = reg.subscribe("reborn", c1);
+        const auto stale = reg.acquireRoomHandle("reborn");
+        reg.unsubscribe("reborn", id1); // 最后一个成员离开 → 房间被回收
+        CHECK(!reg.acquireRoomHandle("reborn"), "房间回收后取不到句柄");
+
+        auto c2 = std::make_shared<MockConn>();
+        reg.subscribe("reborn", c2); // 同名新房间
+
+        // 关键：传的是【已失效的旧句柄】+ 正确的房间名。
+        // 若快路径不判 retired，这条消息会被投进孤儿房间而静默消失。
+        CHECK(reg.publish("reborn", std::string("M"), stale), "带失效句柄发布返回成功");
+        CHECK(snapshotOf(c2) == std::vector<std::string>{"M"},
+              "失效句柄回退查表：消息投给了新房间的订阅者");
+        CHECK(snapshotOf(c1).empty(), "失效句柄不会把消息投回旧房间");
+    }
+
+    // ── 7c. 单非空分片快路径（dist.size() > 1，但只剩一个分片有人）────────
+    // 这是快路径最容易写错的输入：门控说「只有一个非空分片」，而 dist 有多个
+    // 槽位 —— 扫描时必须找对那个槽位，否则消息静默丢失。
+    {
+        Reg::Options opt;
+        opt.maxShards = 8;
+        opt.subsPerShard = 2;
+        opt.fanoutThreads = 2;
+        opt.inlineMaxSubs = 0;
+        Reg reg(opt);
+
+        auto c1 = std::make_shared<MockConn>();
+        auto c2 = std::make_shared<MockConn>();
+        auto c3 = std::make_shared<MockConn>();
+        reg.subscribe("shardy", c1); // id 1 → 分片 1
+        const auto i2 = reg.subscribe("shardy", c2); // id 2 → 分片 0
+        reg.subscribe("shardy", c3); // id 3 → 分片 1
+        CHECK(reg.activeShards() == 2, "3 个订阅者时房间有 2 个非空分片");
+
+        reg.unsubscribe("shardy", i2); // 分片 0 变空 → 只剩分片 1
+        CHECK(reg.activeShards() == 1, "退掉一个后只剩 1 个非空分片（命中快路径）");
+
+        reg.publish("shardy", std::string("S1"));
+        reg.publish("shardy", std::string("S2"));
+
+        CHECK(waitUntil(
+                  [&] { return snapshotOf(c1).size() == 2 && snapshotOf(c3).size() == 2; }, 2000),
+              "单非空分片快路径把消息投给了该分片上的全部订阅者");
+        CHECK(snapshotOf(c1) == std::vector<std::string>({"S1", "S2"}),
+              "快路径保持分片内 FIFO 顺序");
+        CHECK(snapshotOf(c3) == std::vector<std::string>({"S1", "S2"}),
+              "快路径对分片内第二个订阅者也生效");
+        CHECK(snapshotOf(c2).empty(), "已退订的连接不再收到消息");
+    }
+}
+
 int main()
 {
     testStrictOrdering(0, "线程池并行扇出");
@@ -826,6 +918,7 @@ int main()
     testEdgeCases();
     testLoopGrouping();
     testMixedDeliveryOrdering();
+    testRoomHandleHint();
 
     std::printf("\n%s (failures=%d)\n", g_failures == 0 ? "ALL PASSED" : "FAILED", g_failures);
     return g_failures == 0 ? 0 : 1;

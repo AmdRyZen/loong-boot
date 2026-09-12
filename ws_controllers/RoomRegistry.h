@@ -156,9 +156,24 @@ struct TrantorLoopHandle
 template <typename ConnT, typename LoopH = NullLoopHandle>
 class RoomRegistryT
 {
+  private:
+    // 房间实现（定义在下面的 private 区）。先声明后定义，是为了让下面的
+    // RoomHandle 能作为公开类型暴露出去，而 Room 的布局仍然不对外可见。
+    //
+    // 注意：嵌套类的「声明」与「定义」必须处于同一访问级别，
+    // 否则 GCC 报 "redeclared with different access"（已实测）。
+    struct Room;
+
   public:
     using SubscriberID = uint64_t;
     using ConnPtr = ConnT;
+
+    // 房间句柄（不透明）：订阅成功后取一次并缓存起来，之后发布时把它传回来，
+    // 就能跳过「每次发布都拿全局 roomsMtx_ 共享锁 + 按房间名哈希查表」这一步。
+    //
+    // 外部只会拷贝/析构这个 shared_ptr，不需要（也看不到）Room 的完整类型 ——
+    // shared_ptr 的 deleter 在 RoomRegistry 内部构造时就已类型擦除。
+    using RoomHandle = std::shared_ptr<Room>;
 
     struct Options
     {
@@ -373,22 +388,58 @@ class RoomRegistryT
     }
 
     /**
+     * @brief 取房间句柄，供调用方缓存后随 publish 传回（见 publish 的 hint 参数）。
+     *
+     * 典型用法：订阅成功后取一次存进订阅者对象，此后该订阅者每次发布都带上传回的
+     * 句柄，从而完全绕开全局 roomsMtx_ 共享锁与房间名哈希 —— 全局表锁的访问频次
+     * 从「每条消息一次」降到「每次订阅一次」。
+     *
+     * 房间被回收（retired）后句柄自动失效，publish 会回退到按名字查表，因此
+     * 无需在退订时主动清理这个缓存（缓存一个已失效的句柄不会出错，只是慢一次）。
+     *
+     * @return 房间不存在时返回空句柄。
+     */
+    RoomHandle acquireRoomHandle(const std::string& room) const
+    {
+        std::shared_lock lock(roomsMtx_);
+        const auto it = rooms_.find(room);
+        return it == rooms_.end() ? RoomHandle{} : it->second;
+    }
+
+    /**
      * @brief 向房间发布一条消息（payload 已序列化完成）
      * @return false 表示分片积压达上限、消息被丢弃（调用方需计数并告知客户端）
      */
-    bool publish(const std::string& room, const std::string& payload)
+    bool publish(const std::string& room, const std::string& payload, const RoomHandle& hint = {})
     {
-        return publishShared(room, std::make_shared<const std::string>(payload));
+        return publishShared(room, std::make_shared<const std::string>(payload), hint);
     }
 
-    bool publish(const std::string& room, std::string&& payload)
+    bool publish(const std::string& room, std::string&& payload, const RoomHandle& hint = {})
     {
-        return publishShared(room, std::make_shared<const std::string>(std::move(payload)));
+        return publishShared(room, std::make_shared<const std::string>(std::move(payload)), hint);
     }
 
-    bool publishShared(const std::string& room, std::shared_ptr<const std::string> payload)
+    bool publishShared(const std::string& room, std::shared_ptr<const std::string> payload,
+                       const RoomHandle& hint = {})
     {
         std::shared_ptr<Room> r;
+
+        // ── 快路径：调用方缓存了房间句柄 → 直接复用，不过全局表锁 ─────────────
+        //
+        // retired 的读判是安全的：退订摘除房间的顺序恒为「先 retired.store(true)，
+        // 再 rooms_.erase」，所以读到 !retired 就蕴含「这个 Room 仍是 rooms_ 里
+        // 的那一份」。反过来若读到 retired，则可能已经有同名的新房间被建出来，
+        // 必须回退查表 —— 否则消息会被投进一个成员已清空的孤儿房间（静默丢消息）。
+        //
+        // ⚠️ 前置条件：hint 必须与 room 指向同一房间。若 hint 有效却属于别的房间，
+        //    消息会被投到 hint 的房间去（此时 room 参数被忽略）。调用方务必把
+        //    「同一个订阅者身上的 topic_」和「它的 room_」成对传进来。
+        if (hint && !hint->retired.load(std::memory_order_acquire))
+        {
+            r = hint;
+        }
+        else
         {
             std::shared_lock roomsLock(roomsMtx_);
             if (const auto it = rooms_.find(room); it != rooms_.end())
@@ -410,48 +461,88 @@ class RoomRegistryT
             // 房间级发布锁：消息顺序的唯一来源。只做「入队」，不做扇出。
             std::lock_guard pubLock(r->pubMtx);
 
-            // ── 第一阶段：预检查（全有或全无）──────────────────────────────
-            // 只要有一个非空分片已满，整条消息就都不入队并返回 false。
+            // ── 快路径：恰好一个非空分片（小房间的常态）────────────────────
+            // 两阶段协议要遍历 dist 两次、对同一个分片加解锁两次。但「全有或全无」
+            // 这个约束在只有一个非空分片时是平凡的 —— 单分片的「检查」与「入队」
+            // 可以在同一把分片锁里一次做完，省掉一遍遍历和一次 mutex 往返。
             //
-            // 原实现是「逐分片判断、满的那个 continue」，于是过载时会出现
-            // 「一部分订阅者已收到、另一部分被丢」——调用方只能回一个 503，
-            // 客户端重试后已收到的人又会看到重复消息。多分片时必然发生。
-            //
-            // 同房间的所有 publish 都被 pubMtx 串行化，所以「预检查通过」到
-            // 「入队」之间不会有别的 publish 插入；drain 只会让队列更空、
-            // 不会让它变满，因此预检查的结论在第二阶段依然成立。
-            for (size_t i = 0; i < r->dist.size(); ++i)
+            // 门控读的是 nonEmptyShards：它在 pubMtx 内是精确值，subscribe /
+            // unsubscribe / reshapeLocked 三处都持同一把房间锁维护它，不存在读到
+            // 中间态的可能（因此不会出现「实际两个分片非空、却按一个分片投递」
+            // 这种静默漏投）。分片数 k=1 的房间恒走这条路。
+            if (r->nonEmptyShards.load(std::memory_order_relaxed) == 1)
             {
-                if (r->dist[i].empty())
+                for (size_t i = 0; i < r->dist.size(); ++i)
                 {
-                    continue;
-                }
-                const std::shared_ptr<Shard>& sh = r->shards[i];
-                std::lock_guard shardLock(sh->mtx);
-                if (sh->queue.size() >= opt_.backlogPerShard)
-                {
-                    // 整条消息按一次丢弃计数（而不是每个满分片各计一次），
-                    // 这样 dropped_ 与「被拒绝的 publish 次数」严格一致。
-                    dropped_.fetch_add(1, std::memory_order_relaxed);
-                    return false;
+                    if (r->dist[i].empty())
+                    {
+                        continue;
+                    }
+                    const std::shared_ptr<Shard>& sh = r->shards[i];
+                    {
+                        std::lock_guard shardLock(sh->mtx);
+                        if (sh->queue.size() >= opt_.backlogPerShard)
+                        {
+                            // 整条消息按一次丢弃计数（与两阶段路径口径一致）
+                            dropped_.fetch_add(1, std::memory_order_relaxed);
+                            return false;
+                        }
+                        sh->queue.push_back(payload);
+                        // 门铃：仅在「空闲 → 忙」跳变时入池，热点分片不会每条消息都惊动线程池。
+                        // exchange 与 drain 的 busy=false 都在分片锁内完成，不会丢唤醒。
+                        if (!sh->busy.exchange(true, std::memory_order_acq_rel))
+                        {
+                            needWake.push_back(sh);
+                        }
+                    }
+                    break; // 有且仅有一个非空分片
                 }
             }
-
-            // ── 第二阶段：整条消息入队 ────────────────────────────────────
-            for (size_t i = 0; i < r->dist.size(); ++i)
+            else
             {
-                if (r->dist[i].empty())
+                // ── 第一阶段：预检查（全有或全无）──────────────────────────────
+                // 只要有一个非空分片已满，整条消息就都不入队并返回 false。
+                //
+                // 原实现是「逐分片判断、满的那个 continue」，于是过载时会出现
+                // 「一部分订阅者已收到、另一部分被丢」——调用方只能回一个 503，
+                // 客户端重试后已收到的人又会看到重复消息。多分片时必然发生。
+                //
+                // 同房间的所有 publish 都被 pubMtx 串行化，所以「预检查通过」到
+                // 「入队」之间不会有别的 publish 插入；drain 只会让队列更空、
+                // 不会让它变满，因此预检查的结论在第二阶段依然成立。
+                for (size_t i = 0; i < r->dist.size(); ++i)
                 {
-                    continue; // 空槽位不建对象也不发布，小房间不为用不到的分片买单
+                    if (r->dist[i].empty())
+                    {
+                        continue;
+                    }
+                    const std::shared_ptr<Shard>& sh = r->shards[i];
+                    std::lock_guard shardLock(sh->mtx);
+                    if (sh->queue.size() >= opt_.backlogPerShard)
+                    {
+                        // 整条消息按一次丢弃计数（而不是每个满分片各计一次），
+                        // 这样 dropped_ 与「被拒绝的 publish 次数」严格一致。
+                        dropped_.fetch_add(1, std::memory_order_relaxed);
+                        return false;
+                    }
                 }
-                const std::shared_ptr<Shard>& sh = r->shards[i];
-                std::lock_guard shardLock(sh->mtx);
-                sh->queue.push_back(payload);
-                // 门铃：仅在「空闲 → 忙」跳变时入池，热点分片不会每条消息都惊动线程池。
-                // exchange 与 drain 的 busy=false 都在分片锁内完成，不会丢唤醒。
-                if (!sh->busy.exchange(true, std::memory_order_acq_rel))
+
+                // ── 第二阶段：整条消息入队 ────────────────────────────────────
+                for (size_t i = 0; i < r->dist.size(); ++i)
                 {
-                    needWake.push_back(sh);
+                    if (r->dist[i].empty())
+                    {
+                        continue; // 空槽位不建对象也不发布，小房间不为用不到的分片买单
+                    }
+                    const std::shared_ptr<Shard>& sh = r->shards[i];
+                    std::lock_guard shardLock(sh->mtx);
+                    sh->queue.push_back(payload);
+                    // 门铃：仅在「空闲 → 忙」跳变时入池，热点分片不会每条消息都惊动线程池。
+                    // exchange 与 drain 的 busy=false 都在分片锁内完成，不会丢唤醒。
+                    if (!sh->busy.exchange(true, std::memory_order_acq_rel))
+                    {
+                        needWake.push_back(sh);
+                    }
                 }
             }
 

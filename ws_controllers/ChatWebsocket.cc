@@ -6,7 +6,6 @@
 #include <glaze/glaze.hpp>
 #include <drogon/HttpAppFramework.h>
 #include "utils/retry_utils.h"
-#include <memory_resource>
 #include <atomic>
 #include <vector>
 #include <drogon/nosql/RedisSubscriber.h>
@@ -15,7 +14,7 @@
 // Subscriber 原先定义在本文件，为了让定时器与启动回调能够按值捕获 Core
 //（而不是捕获 this）而整体上移到头文件。
 
-void ChatWebsocket::produceKafkaAsync(std::string topicName, std::string payload)
+void ChatWebsocket::produceKafkaAsync(std::string_view topicName, std::string_view payload)
 {
     // 读取生产环境配置开关：通过 enable_kafka_persistence 控制是否异步落库 Kafka
     static const bool enableKafka = []() {
@@ -33,18 +32,25 @@ void ChatWebsocket::produceKafkaAsync(std::string topicName, std::string payload
         return true;
     }();
 
+    // 开关检查必须在【任何字符串构造之前】。
+    //
+    // 形参原先按值传 std::string：即便 Kafka 关闭、函数在这里立刻 return，
+    // 实参的堆拷贝也已经发生完了 —— 热路径上每条消息白付一次分配。
+    // 改成 string_view 后，关闭态下这次调用只是两次指针/长度赋值。
     if (!enableKafka)
     {
         return; // 开发或压测模式下跳过 Kafka 写入，保持极致 CPU 吞吐
     }
 
-    const std::string topicForLog = topicName;
-
+    // 只有在真正要投递时才把视图落成所有权字符串（TBB worker 会活过调用方栈帧）。
+    // 原实现另有一个 `const std::string topicForLog = topicName;` 的无条件拷贝，
+    // 仅仅为了失败日志 —— 现在日志直接打视图，拷贝彻底消失。
+    //
     // 背压：TBB 池积压超过上限时 submit 会返回 false。
     // 原实现忽略返回值 → 消息被静默丢弃，无日志无指标，上层误以为已落库。
     const bool accepted = TbbCoroutinePool::instance().submit(
-        [topicName = std::move(topicName), payload = std::move(payload)] {
-            rd_kafka_topic_t* topicPtr = kafka::KafkaManager::instance().getTopic(topicName);
+        [topic = std::string(topicName), payload = std::string(payload)] {
+            rd_kafka_topic_t* topicPtr = kafka::KafkaManager::instance().getTopic(topic);
             retryWithSleep([&]() {
                 if (!kafka::KafkaManager::safeProduce(topicPtr, payload))
                 {
@@ -59,7 +65,7 @@ void ChatWebsocket::produceKafkaAsync(std::string topicName, std::string payload
     if (!accepted)
     {
         Metrics::PrometheusRegistry::instance().recordWsMessageDropped();
-        LOG_WARN << "TBB pool saturated, dropped Kafka persistence for topic: " << topicForLog;
+        LOG_WARN << "TBB pool saturated, dropped Kafka persistence for topic: " << topicName;
     }
 }
 
@@ -221,7 +227,10 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                     // 1. 本实例本地房间广播（分片并行扇出）
                     // 2. 分布式总线：同步广播给集群其他实例
                     // 3. 生产环境持久化：异步投递到 Kafka 历史消息流
-                    if (!fanOutRoom(*core_, topic, json))
+                    // 带上本连接缓存的房间句柄：hint 与 topic 同源（都是本订阅者的字段），
+                    // 因此 publish 可以安全地跳过全局房间表锁。
+                    if (!fanOutRoom(*core_, topic, json, /*broadcastToCluster=*/true,
+                                    subscriber.room_))
                     {
                         auto& metrics = Metrics::PrometheusRegistry::instance();
                         metrics.recordWsMessageDropped();
@@ -304,6 +313,11 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
         subscriber->id_ = core_->roomRegistry.subscribe(
             topic, wsConn, TrantorLoopHandle{trantor::EventLoop::getEventLoopOfCurrentThread()});
 
+        // 缓存房间句柄：此后这条连接的每次发布都带上传回的句柄，publish 走快路径
+        // 直接命中该房间，不再每条消息都去抢全局 roomsMtx_ 共享锁。
+        // 房间被回收后句柄自动失效（retired），publish 会回退查表，无需在退订时清理。
+        subscriber->room_ = core_->roomRegistry.acquireRoomHandle(topic);
+
         // 同一昵称允许多端并存：注册为「昵称 -> 会话列表」，多端都能收到私聊。
         // 原实现用 emplace 存单连接，同名时静默失败，且断开时按昵称 erase 会误删新连接。
         // 同时把 Subscriber 一并存下来，供空闲驱逐在锁内直接取用（避免跨线程读连接的 context）。
@@ -331,7 +345,7 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
         //
         // broadcastToCluster = false：在线状态是本实例的本地事实。广播给其他实例后，
         // 那边的同名用户会收到与自己无关的「XX 已加入」；退群公告同理（见下）。
-        if (!fanOutRoom(*core_, topic, json, /*broadcastToCluster=*/false))
+        if (!fanOutRoom(*core_, topic, json, /*broadcastToCluster=*/false, subscriber->room_))
         {
             Metrics::PrometheusRegistry::instance().recordWsMessageDropped();
             // 与消息丢弃共用同一个限流器：同属「房间积压」这一种过载现象。
@@ -433,7 +447,7 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
 
         // 与聊天消息共用同一房间的发布锁，保证「离群公告」与其他消息的相对顺序稳定。
         // 同样不跨实例广播（理由见 handleNewConnection 的入群公告）。
-        if (!fanOutRoom(*core_, topic, json, /*broadcastToCluster=*/false))
+        if (!fanOutRoom(*core_, topic, json, /*broadcastToCluster=*/false, subscriber.room_))
         {
             Metrics::PrometheusRegistry::instance().recordWsMessageDropped();
             // 同上：与消息丢弃共用限流器。
