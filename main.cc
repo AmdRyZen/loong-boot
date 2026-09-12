@@ -47,17 +47,28 @@ int main(int argc, char* argv[])
         // 初始化服务 如kfk等
         App::Application();
 
-        // IO 线程数（= drogon 事件循环个数）。
+        // IO 线程数（= drogon 事件循环个数）优先级：
+        //   1) 环境变量 LOONG_IO_THREADS —— 显式覆盖（压测、异构核机器收敛）
+        //   2) 配置文件里显式指定的 number_of_threads / threads_num
+        //   3) 兜底 hardware_concurrency() * 2
         //
-        // ⚠️ 这一行在 loadConfigFile 之后执行，**会覆盖 config.json 里的
-        // number_of_threads** —— 只看配置文件会以为线程数是 8，实际是 核数×2。
-        // 排查任何与线程/事件循环相关的问题（扇出分组、定时器、连接归属）前，
-        // 必须先意识到这一点。
+        // ⚠️ 这里修掉了一个历史坑：旧代码无条件 setThreadNum(hardware_concurrency()*2)，
+        // 把配置文件里显式写好的 number_of_threads 静默覆盖掉 —— 配置里的值从来没生效过，
+        // 且不打印任何日志，排查线程/事件循环相关问题时极易误判（扇出分组、定时器、
+        // 连接归属都依赖线程数）。
         //
-        // 线程数同时决定扇出的跨线程唤醒上界：房间订阅者分散在 K 个 loop 上时，
-        // 每条消息最多需要 K 次唤醒（见 RoomRegistry 的 LoopH 分组）。
-        // LOONG_IO_THREADS 可显式覆盖，用于压测不同线程数或在异构核机器上收敛。
-        unsigned int ioThreads = std::thread::hardware_concurrency() * 2;
+        // 注意 drogon 的 ConfigLoader 在 number_of_threads 缺省时会把它设为 1，
+        // 所以「配置值 > 1」才视为显式指定；否则走兜底，避免退化成单线程。
+        unsigned int ioThreads = 0;
+        const char* ioThreadsSource = "default(cores*2)";
+
+        // loadConfigFile 已经把配置值应用进去了，这里取回来判断
+        if (const size_t fromConfig = drogon::app().getThreadNum(); fromConfig > 1)
+        {
+            ioThreads = static_cast<unsigned int>(fromConfig);
+            ioThreadsSource = "config";
+        }
+
         if (const char* env = std::getenv("LOONG_IO_THREADS"); env != nullptr && *env != '\0')
         {
             try
@@ -66,6 +77,7 @@ int main(int argc, char* argv[])
                 if (v > 0 && v <= 4096)
                 {
                     ioThreads = static_cast<unsigned int>(v);
+                    ioThreadsSource = "env";
                 }
                 else
                 {
@@ -77,11 +89,23 @@ int main(int argc, char* argv[])
                 LOG_WARN << "LOONG_IO_THREADS 不是合法数字，忽略: " << env;
             }
         }
-        if (ioThreads != 0)
+
+        if (ioThreads == 0)
         {
-            drogon::app().setThreadNum(ioThreads);
+            ioThreads = std::thread::hardware_concurrency() * 2;
+            if (ioThreads == 0)
+            {
+                ioThreads = 1; // hardware_concurrency() 可能返回 0
+            }
         }
-        LOG_INFO << "IO threads: " << ioThreads;
+
+        drogon::app().setThreadNum(ioThreads);
+
+        // 同时写 stdout 与日志：stdout 不受 log_level 影响（WARN 级别下 LOG_INFO
+        // 是不落盘的），确保这个值在任何配置下都看得见。
+        LOG_INFO << "IO threads: " << ioThreads << " (source: " << ioThreadsSource << ")";
+        std::cout << "IO threads: " << ioThreads << " (source: " << ioThreadsSource << ")"
+                  << std::endl;
 
         // 启动项目
         drogon::app().run();
