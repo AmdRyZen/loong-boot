@@ -444,6 +444,20 @@ static void testEdgeCases()
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     reg.unsubscribe("n", id2);
     CHECK(true, "订阅了空连接也不崩溃");
+
+    // 可调项真的被接进去了（否则就是「提出来了但没人读」的假重构）。
+    // workerSpinRounds 原先是 workerLoop() 里的 constexpr，调参要重新编译。
+    {
+        Reg::Options opt;
+        opt.workerSpinRounds = 7;
+        Reg tuned(opt);
+        CHECK(tuned.options().workerSpinRounds == 7, "workerSpinRounds 透传到生效值");
+
+        Reg::Options zero;
+        zero.workerSpinRounds = 0; // 配置错误：0 会让 worker 完全不自旋，按默认兜底
+        Reg fallback(zero);
+        CHECK(fallback.options().workerSpinRounds == 4000, "workerSpinRounds = 0 时兜底为 4000");
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -37,7 +37,11 @@ public:
         core_->instanceId =
             std::format("inst_{}_{}", static_cast<long long>(::getpid()), Subscriber::nowNanos());
 
-        // 注册定时任务：空闲超时连接驱逐 + 房间指标采集。
+        // 先把开关读进来。kafkaPersistenceEnabled() 的初值是 fail-safe 的 false，
+        // 若不在这里同步一次，启动后到第一次定时刷新之间会处于「配置说开、实际关」的状态。
+        reloadSwitches();
+
+        // 注册定时任务：空闲超时连接驱逐 + 房间指标采集 + 开关热更新。
         //
         // 回调按值捕获 core_（shared_ptr），而不是捕获 this：
         // 回调持有的引用会让 Core 活到本次回调结束，因此即使控制器已析构、
@@ -46,6 +50,8 @@ public:
         HttpAppFramework::instance().getLoop()->runEvery(5.0, [core = core_] {
             checkAndEvictIdleConnections(*core);
             publishRoomMetrics(*core);
+            // 开关热更新：改 config.json 不必重启进程（见 reloadSwitches 注释）
+            reloadSwitches();
         });
 
         // 初始化 Redis 分布式集群网关总线
@@ -175,6 +181,16 @@ private:
     // 需要所有权的地方（TBB worker）在 lambda 捕获里再落成 std::string。
     static void produceKafkaAsync(std::string_view topicName, std::string_view payload);
 
+    // Kafka 落库开关的缓存值（缺省 false = fail-safe，见 .cc 里的说明）。
+    //
+    // 用原子量而不是 `static const`：后者只在首次调用时求值一次，
+    // 于是「改 config.json 不生效、必须重启」—— 压测时切换落库开关很烦。
+    static std::atomic<bool>& kafkaPersistenceEnabled() noexcept;
+
+    // 重读配置里的各个运行期开关。由构造函数与 5 秒定时任务调用。
+    // 只覆盖【可以安全热更新】的开关；enable_cluster_bus 不在此列（见下）。
+    static void reloadSwitches();
+
     // 集群总线开关：读 custom_config.enable_cluster_bus，缺省为 false。
     //
     // ⚠️ 未启用时【绝不能】调用 app().getRedisClient() / app().getFastRedisClient()。
@@ -190,6 +206,11 @@ private:
     //
     // 另注：本工程 redis_clients 配的是 is_fast=true，所以集群总线也必须用
     // getFastRedisClient()；取非 fast 变体同样会踩上面这个空条目。
+    //
+    // ⚠️ 本开关刻意【不】参与热更新（与 kafkaPersistenceEnabled 的区别）：
+    // 它在构造期一次性决定要不要注册 Redis 订阅，注册之后无法中途注销 ——
+    // 热更新只会造出「开关读作 false、总线却还活着」这种自相矛盾的状态。
+    // 要改它必须重启。默认值与 Kafka 开关对齐（都是 false = fail-safe）。
     static bool clusterBusEnabled();
 
     struct ClusterPacket
@@ -224,6 +245,7 @@ private:
         readEnv("LOONG_WS_INLINE_MAX_SUBS", opt.inlineMaxSubs);
         readEnv("LOONG_WS_BACKLOG_PER_SHARD", opt.backlogPerShard);
         readEnv("LOONG_WS_DRAIN_BATCH", opt.drainBatch);
+        readEnv("LOONG_WS_WORKER_SPIN_ROUNDS", opt.workerSpinRounds);
         return opt;
     }
 

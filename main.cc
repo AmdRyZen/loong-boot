@@ -1,4 +1,5 @@
 #include "aop/Application.h"
+#include "utils/ConfigPath.h"
 #include <drogon/drogon.h>
 #include <filesystem>
 #include <cstdlib>
@@ -37,6 +38,10 @@ int main(int argc, char* argv[])
         // 允许通过命令行传参指定配置文件，如 ./loong-boot config-prod.json
         const std::string configFile = argc > 1 && argv[1] != nullptr ? argv[1] : resolveConfigFile();
         LOG_DEBUG << "Active configuration: " << configFile;
+
+        // 记下真正加载的文件路径：drogon 的 getCustomConfig() 是启动时的内存副本，
+        // 不会重读文件，运行期想重读配置（开关热更新）只能靠这个路径。
+        Config::filePath() = configFile;
 
         // 加载配置
         drogon::app().loadConfigFile(configFile);

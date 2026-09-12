@@ -203,6 +203,16 @@ class RoomRegistryT
         size_t backlogPerShard = 4096;
         // 单次连续扇出的消息批上限，超过则让出 worker 重排队，避免热点分片饿死其他房间
         size_t drainBatch = 32;
+        // worker 在落眠前的无锁自旋轮数（每轮一条 cpuPause/yield 指令）。
+        //
+        // 为什么默认给这么大：热点分片会高频「空闲 → 忙」跳变，一旦落眠就要走
+        // futex 唤醒，延迟在有负载的机器上会被放大到毫秒级，直接把延迟敏感型房间的
+        // 吞吐打塌。自旋换的是「响应速度」，代价是空闲 worker 白烧 CPU。
+        // 只有 fanoutThreads > 0（真起了线程池）时才有意义。
+        //
+        // 原先是 workerLoop() 里的 constexpr，调参要重新编译；提到这里后可经
+        // LOONG_WS_WORKER_SPIN_ROUNDS 覆盖，便于压测 A/B。
+        size_t workerSpinRounds = 4000;
     };
 
     explicit RoomRegistryT(Options opt = Options{}) : opt_(opt)
@@ -218,6 +228,12 @@ class RoomRegistryT
         if (opt_.drainBatch == 0)
         {
             opt_.drainBatch = 1;
+        }
+        if (opt_.workerSpinRounds == 0)
+        {
+            // 0 会让 worker 完全不自旋、立刻落眠 —— 那是配置错误而不是意图，
+            // 因为每次唤醒都要走一次 futex。按默认值兜底。
+            opt_.workerSpinRounds = 4000;
         }
 
         // 没有线程池就谈不上并行扇出，分片数强制收敛为 1，避免白付分片记账开销
@@ -885,7 +901,9 @@ class RoomRegistryT
 
     void workerLoop()
     {
-        constexpr int kSpinRounds = 4000;
+        // 自旋轮数是可调项（Options::workerSpinRounds，可用环境变量覆盖）：
+        // 热点分片靠它避免 futex 唤醒延迟，空闲时靠它白烧 CPU，取舍随负载而定。
+        const int kSpinRounds = static_cast<int>(opt_.workerSpinRounds);
 
         for (;;)
         {

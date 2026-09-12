@@ -1,5 +1,6 @@
 #include "ChatWebsocket.h"
 #include "utils/redisUtils.h"
+#include "utils/ConfigPath.h"
 #include "coroutinePool/TbbCoroutinePool.h"
 #include "utils/PrometheusMetrics.h"
 //#include "user.pb.h"
@@ -7,6 +8,8 @@
 #include <drogon/HttpAppFramework.h>
 #include "utils/retry_utils.h"
 #include <atomic>
+#include <fstream>
+#include <json/json.h>
 #include <vector>
 #include <drogon/nosql/RedisSubscriber.h>
 
@@ -14,30 +17,86 @@
 // Subscriber 原先定义在本文件，为了让定时器与启动回调能够按值捕获 Core
 //（而不是捕获 this）而整体上移到头文件。
 
-void ChatWebsocket::produceKafkaAsync(std::string_view topicName, std::string_view payload)
+std::atomic<bool>& ChatWebsocket::kafkaPersistenceEnabled() noexcept
 {
-    // 读取生产环境配置开关：通过 enable_kafka_persistence 控制是否异步落库 Kafka
-    static const bool enableKafka = []() {
-        try
+    // 缺省 false（fail-safe）：配置里漏写 enable_kafka_persistence 时【不】往 Kafka 写。
+    // 两个方向的代价不对称 —— 默认 true 会把「配置里忘了写」变成「只产不消把磁盘写满」，
+    // 而默认 false 的代价只是「以为在落库其实没落」，且一查 /metrics 就看得见。
+    static std::atomic<bool> enabled{false};
+    return enabled;
+}
+
+void ChatWebsocket::reloadSwitches()
+{
+    // 由构造函数与 5 秒定时任务调用。做成可重读是为了避免「改配置必须重启」——
+    // 压测时切换落库开关不该需要重新起进程。
+    //
+    // ⚠️ 必须重读【磁盘上的配置文件】，不能读 drogon::app().getCustomConfig()：
+    // 后者是启动时解析出来的内存副本，进程跑起来之后永远不变 ——
+    // 拿它做热更新等于什么都没做（实测：改完文件后观察用的 gauge 一直不动）。
+    //
+    // 注：enable_cluster_bus 刻意【不】走这条路 —— 它在构造期决定要不要注册
+    // Redis 订阅，注册之后无法中途注销，热更新只会造成「开关说 false 但总线还活着」
+    // 这种自相矛盾的状态。详见 clusterBusEnabled()。
+    bool kafka = false;
+    try
+    {
+        Json::Value root;
+        Json::CharReaderBuilder builder;
+        std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+        std::string errs;
+        std::ifstream ifs(Config::filePath(), std::ios::binary);
+        const bool parsed =
+            ifs && Json::parseFromStream(builder, ifs, &root, &errs);
+        if (parsed)
         {
-            const auto& custom = drogon::app().getCustomConfig();
+            const auto& custom = root["custom_config"];
             if (custom.isMember("enable_kafka_persistence"))
             {
-                return custom["enable_kafka_persistence"].asBool();
+                kafka = custom["enable_kafka_persistence"].asBool();
             }
         }
-        catch (...)
+        else
         {
+            // 读不到就保持「关闭」并只告警一次。
+            // 不能每 5 秒刷一行 —— 那正好是本项目反复踩过的「热路径日志放大」。
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true, std::memory_order_relaxed))
+            {
+                LOG_WARN << "Cannot re-read config file '" << Config::filePath()
+                         << "' for hot switch reload: " << (errs.empty() ? "open failed" : errs)
+                         << " — switches keep their current value";
+            }
         }
-        return true;
-    }();
+    }
+    catch (...)
+    {
+    }
 
+    // exchange 而不是 store：只有真的发生跳变才留痕。
+    // 热更新必须可审计 —— 否则「谁在什么时候把落库打开了」无从查起。
+    // 首次调用若配置就是 true，也会打印一行（false -> true），正好说明生效值。
+    const bool prev = kafkaPersistenceEnabled().exchange(kafka, std::memory_order_relaxed);
+    if (prev != kafka)
+    {
+        // LOG_WARN 宏没有级别判断，永远输出 —— 审计信息不能被 log_level 过滤掉。
+        LOG_WARN << "Kafka persistence switch changed: " << (prev ? "true" : "false") << " -> "
+                 << (kafka ? "true" : "false") << " (custom_config.enable_kafka_persistence)";
+    }
+    Metrics::PrometheusRegistry::instance().setSwitchStates(kafka);
+}
+
+void ChatWebsocket::produceKafkaAsync(std::string_view topicName, std::string_view payload)
+{
     // 开关检查必须在【任何字符串构造之前】。
     //
     // 形参原先按值传 std::string：即便 Kafka 关闭、函数在这里立刻 return，
     // 实参的堆拷贝也已经发生完了 —— 热路径上每条消息白付一次分配。
     // 改成 string_view 后，关闭态下这次调用只是两次指针/长度赋值。
-    if (!enableKafka)
+    //
+    // 开关本身从「static const 一次性求值」改成原子量：原实现改配置永不生效，
+    // 只能重启进程（压测时切换落库开关很烦）。值由 reloadSwitches() 维护。
+    if (!kafkaPersistenceEnabled().load(std::memory_order_relaxed))
     {
         return; // 开发或压测模式下跳过 Kafka 写入，保持极致 CPU 吞吐
     }
@@ -64,7 +123,11 @@ void ChatWebsocket::produceKafkaAsync(std::string_view topicName, std::string_vi
 
     if (!accepted)
     {
-        Metrics::PrometheusRegistry::instance().recordWsMessageDropped();
+        // 注意用 recordKafkaPersistDropped 而不是 recordWsMessageDropped：
+        // 这条消息【已经投递给订阅者了】，丢的只是异步落库。
+        // 混进 ws_messages_dropped_total 会让「实时消息没投出去」和
+        // 「投出去了但没落库」这两类完全不同的事故变成一个数。
+        Metrics::PrometheusRegistry::instance().recordKafkaPersistDropped();
         LOG_WARN << "TBB pool saturated, dropped Kafka persistence for topic: " << topicName;
     }
 }
@@ -264,6 +327,8 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
     }
     catch (const std::exception& e)
     {
+        // 只打日志的话，线上没有任何可累加的信号（日志可能被级别过滤或轮转掉）。
+        Metrics::PrometheusRegistry::instance().recordWsHandlerException();
         LOG_ERROR << "Error in handleNewMessage: " << e.what();
     }
 }
@@ -360,6 +425,7 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
     }
     catch (const std::exception& e)
     {
+        Metrics::PrometheusRegistry::instance().recordWsHandlerException();
         LOG_ERROR << "Error in handleNewConnection: " << e.what();
 
         // 半初始化状态不能留：连接若已建立却没登记完整，就主动关掉，让
@@ -431,6 +497,7 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
         {
             // RoomRegistry 内部有锁，抛异常只可能是分配失败；记录后继续走公告流程。
             // 残留条目由房间回收兜底，不会永久泄漏。
+            Metrics::PrometheusRegistry::instance().recordWsHandlerException();
             LOG_ERROR << "unsubscribe failed for topic " << topic << ", ID: " << id << ": " << e.what();
         }
         LOG_DEBUG << "Unsubscribed from topic: " << topic << ", ID: " << id;
@@ -461,6 +528,7 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
     }
     catch (const std::exception& e)
     {
+        Metrics::PrometheusRegistry::instance().recordWsHandlerException();
         LOG_ERROR << "Error in handleConnectionClosed: " << e.what();
     }
 }
@@ -592,6 +660,9 @@ void ChatWebsocket::publishToCluster(const Core& core, const std::string& topic,
     }
     catch (const std::exception& e)
     {
+        // 这条路径在【每条消息】上都会走一遍，异常若持续发生，
+        // 日志被限流/轮转掉之后就没有任何痕迹了，必须靠计数器留证。
+        Metrics::PrometheusRegistry::instance().recordWsHandlerException();
         LOG_ERROR << "publishToCluster exception: " << e.what();
     }
 }
@@ -656,6 +727,7 @@ void ChatWebsocket::checkAndEvictIdleConnections(Core& core)
     }
     catch (const std::exception& e)
     {
+        Metrics::PrometheusRegistry::instance().recordWsHandlerException();
         LOG_ERROR << "Error in checkAndEvictIdleConnections: " << e.what();
     }
 }

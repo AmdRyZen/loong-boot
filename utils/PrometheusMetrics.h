@@ -48,10 +48,34 @@ public:
         wsTotalMessages_.fetch_add(count, std::memory_order_relaxed);
     }
 
-    // 因线程池背压 / 房间积压限流而被丢弃的消息数。
+    // 因【房间分片积压达上限】而被丢弃的消息数（含聊天消息与入群/退群公告）。
     // 该计数必须暴露：一旦持续增长说明吞吐已达上限，需要扩实例而不是继续加压。
+    //
+    // ⚠️ 语义收窄（2026-09-12）：此前 Kafka 持久化的 TBB 池饱和也往这里 +1，
+    // 于是「消息没投出去」和「消息投出去了但没落库」混成同一个数，线上看到涨了
+    // 无法判断是哪一类。现在这里只表示前者，后者见 recordKafkaPersistDropped()。
     void recordWsMessageDropped(uint64_t count = 1) {
         wsDroppedMessages_.fetch_add(count, std::memory_order_relaxed);
+    }
+
+    // 因 TBB 协程池饱和而被丢弃的 Kafka 持久化次数。
+    //
+    // 与 recordWsMessageDropped() 的区别：这条消息【已经投递给订阅者了】，
+    // 只是没能异步落库 —— 丢的是历史记录，不是实时消息。
+    // 判读：持续增长说明 TBB 池长期打满（Kafka broker 慢 / 分区数不足），
+    //       实时链路仍正常，但历史回放会缺数据。
+    void recordKafkaPersistDropped(uint64_t count = 1) {
+        wsKafkaPersistDropped_.fetch_add(count, std::memory_order_relaxed);
+    }
+
+    // WebSocket 回调里被 catch 吞掉的异常次数。
+    //
+    // 为什么需要：这几处 catch 原先只写一行 LOG_ERROR。异常是罕见事件，
+    // 但一旦发生（分配失败、序列化异常等）线上没有任何可累加的信号，
+    // 只能去翻日志 —— 而日志可能被级别过滤或轮转掉。
+    // 判读：非 0 即应查日志定位；具体是哪个 handler 看日志里的前缀。
+    void recordWsHandlerException(uint64_t count = 1) {
+        wsHandlerExceptions_.fetch_add(count, std::memory_order_relaxed);
     }
 
     // 因空闲超时（60 秒未收到客户端任意帧）被服务端主动断开的连接数。
@@ -111,6 +135,15 @@ public:
         wsFanoutCrossThreadDeliveries_.store(crossthreadDeliveries, std::memory_order_relaxed);
     }
 
+    // 运行期开关的当前值（0/1），由 ChatWebsocket::reloadSwitches() 每 5 秒推送。
+    //
+    // 为什么必须有：开关现在支持热更新，那就必须能看见「此刻到底是开还是关」——
+    // 否则又回到「改了配置到底生效没有」的盲区（原实现是 static const，
+    // 只在首次调用求值一次，改配置永远不生效且没有任何提示）。
+    void setSwitchStates(bool kafkaPersistence) {
+        wsKafkaPersistenceEnabled_.store(kafkaPersistence ? 1 : 0, std::memory_order_relaxed);
+    }
+
     // 生成标准 Prometheus 文本格式导出
     std::string exportPrometheusText() const {
         std::ostringstream ss;
@@ -137,9 +170,18 @@ public:
            << "# HELP ws_messages_received_total Total WebSocket messages processed.\n"
            << "# TYPE ws_messages_received_total counter\n"
            << "ws_messages_received_total " << wsTotalMessages_.load(std::memory_order_relaxed) << "\n\n"
-           << "# HELP ws_messages_dropped_total Total WebSocket messages dropped due to backpressure.\n"
+           << "# HELP ws_messages_dropped_total WebSocket messages dropped due to room shard backlog.\n"
            << "# TYPE ws_messages_dropped_total counter\n"
            << "ws_messages_dropped_total " << wsDroppedMessages_.load(std::memory_order_relaxed) << "\n\n"
+           << "# HELP ws_kafka_persist_dropped_total Kafka persistence skipped because the TBB pool was saturated (message was still delivered live).\n"
+           << "# TYPE ws_kafka_persist_dropped_total counter\n"
+           << "ws_kafka_persist_dropped_total " << wsKafkaPersistDropped_.load(std::memory_order_relaxed) << "\n\n"
+           << "# HELP ws_handler_exceptions_total Exceptions caught and swallowed inside WebSocket callbacks (non-zero means check logs).\n"
+           << "# TYPE ws_handler_exceptions_total counter\n"
+           << "ws_handler_exceptions_total " << wsHandlerExceptions_.load(std::memory_order_relaxed) << "\n\n"
+           << "# HELP ws_kafka_persistence_enabled Effective value of custom_config.enable_kafka_persistence (hot-reloaded every 5s).\n"
+           << "# TYPE ws_kafka_persistence_enabled gauge\n"
+           << "ws_kafka_persistence_enabled " << wsKafkaPersistenceEnabled_.load(std::memory_order_relaxed) << "\n\n"
            << "# HELP ws_evicted_idle_total WebSocket connections force-closed after the 60s idle timeout.\n"
            << "# TYPE ws_evicted_idle_total counter\n"
            << "ws_evicted_idle_total " << wsEvictedIdle_.load(std::memory_order_relaxed) << "\n\n"
@@ -225,6 +267,9 @@ private:
     std::atomic<int64_t> wsOnlineConnections_{0};
     std::atomic<uint64_t> wsTotalMessages_{0};
     std::atomic<uint64_t> wsDroppedMessages_{0};
+    std::atomic<uint64_t> wsKafkaPersistDropped_{0};
+    std::atomic<uint64_t> wsHandlerExceptions_{0};
+    std::atomic<uint64_t> wsKafkaPersistenceEnabled_{0};
     std::atomic<uint64_t> wsEvictedIdle_{0};
     std::atomic<uint64_t> wsOverloadNoticeSuppressed_{0};
     std::atomic<uint64_t> wsJsonParseErrors_{0};
