@@ -166,24 +166,19 @@ Application::Application()
         std::cout << std::endl;
     });
 
-    // 全局路由注册：/metrics 监控端点直接代码级注册，避免反射加载顺序失效
-    drogon::app().registerHandler(
-        "/metrics",
-        [](const drogon::HttpRequestPtr& req,
-           std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
-            const auto resp = drogon::HttpResponse::newHttpResponse();
-            resp->setStatusCode(drogon::k200OK);
-            resp->setContentTypeString("text/plain; version=0.0.4; charset=utf-8");
-            resp->setBody(Metrics::PrometheusRegistry::instance().exportPrometheusText());
-            // ⚠️ 这里必须用负数。drogon 的 setExpiredTime 语义与直觉相反：
-            //    0 = **永久缓存**，负数 = 不缓存，默认 -1。
-            // 之前写的 0 会让每个 IO 线程把「它服务的第一个 /metrics 请求」的
-            // 快照永久冻结（缓存是 IOThreadStorage，每线程一份），之后该线程上
-            // 的所有抓取都返回旧值 —— 监控静默失真，排查时极易被误导。
-            resp->setExpiredTime(-1);
-            callback(resp);
-        },
-        {drogon::Get});
+    // 注意：/metrics **不在这里**注册。
+    //
+    // 它由 config.json 的 `simple_controllers_map` 注册到 MetricsCtrl。
+    // 这里曾经有一段代码级 `registerHandler("/metrics", ...)`，注释写着
+    // 「避免反射加载顺序失效」—— 那是多余的：drogon 的
+    // HttpControllersRouter::route() **先查 simpleCtrlMap_（配置注册）并直接
+    // 返回**，查不到才轮到 ctrlMap_（registerHandler）。也就是说配置那条路
+    // 一旦命中，这段代码**永远不会被执行**，是一段纯死代码，且它与
+    // MetricsCtrl 各自维护一份响应构造逻辑（上一轮 setExpiredTime 的坑就
+    // 两处都要改）。已删除，只保留 MetricsCtrl 一条路。
+    //
+    // 代价：/metrics 现在依赖 config.json 里那条 simple_controllers_map 存在
+    // （与 /test 同机制）。改动配置时注意别把它删掉。
 
     // 全局分布式链路追踪 TraceId 拦截与注入
     drogon::app().registerPreRoutingAdvice([](const drogon::HttpRequestPtr& req,
