@@ -115,7 +115,11 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                 subscriber.touch();
             }
             wsConn->send("pong_ms", WebSocketMessageType::Pong);
-            LOG_INFO << "Received a ping";
+            // 降级为 DEBUG：这是「每帧一条」的路径，而 config.json 的 log_level 是 INFO
+            // → 原来每个心跳都会落一行盘。前端本来就必须定期发心跳（60s 空闲驱逐只看
+            // handleNewMessage，协议层 ping/pong 不计入），所以连接数一上来就是
+            // 每秒数千行的纯噪声。连接存活与否已有 ws_evicted_idle_total 覆盖。
+            LOG_DEBUG << "Received a ping";
             return;
         }
 
@@ -131,7 +135,8 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
 
         if (type == WebSocketMessageType::Close)
         {
-            LOG_INFO << "Received a Close";
+            // 同样是「每连接一条」的诊断噪声，不该占 INFO
+            LOG_DEBUG << "Received a Close";
             return;
         }
 
