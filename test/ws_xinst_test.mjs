@@ -14,19 +14,24 @@
 //   3. 两个实例是【不同端口】的独立进程
 //
 // 起两个实例（用 /tmp 的配置副本，别改仓库里的 config.json）：
-//   for p in 9092 9093; do
-//     mkdir -p /tmp/xchat/i$p/log && cp config.json /tmp/xchat/i$p/config.json
+//   for p in 18092 18093; do
+//     mkdir -p /tmp/xchat/i$p/log        # ← log/ 必须先建，否则启动即退（Log path does not exist）
+//     cp config.json /tmp/xchat/i$p/config.json
 //     sed -i '' "s/\"port\": 9090/\"port\": $p/" /tmp/xchat/i$p/config.json
 //     sed -i '' 's/"enable_cluster_bus": false/"enable_cluster_bus": true/' /tmp/xchat/i$p/config.json
+//     cp cmake-build-release/loong-boot /tmp/xchat/i$p/
 //     (cd /tmp/xchat/i$p && nohup ./loong-boot config.json > stdout.log 2>&1 &)
 //   done
 //   redis-cli pubsub numsub chat_cluster_bus     # 应为 2（两个实例各一个订阅）
 //
+// ⚠️ 端口别用 9090~9093：本机 Kafka broker 占着 9092/9093（lsof -iTCP:9092 -sTCP:LISTEN
+//    可确认），HTTP 端口与之冲突时实例直接 terminate（std::system_error）。
+//
 // 用法：
-//   node test/ws_xinst_test.mjs [ws://127.0.0.1:9092/chat] [ws://127.0.0.1:9093/chat]
+//   node test/ws_xinst_test.mjs [ws://127.0.0.1:18092/chat] [ws://127.0.0.1:18093/chat]
 
-const A = process.argv[2] || 'ws://127.0.0.1:9092/chat';
-const B = process.argv[3] || 'ws://127.0.0.1:9093/chat';
+const A = process.argv[2] || 'ws://127.0.0.1:18092/chat';
+const B = process.argv[3] || 'ws://127.0.0.1:18093/chat';
 const ROOM = `xroom_${Date.now()}`;
 
 let failures = 0;

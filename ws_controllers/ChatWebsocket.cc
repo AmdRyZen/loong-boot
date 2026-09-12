@@ -109,16 +109,84 @@ void ChatWebsocket::produceKafkaAsync(std::string_view topicName, std::string_vi
     // 原实现忽略返回值 → 消息被静默丢弃，无日志无指标，上层误以为已落库。
     const bool accepted = TbbCoroutinePool::instance().submit(
         [topic = std::string(topicName), payload = std::string(payload)] {
-            rd_kafka_topic_t* topicPtr = kafka::KafkaManager::instance().getTopic(topic);
-            retryWithSleep([&]() {
-                if (!kafka::KafkaManager::safeProduce(topicPtr, payload))
+            // ⚠️ TbbCoroutinePool 内部对任务包了 catch(...)，lambda 里抛出的任何异常
+            // 都会被【静默吞掉】（无日志无指标）。KafkaManager::getTopic 在未初始化 /
+            // topic 句柄创建失败时抛 runtime_error —— 不在这里自己接住的话，
+            // 消息就是无声消失。所以本 lambda 内的一切工作都必须自己兜异常。
+            // 终态失败日志的限流器（按秒，行内带上被压掉的条数）。
+            //
+            // 为什么必须限流：本 lambda 的两条失败路径（getTopic 抛异常 / produce 重试后仍未成功）
+            // 触发频率都与【消息流量】成正比 —— KafkaManager 或 broker 不可用时每条消息都走。
+            // 与 overloadLogLimiter_ / jsonParseErrorLogLimiter_ 同一把尺子。
+            //
+            // 刻意用函数内静态量而不是实例成员：produceKafkaAsync 是 static 成员函数拿不到实例；
+            // 且「落库失败」是全局事件，跨 topic 共享一个窗口正是想要的语义。
+            static loong::log::RateLimiter failLogLimiter{1000};
+
+            // 两条失败路径共用同一个限流器 —— 否则它们各自限流、合起来仍可能被冲垮。
+            // 必须在 allow() 返回 true 之后才调 takeSuppressed()（见 RateLimitedLog.h）。
+            // 注意：这里才构造日志字符串，成功路径一行都不打、也不分配。
+            const auto logTerminalFailure = [&](const char* reason, bool severe) {
+                if (!failLogLimiter.allow())
                 {
-                    const rd_kafka_resp_err_t err = rd_kafka_last_error();
-                    LOG_ERROR << "Failed to produce message: " << rd_kafka_err2str(err);
-                    return err != RD_KAFKA_RESP_ERR__QUEUE_FULL;
+                    return;
                 }
-                return true;
+                const std::string line =
+                    std::string("Kafka persist failed for topic '") + topic + "': " + reason + ", " +
+                    std::to_string(1 + failLogLimiter.takeSuppressed()) +
+                    " occurrence(s) since last log (total: ws_kafka_produce_failed_total)";
+                if (severe)
+                {
+                    LOG_ERROR << line;
+                }
+                else
+                {
+                    LOG_WARN << line;
+                }
+            };
+
+            rd_kafka_topic_t* topicPtr = nullptr;
+            try
+            {
+                topicPtr = kafka::KafkaManager::instance().getTopic(topic);
+            }
+            catch (const std::exception& e)
+            {
+                Metrics::PrometheusRegistry::instance().recordKafkaProduceFailed();
+                logTerminalFailure(e.what(), /*severe=*/true);
+                return;
+            }
+
+            // delivered 必须显式追踪：谓词的返回值语义是「还要不要重试」而不是「成功没有」
+            //（QUEUE_FULL 之外的错误返回 true 表示「重试没意义、放弃」，会被 retryWithSleep
+            // 当作成功收尾）。原实现里「重试耗尽」与「永久性错误放弃」都既无指标也无终态日志，
+            // 上层只能靠翻每次尝试的 LOG_ERROR 自己拼结论。
+            //
+            // ⚠️ 循环内【一行日志都不打】：retryWithSleep 默认重试 3 次，若每次失败都打一行，
+            // broker 挂掉时就是「每条消息 3 行」——正是本项目反复踩过的热路径日志放大，
+            // 而且它比终态那条还频繁（终态已限流，这条没有）。改成把错误码记在 lastErr 里、
+            // 由终态那条限流日志输出：信息量不减（拿到的是最终错误码，比三次中间态更有用），
+            // 日志量从 O(3 × 消息数) 降到 ≤1 行/秒。
+            bool delivered = false;
+            rd_kafka_resp_err_t lastErr = RD_KAFKA_RESP_ERR_NO_ERROR;
+            retryWithSleep([&]() {
+                if (kafka::KafkaManager::safeProduce(topicPtr, payload))
+                {
+                    delivered = true;
+                    return true;
+                }
+                lastErr = rd_kafka_last_error();
+                // QUEUE_FULL 是瞬态的 → 返回 false 让 retryWithSleep 重试；
+                // 其余错误（消息过大 / 无效 topic 等）重试无意义 → 放弃。
+                return lastErr != RD_KAFKA_RESP_ERR__QUEUE_FULL;
             });
+            if (delivered)
+            {
+                return;
+            }
+
+            Metrics::PrometheusRegistry::instance().recordKafkaProduceFailed();
+            logTerminalFailure(rd_kafka_err2str(lastErr), /*severe=*/false);
         });
 
     if (!accepted)

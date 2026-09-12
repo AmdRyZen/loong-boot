@@ -68,6 +68,16 @@ public:
         wsKafkaPersistDropped_.fetch_add(count, std::memory_order_relaxed);
     }
 
+    // Kafka produce 最终失败（重试耗尽 / getTopic 抛异常）的次数。
+    //
+    // 与 recordKafkaPersistDropped() 的区别：那是「任务根本没进 TBB 池」，
+    // 这是「进了池、也跑了，但 broker 侧始终没接受」。两者对上层的影响相同
+    // （实时消息已投、历史缺失），但事故处置不同 —— 前者查池容量，后者查 broker。
+    // 判读：非 0 即有历史缺口；结合日志里的 rd_kafka 错误码定位根因。
+    void recordKafkaProduceFailed(uint64_t count = 1) {
+        wsKafkaProduceFailed_.fetch_add(count, std::memory_order_relaxed);
+    }
+
     // WebSocket 回调里被 catch 吞掉的异常次数。
     //
     // 为什么需要：这几处 catch 原先只写一行 LOG_ERROR。异常是罕见事件，
@@ -176,6 +186,9 @@ public:
            << "# HELP ws_kafka_persist_dropped_total Kafka persistence skipped because the TBB pool was saturated (message was still delivered live).\n"
            << "# TYPE ws_kafka_persist_dropped_total counter\n"
            << "ws_kafka_persist_dropped_total " << wsKafkaPersistDropped_.load(std::memory_order_relaxed) << "\n\n"
+           << "# HELP ws_kafka_produce_failed_total Kafka produce attempts that ultimately failed (retries exhausted or getTopic threw); live delivery was unaffected but history has gaps.\n"
+           << "# TYPE ws_kafka_produce_failed_total counter\n"
+           << "ws_kafka_produce_failed_total " << wsKafkaProduceFailed_.load(std::memory_order_relaxed) << "\n\n"
            << "# HELP ws_handler_exceptions_total Exceptions caught and swallowed inside WebSocket callbacks (non-zero means check logs).\n"
            << "# TYPE ws_handler_exceptions_total counter\n"
            << "ws_handler_exceptions_total " << wsHandlerExceptions_.load(std::memory_order_relaxed) << "\n\n"
@@ -268,6 +281,7 @@ private:
     std::atomic<uint64_t> wsTotalMessages_{0};
     std::atomic<uint64_t> wsDroppedMessages_{0};
     std::atomic<uint64_t> wsKafkaPersistDropped_{0};
+    std::atomic<uint64_t> wsKafkaProduceFailed_{0};
     std::atomic<uint64_t> wsHandlerExceptions_{0};
     std::atomic<uint64_t> wsKafkaPersistenceEnabled_{0};
     std::atomic<uint64_t> wsEvictedIdle_{0};
