@@ -4,6 +4,7 @@
 #include <glaze/glaze.hpp>
 #include <drogon/HttpAppFramework.h>
 #include "utils/retry_utils.h"
+#include "utils/RateLimitedLog.h"
 #include "parallel_hashmap/phmap.h"
 #include "RoomRegistry.h"
 #include <algorithm>
@@ -34,11 +35,10 @@ public:
         std::mt19937_64 rng(std::random_device{}());
         instanceId_ = "inst_" + std::to_string(rng());
 
-        // 注册定时任务：空闲超时连接驱逐 + 房间指标采集 + 过载日志聚合
+        // 注册定时任务：空闲超时连接驱逐 + 房间指标采集
         HttpAppFramework::instance().getLoop()->runEvery(5.0, [this] {
             checkAndEvictIdleConnections();
             publishRoomMetrics();
-            flushOverloadLog();
         });
 
         // 初始化 Redis 分布式集群网关总线
@@ -141,13 +141,21 @@ private:
     // 代价是最多 5 秒的滞后（gauge 类指标可以接受；counter 看增量也不受影响）。
     void publishRoomMetrics();
 
-    // 把「房间积压导致的丢弃」按 5 秒窗口聚合成一行日志。
-    // 逐条 LOG_WARN 在饱和时会写出 GB 级日志（实测 30s → 1.6GB / 13.8M 行），
-    // 日志 I/O 反过来拖垮扇出，因此热路径只做一次原子累加，输出交给定时任务。
-    void flushOverloadLog();
-
-    // 距上次日志汇总以来被丢弃的消息数（热路径只碰这一个原子量）。
-    std::atomic<uint64_t> overloadDropsSinceFlush_{0};
+    // ── 客户端可控频率的日志限流 ────────────────────────────────────────────
+    //
+    // 下面两类日志的触发频率**由客户端决定**，逐条输出时一个恶意/异常客户端
+    // 就能刷爆磁盘（与「过载时回一帧 503」是同一类放大漏洞）：
+    //   ① 房间积压丢弃：客户端发得越猛，丢弃越多。实测 30s 回声饱和压测
+    //      曾写出 1.6GB / 13.8M 行日志，日志 I/O 反过来拖垮扇出。
+    //      三个调用点共用 overloadLogLimiter_（聊天消息 / 入群公告 / 退群公告）——
+    //      它们同属「房间积压」这一种过载现象，共用一把尺子即可。
+    //   ② JSON 解析失败：狂发非法负载即可无限刷。
+    //
+    // 它们都是真错误、不能静默，但必须限流。被压掉的次数会在下一次输出里
+    // 一并带上（见 RateLimiter::takeSuppressed），信息不丢。
+    // 判读总量仍看 counter：ws_messages_dropped_total / ws_json_parse_errors_total。
+    loong::log::RateLimiter overloadLogLimiter_{1000};
+    loong::log::RateLimiter jsonParseErrorLogLimiter_{1000};
 
     // 把 room 内的消息投递到本地房间 + 集群总线（+ Kafka 持久化，已按需关闭）
     // 返回 false 表示本地分片积压达上限、消息被丢弃（调用方需计数并告知客户端）

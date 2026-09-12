@@ -9,6 +9,8 @@
 #include <jwt-cpp/jwt.h>
 #include <optional>
 
+#include "utils/RateLimitedLog.h"
+
 class checkloginUtils
 {
   public:
@@ -30,7 +32,15 @@ std::optional<std::string> checkloginUtils::checklogin(const drogon::HttpRequest
     }
     catch (const std::exception& e)
     {
-        LOG_ERROR << "checklogin err = " << e.what() << " login";
+        // 触发频率由客户端决定：乱发 token 就能让每个请求写一行 ERROR。
+        // 是真错误（鉴权失败）所以不静默，但必须限流。
+        // 函数内 static：inline 函数保证全程序一份实例。
+        static loong::log::RateLimiter limiter{1000};
+        if (limiter.allow())
+        {
+            LOG_ERROR << "checklogin err = " << e.what() << " login: "
+                      << (1 + limiter.takeSuppressed()) << " occurrence(s) since last log";
+        }
         return std::nullopt;
     }
 }

@@ -149,7 +149,18 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                 std::string json{};
                 (void)glz::write_json(err_msg, json);
                 wsConn->send(json, WebSocketMessageType::Text);
-                LOG_ERROR << "Failed to parse JSON message";
+                Metrics::PrometheusRegistry::instance().recordWsJsonParseError();
+                // 触发频率完全由客户端决定（狂发非法负载即可无限刷），必须限流。
+                // 是真错误所以不静默。行内给出「本次覆盖多少条」；
+                // 累计总量看 ws_json_parse_errors_total（限流会让日志少报，
+                // 但 counter 不会）。
+                if (jsonParseErrorLogLimiter_.allow())
+                {
+                    LOG_ERROR << "Failed to parse JSON message: "
+                              << (1 + jsonParseErrorLogLimiter_.takeSuppressed())
+                              << " occurrence(s) since last log "
+                              << "(total: ws_json_parse_errors_total)";
+                }
                 return;
             }
 
@@ -259,9 +270,17 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                             metrics.recordWsOverloadNoticeSuppressed();
                         }
 
-                        // 日志同样按窗口聚合：逐条 WARN 在饱和时会写出 GB 级日志，
-                        // 磁盘 I/O 反过来拖垮扇出。这里只累加，由 5 秒定时任务汇总输出。
-                        overloadDropsSinceFlush_.fetch_add(1, std::memory_order_relaxed);
+                        // 逐条 WARN 在饱和时会写出 GB 级日志（实测 30s → 1.6GB /
+                        // 13.8M 行），磁盘 I/O 反过来拖垮扇出。这里按秒限流，
+                        // 行内给出「本次覆盖多少条」；累计总量看
+                        // ws_messages_dropped_total（counter 不受限流影响）。
+                        if (overloadLogLimiter_.allow())
+                        {
+                            LOG_WARN << "Room backlog full, message dropped: "
+                                     << (1 + overloadLogLimiter_.takeSuppressed())
+                                     << " occurrence(s) since last log "
+                                     << "(total: ws_messages_dropped_total)";
+                        }
                     }
                 }
             }
@@ -343,7 +362,14 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
         if (!fanOutRoom(topic, json))
         {
             Metrics::PrometheusRegistry::instance().recordWsMessageDropped();
-            LOG_WARN << "Room backlog full, dropped join notice for room: " << topic;
+            // 与消息丢弃共用同一个限流器：同属「房间积压」这一种过载现象。
+            // 触发频率同样由客户端决定（反复快速建连/断连即可），不能逐条打。
+            if (overloadLogLimiter_.allow())
+            {
+                LOG_WARN << "Room backlog full, dropped join notice for room " << topic << ": "
+                         << (1 + overloadLogLimiter_.takeSuppressed())
+                         << " occurrence(s) since last log (total: ws_messages_dropped_total)";
+            }
         }
     }
     catch (const std::exception& e)
@@ -403,7 +429,13 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
         if (!fanOutRoom(topic, json))
         {
             Metrics::PrometheusRegistry::instance().recordWsMessageDropped();
-            LOG_WARN << "Room backlog full, dropped leave notice for room: " << topic;
+            // 同上：与消息丢弃共用限流器。
+            if (overloadLogLimiter_.allow())
+            {
+                LOG_WARN << "Room backlog full, dropped leave notice for room " << topic << ": "
+                         << (1 + overloadLogLimiter_.takeSuppressed())
+                         << " occurrence(s) since last log (total: ws_messages_dropped_total)";
+            }
         }
     }
     catch (const std::exception& e)
@@ -610,19 +642,3 @@ void ChatWebsocket::publishRoomMetrics()
                      roomRegistry_.crossThreadDeliveries());
 }
 
-void ChatWebsocket::flushOverloadLog()
-{
-    // 把窗口内被丢弃的消息数汇总成一行日志。
-    //
-    // 原实现是「每条丢弃一行 LOG_WARN」：30 秒回声饱和压测实测写出 1.6GB 日志
-    // （13.8M 行全是同一句 "Room backlog full"），日志本身成了比扇出更重的负担。
-    // 聚合后同样的负载只产生「每 5 秒一行」，信息量不减（仍能看出过载程度），
-    // 而磁盘写入量下降 5~6 个数量级。
-    const uint64_t dropped = overloadDropsSinceFlush_.exchange(0, std::memory_order_relaxed);
-    if (dropped > 0)
-    {
-        LOG_WARN << "Room backlog full: dropped " << dropped
-                 << " message(s) in the last 5s window "
-                 << "(per-message logs suppressed; see ws_messages_dropped_total)";
-    }
-}

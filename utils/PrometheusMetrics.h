@@ -73,6 +73,13 @@ public:
         wsOverloadNoticeSuppressed_.fetch_add(count, std::memory_order_relaxed);
     }
 
+    // 客户端发来的负载无法解析的次数。
+    // 该计数必须暴露：触发频率由客户端决定，持续增长说明有人在发非法负载
+    // （日志已按秒限流，所以「日志里看不到」不等于「没发生」，要看这个数）。
+    void recordWsJsonParseError(uint64_t count = 1) {
+        wsJsonParseErrors_.fetch_add(count, std::memory_order_relaxed);
+    }
+
     // 房间侧快照（由 ChatWebsocket 的 5 秒定时任务推送）。
     // 这里存的是上一次采样的值：/metrics 抓取时无需再去加房间表的锁，
     // 代价是最多 5 秒的滞后 —— 对 gauge 类指标完全够用。
@@ -138,7 +145,10 @@ public:
            << "ws_evicted_idle_total " << wsEvictedIdle_.load(std::memory_order_relaxed) << "\n\n"
            << "# HELP ws_overload_notice_suppressed_total Overload (503) notices suppressed by the per-connection rate limit.\n"
            << "# TYPE ws_overload_notice_suppressed_total counter\n"
-           << "ws_overload_notice_suppressed_total " << wsOverloadNoticeSuppressed_.load(std::memory_order_relaxed) << "\n\n";
+           << "ws_overload_notice_suppressed_total " << wsOverloadNoticeSuppressed_.load(std::memory_order_relaxed) << "\n\n"
+           << "# HELP ws_json_parse_errors_total Client messages that failed to parse (rate-limited in logs; watch this counter).\n"
+           << "# TYPE ws_json_parse_errors_total counter\n"
+           << "ws_json_parse_errors_total " << wsJsonParseErrors_.load(std::memory_order_relaxed) << "\n\n";
 
         // 房间注册表度量（由 5 秒定时任务推送，最多 5 秒滞后）
         ss << "# HELP ws_rooms_active Number of active chat rooms.\n"
@@ -217,6 +227,7 @@ private:
     std::atomic<uint64_t> wsDroppedMessages_{0};
     std::atomic<uint64_t> wsEvictedIdle_{0};
     std::atomic<uint64_t> wsOverloadNoticeSuppressed_{0};
+    std::atomic<uint64_t> wsJsonParseErrors_{0};
     std::atomic<uint64_t> wsRoomsActive_{0};
     std::atomic<uint64_t> wsRoomShards_{0};
     std::atomic<uint64_t> wsRoomSubscribers_{0};
