@@ -557,6 +557,56 @@
             document.getElementById('qpsVal').innerText = `${currentQps.toLocaleString()} msg/s`;
         }, 1000);
 
+        // ------------------------------------------------------------------
+        // 应用层心跳
+        //
+        // 服务端每 5 秒扫描一次连接，超过 60 秒没收到【客户端任意帧】就 forceClose。
+        //
+        // 注意：drogon 的 HttpServer 对每条 WebSocket 连接默认执行
+        //   wsConn->setPingMessage("", 30s)
+        // 即每 30 秒主动发一次协议层 Ping，浏览器会自动回 Pong —— 而 Pong 同样会
+        // 刷新服务端的活动时间。所以正常情况下连接不会被误杀，这条应用层心跳属于
+        // 【纵深防御】：它探测的是「TCP/协议栈还活着、但前端 JS 已经卡死」的场景，
+        // 那种情况下协议层 Pong 仍会自动回复，只有应用层心跳会停。
+        //
+        // 心跳用 action="ping"：服务端只在 action=="message" 时才广播，
+        // 因此它不会出现在聊天记录里，也不计入 QPS 统计。
+        // ------------------------------------------------------------------
+        const HEARTBEAT_MS = 25000;   // 必须明显小于服务端的 60 秒阈值
+        let heartbeatTimer = null;
+
+        function sendHeartbeat() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            try {
+                ws.send(JSON.stringify({
+                    key: document.getElementById('roomName').value.trim(),
+                    action: "ping",
+                    msgContent: "",
+                    toUser: ""
+                }));
+            } catch (e) {
+                // 发送失败不处理：下一轮会重试，连接真断了由 onclose 收尾
+            }
+        }
+
+        function startHeartbeat() {
+            stopHeartbeat();
+            heartbeatTimer = setInterval(sendHeartbeat, HEARTBEAT_MS);
+        }
+
+        function stopHeartbeat() {
+            if (heartbeatTimer !== null) {
+                clearInterval(heartbeatTimer);
+                heartbeatTimer = null;
+            }
+        }
+
+        // 标签页隐藏时浏览器会节流定时器（隐藏 5 分钟后约 1 分钟才触发一次），
+        // 刚好卡在服务端 60 秒阈值上。恢复可见时立刻补发一次。
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden) sendHeartbeat();
+        });
+
         function toggleConnect() {
             if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
                 ws.close();
@@ -594,6 +644,7 @@
                 btnSend.disabled = false;
                 msgInput.focus();
                 addSystemMessage(`已进入空间 [${room}]，身份: ${user}`);
+                startHeartbeat();
             };
 
             ws.onmessage = (event) => {
@@ -619,6 +670,7 @@
             };
 
             ws.onclose = () => {
+                stopHeartbeat();
                 dot.classList.remove('online');
                 statusText.innerText = '已断开';
                 statusText.style.color = 'var(--hm-text-secondary)';

@@ -490,9 +490,17 @@ void ChatWebsocket::checkAndEvictIdleConnections()
     {
         const auto now = Subscriber::nowNanos();
         // 60 秒无交互视为僵尸连接。
-        // 注意：活动时间只在【收到客户端消息】时刷新（Subscriber::touch()），
-        // drogon 协议层的 ping/pong 不计入；因此「只收不发」的客户端也会被踢。
-        // 前端需要自行定期发心跳（当前 chat.html 尚未实现，属已知待办）。
+        //
+        // 活动时间在【收到客户端任意帧】时刷新（Subscriber::touch()），包括两类：
+        //   1. 业务文本消息（action == "message" / "ping" 等）；
+        //   2. drogon 协议层自动收发的 Ping/Pong —— drogon 的 HttpServer 对每条
+        //      WebSocket 连接默认执行 setPingMessage("", 30s)，即每 30 秒主动发一次
+        //      Ping，浏览器/undici 等标准实现会自动回 Pong，从而触发 touch()。
+        // 因此「只收不发」的客户端【不会】被误杀；只有真正失联（不回 Pong）的连接
+        // 才会在 60 秒后被驱逐。实测：不自动回 Pong 的裸客户端在空闲 64.8 秒时被踢。
+        //
+        // chat.html 仍会额外发应用层心跳（action="ping"，25 秒一次），
+        // 用于探测「协议栈还活着但前端 JS 已卡死」的场景，属于纵深防御而非必需。
         constexpr int64_t idleTimeoutNanos =
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::seconds(60)).count();
 
