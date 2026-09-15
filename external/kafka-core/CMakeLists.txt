@@ -1,6 +1,13 @@
 cmake_minimum_required(VERSION 3.10)  # 降低版本要求以提高兼容性
-SET(CMAKE_C_COMPILER "/opt/homebrew/Cellar/gcc/15.1.0/bin/gcc-15")
-SET(CMAKE_CXX_COMPILER "/opt/homebrew/Cellar/gcc/15.1.0/bin/g++-15")
+# 编译器路径原先硬编码为 Homebrew gcc 15.1.0。该版本被 brew 升级移除后，
+# build-lib.sh 直接 configure 失败（"is not a full path to an existing
+# compiler tool"）—— 于是 kafka-core 的源码改动根本无法重装，
+# 表现为「改了 src/ 却怎么都不生效」。
+# 这里改成「存在则显式指定，不存在则回退 PATH 上的默认编译器」。
+if(EXISTS "/opt/homebrew/bin/gcc-16" AND EXISTS "/opt/homebrew/bin/g++-16")
+    set(CMAKE_C_COMPILER "/opt/homebrew/bin/gcc-16")
+    set(CMAKE_CXX_COMPILER "/opt/homebrew/bin/g++-16")
+endif()
 
 project(kafka-core)
 

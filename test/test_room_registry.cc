@@ -568,6 +568,11 @@ struct LoopState
     std::mutex m;
     std::vector<std::function<void()>> pending;
     std::atomic<int> wakeups{0};
+
+    // 注入用：置位后【下一次】dispatch 抛 bad_alloc，用来验证「投递阶段抛异常」
+    // 这条路径不会把分片永久卡死（见 testDispatchExceptionRecovery）。
+    // 默认 false，不影响其他用例。
+    std::atomic<bool> failNextDispatch{false};
 };
 
 struct MockLoopHandle
@@ -642,6 +647,11 @@ struct DynamicLoopHandle
     template <typename F>
     void dispatch(F&& f) const
     {
+        if (st->failNextDispatch.exchange(false, std::memory_order_relaxed))
+        {
+            // 模拟 queueInLoop 内部（std::function 构造 / 队列扩容）分配失败
+            throw std::bad_alloc();
+        }
         st->wakeups.fetch_add(1, std::memory_order_relaxed);
         std::lock_guard lock(st->m);
         st->pending.emplace_back(std::forward<F>(f));
@@ -653,6 +663,21 @@ struct DynamicLoopHandle
 };
 
 using RegDynamic = RoomRegistryT<MockPtr, DynamicLoopHandle>;
+
+// 扮演「loop 线程」：把排队的批次取出来执行（swap 出来再执行，避免持锁跑用户代码）。
+// 提成文件级函数是因为「在途投递上限」的用例需要反复手动排空 loop 队列。
+static void drainLoop(LoopState& l)
+{
+    std::vector<std::function<void()>> take;
+    {
+        std::lock_guard lock(l.m);
+        take.swap(l.pending);
+    }
+    for (auto& f : take)
+    {
+        f();
+    }
+}
 
 static void testLoopGrouping()
 {
@@ -921,9 +946,190 @@ static void testRoomHandleHint()
     }
 }
 
-int main()
+// ---------------------------------------------------------------------------
+// 8. 投递阶段抛异常后的分片恢复（回归）
+// ---------------------------------------------------------------------------
+// 缺陷形态（2026-09-15 修复）：fanOutToSnapshot 在锁外调用，dispatch
+// （queueInLoop 的 std::function 构造 / 队列扩容）抛异常时，异常会穿出
+// drainShard —— 而 busy 仍为 true 且再无人抽该分片，于是后续消息只入队
+// 不投递，直到队列堆满开始被拒（实测：抛一次之后分片永久卡死）。
+// 修复后：异常在 drainer 内被捕获、busy 复位、剩余消息继续投递，
+// 并计入 fanoutExceptions()（导出为 ws_fanout_exceptions_total）。
+static void testDispatchExceptionRecovery()
 {
-    testStrictOrdering(0, "线程池并行扇出");
+    std::printf("test: 投递异常后的分片恢复（回归）\n");
+
+    RegDynamic::Options opt;
+    opt.maxShards = 1;
+    opt.fanoutThreads = 0; // 内联抽干：异常路径与修复前走同一处代码
+    opt.backlogPerShard = 64;
+    RegDynamic reg(opt);
+
+    LoopState loop;
+    loop.id = 0;
+    auto c = std::make_shared<MockConn>();
+    reg.subscribe("boom", c, DynamicLoopHandle{&loop});
+
+    loop.failNextDispatch.store(true, std::memory_order_relaxed);
+    bool threw = false;
+    try
+    {
+        reg.publish("boom", std::string("M0"));
+    }
+    catch (...)
+    {
+        threw = true;
+    }
+    CHECK(!threw, "dispatch 抛异常时 publish 不把异常抛给调用方（修复前会抛到业务层）");
+
+    for (int i = 1; i <= 5; ++i)
+    {
+        reg.publish("boom", std::string("M") + std::to_string(i));
+    }
+
+    CHECK(reg.fanoutExceptions() >= 1, "投递异常被计数（ws_fanout_exceptions_total）");
+    CHECK(loop.pending.size() == 5,
+          "异常之后分片恢复投递：后续 5 条全部派发（修复前 busy 卡死，一条都投不出）");
+    CHECK(reg.droppedCount() == 0, "恢复过程中没有触发背压丢弃");
+
+    // 执行排队的批次，确认内容与顺序都正确
+    drainLoop(loop);
+
+    const std::vector<std::string> want{"M1", "M2", "M3", "M4", "M5"};
+    CHECK(snapshotOf(c) == want, "恢复后的消息内容与顺序正确");
+}
+
+// ---------------------------------------------------------------------------
+// 9. 订阅 ID 跨房间重生不复用（回归）
+// ---------------------------------------------------------------------------
+// 缺陷形态（2026-09-15 修复）：nextId 原是 Room 的成员，每个房间从 0 重新开始。
+// 房间空掉被回收、同名房间重建之后 ID 空间从头复用，而 unsubscribe 是按
+// (房间名, id) 定位的 —— 一次迟到的旧 ID 退订就会误删新订阅者。
+// 现在 ID 由 registry 级全局单调分配，同一房间名下不会出现重复 ID。
+static void testSubscriberIdNotReused()
+{
+    std::printf("test: 订阅 ID 跨房间重生不复用（回归）\n");
+
+    Reg reg;
+    auto c1 = std::make_shared<MockConn>();
+    const auto id1 = reg.subscribe("reborn2", c1);
+    reg.unsubscribe("reborn2", id1); // 房间空了 → 被回收
+    CHECK(reg.activeRooms() == 0, "最后一个订阅者离开后房间被回收");
+
+    auto c2 = std::make_shared<MockConn>();
+    const auto id2 = reg.subscribe("reborn2", c2);
+    CHECK(id2 != id1, "同名房间重建后新订阅者拿到【新】ID（修复前两代都从 1 开始）");
+
+    // 迟到的旧 ID 退订不得影响新订阅者
+    reg.unsubscribe("reborn2", id1);
+    CHECK(reg.publish("reborn2", std::string("M")), "旧 ID 退订后房间仍可发布");
+    CHECK(snapshotOf(c2) == std::vector<std::string>{"M"},
+          "旧 ID 退订不影响新订阅者（幂等且不跨代误删）");
+    CHECK(reg.subscribersIn("reborn2") == 1, "订阅者计数仍为 1");
+}
+
+// ---------------------------------------------------------------------------
+// 10. 全局在途投递上限（回归）
+// ---------------------------------------------------------------------------
+// 缺陷形态（2026-09-15 修复）：backlogPerShard 只约束【分片队列】，而按 loop 分组
+// 投递之后真正的排队点是目标 loop 的 queueInLoop 队列 —— 那是无界的。慢 loop 会让
+// 已出队的批次一直堆在那里，分片队列早已排空 ⇒ backlogPerShard 永不触发 ⇒
+// 调用方拿不到任何背压信号，内存无界上涨。
+// 实测（修复前）：backlogPerShard=4，publish 10000 条【全部返回成功】、dropped=0、
+// 连接实际收到 0 条。
+// 修复后：全局在途份数达到 maxInFlightDeliveries 即拒收（publish 返回 false）；
+// 只拒绝、不重排 ⇒ 不影响保序；置 0 = 关闭（退回旧行为）。
+static void testInFlightCap()
+{
+    std::printf("test: 全局在途投递上限（回归）\n");
+
+    // ---- 10a. 达到上限后拒收，排空后恢复 ----
+    {
+        LoopState loop;
+        loop.id = 0;
+
+        RegDynamic::Options opt;
+        opt.maxShards = 1;
+        opt.fanoutThreads = 0;
+        opt.backlogPerShard = 1 << 20; // 刻意放大：确保触发的是在途上限而不是分片积压
+        opt.maxInFlightDeliveries = 3; // 每批 1 份 ⇒ 第 4 条起被拒
+
+        RegDynamic reg(opt);
+        auto c = std::make_shared<MockConn>();
+        reg.subscribe("cap", c, DynamicLoopHandle{&loop});
+
+        // 不排空 loop ⇒ 份数一直挂在「在途」
+        CHECK(reg.publish("cap", std::string("A")), "在途 0 → 第 1 条被接受");
+        CHECK(reg.publish("cap", std::string("B")), "在途 1 → 第 2 条被接受");
+        CHECK(reg.publish("cap", std::string("C")), "在途 2 → 第 3 条被接受");
+        CHECK(reg.inFlightDeliveries() == 3, "在途份数 = 3（3 条 × 1 个收件人）");
+        CHECK(!reg.publish("cap", std::string("D")),
+              "在途 3 = 上限 → 第 4 条被拒（修复前恒返回成功）");
+        CHECK(reg.inflightRejectedCount() == 1, "因在途上限被拒 1 次");
+        CHECK(reg.droppedCount() == 1, "被拒同时计入总丢弃数（ws_messages_dropped_total）");
+        CHECK(!reg.publish("cap", std::string("E")), "上限持续生效");
+        CHECK(reg.inflightRejectedCount() == 2, "累计被拒 2 次");
+
+        // 排空 loop → 在途归零 → 重新放行
+        drainLoop(loop);
+        CHECK(reg.inFlightDeliveries() == 0, "loop 执行完后在途归零（计数无泄漏）");
+        CHECK(reg.publish("cap", std::string("F")), "在途归零后重新放行");
+        drainLoop(loop);
+        CHECK(snapshotOf(c) == std::vector<std::string>({"A", "B", "C", "F"}),
+              "被拒的消息不进队列，已接受的消息内容与顺序不变");
+    }
+
+    // ---- 10b. 上限 0 = 关闭（退回旧行为）----
+    {
+        LoopState loop;
+        loop.id = 0;
+
+        RegDynamic::Options opt;
+        opt.maxShards = 1;
+        opt.fanoutThreads = 0;
+        opt.backlogPerShard = 1 << 20;
+        opt.maxInFlightDeliveries = 0; // 关闭
+
+        RegDynamic reg(opt);
+        auto c = std::make_shared<MockConn>();
+        reg.subscribe("nocap", c, DynamicLoopHandle{&loop});
+
+        bool allOk = true;
+        for (int i = 0; i < 500; ++i)
+        {
+            allOk = reg.publish("nocap", std::string("M")) && allOk;
+        }
+        CHECK(allOk, "maxInFlightDeliveries = 0 时上限关闭（500 条全部接受）");
+        CHECK(reg.inflightRejectedCount() == 0, "关闭时没有任何在途拒绝");
+        CHECK(reg.inFlightDeliveries() == 500, "在途份数如实累计到 500");
+    }
+
+    // ---- 10c. 派发失败不得泄漏在途计数 ----
+    {
+        LoopState loop;
+        loop.id = 0;
+
+        RegDynamic::Options opt;
+        opt.maxShards = 1;
+        opt.fanoutThreads = 0;
+        opt.backlogPerShard = 1 << 20;
+        opt.maxInFlightDeliveries = 8;
+
+        RegDynamic reg(opt);
+        auto c = std::make_shared<MockConn>();
+        reg.subscribe("leak", c, DynamicLoopHandle{&loop});
+
+        loop.failNextDispatch.store(true, std::memory_order_relaxed);
+        reg.publish("leak", std::string("X"));
+        CHECK(reg.inFlightDeliveries() == 0,
+              "派发失败时在途计数被归还（否则只增不减，最终把房间钉死在上限）");
+        CHECK(reg.publish("leak", std::string("Y")), "派发失败后仍能继续发布");
+        CHECK(reg.inFlightDeliveries() == 1, "在途计数如实反映成功派发的那一条");
+    }
+}
+
+int main()
+{    testStrictOrdering(0, "线程池并行扇出");
     testStrictOrdering(1000000, "内联扇出");
     testRealParallelism();
     testBackpressure();
@@ -933,6 +1139,9 @@ int main()
     testLoopGrouping();
     testMixedDeliveryOrdering();
     testRoomHandleHint();
+    testDispatchExceptionRecovery();
+    testSubscriberIdNotReused();
+    testInFlightCap();
 
     std::printf("\n%s (failures=%d)\n", g_failures == 0 ? "ALL PASSED" : "FAILED", g_failures);
     return g_failures == 0 ? 0 : 1;

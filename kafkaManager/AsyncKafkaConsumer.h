@@ -46,6 +46,15 @@ public:
                 thread.join();
             }
         }
+        // ⚠️ 必须等 TBB 池里的【在途任务】跑完，再释放 consumer。
+        //
+        // submitMessageTask 提交的 lambda 捕获的是裸 rd_kafka_t* consumer，
+        // 任务体里还会调用 rd_kafka_commit_message(consumer, msg, 0) 与
+        // rd_kafka_message_destroy(msg)。原实现只 join 了 poll 线程就
+        // consumers_.clear()，于是「进程退出时刚好有消息在处理」这条路径上，
+        // 在途任务会访问已经销毁的 consumer → use-after-free。
+        // waitAll() 保证这些任务全部结束后才轮到 consumer 析构。
+        TbbCoroutinePool::instance().waitAll();
         consumers_.clear();
         LOG_DEBUG << "AsyncKafkaConsumer consumer stopped.";
     }

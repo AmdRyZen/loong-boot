@@ -46,6 +46,10 @@ public:
                 thread.join();
             }
         }
+        // ⚠️ 同 AsyncKafkaConsumer：必须等 TBB 池里的在途任务全部结束再释放
+        // consumer，否则退出瞬间在途任务会用到已销毁的 consumer（use-after-free）。
+        // 任务 lambda 捕获裸 rd_kafka_t*，并会 commit / destroy message。
+        TbbCoroutinePool::instance().waitAll();
         consumers_.clear();
         LOG_DEBUG << "AsyncKafkaConsumerOne consumer stopped.";
     }

@@ -114,6 +114,25 @@ public:
         wsJsonParseErrors_.fetch_add(count, std::memory_order_relaxed);
     }
 
+    // 集群总线 PUBLISH 失败的次数（Redis 不可达 / 连接断开 / 命令被拒）。
+    //
+    // 为什么必须有：publishToCluster 的异步失败回调原先只写一行 LOG_ERROR。
+    // Redis 挂掉时它按【消息速率】触发 —— 日志会被限流轮转掉，之后就只剩
+    // 「消息静默丢失、发送者仍收到 200 回显」这一种解释了。计数器不受日志
+    // 轮转影响，是判断「跨实例投递到底有没有在工作」的唯一可靠信号。
+    // 判读：非 0 且持续增长 = 集群总线不健康，跨实例消息正在丢。
+    void recordClusterPublishFailed(uint64_t count = 1) {
+        wsClusterPublishFailed_.fetch_add(count, std::memory_order_relaxed);
+    }
+
+    // 集群总线【入站】包被丢弃的次数（JSON 解析失败 / 回调内异常被吞）。
+    //
+    // 与上一条对称：入站路径原先整个 catch(...) 是空的，连日志都没有 ——
+    // 其他实例发来的消息解析失败时，本实例既无日志也无计数，完全静默。
+    void recordClusterPacketDropped(uint64_t count = 1) {
+        wsClusterPacketDropped_.fetch_add(count, std::memory_order_relaxed);
+    }
+
     // 房间侧快照（由 ChatWebsocket 的 5 秒定时任务推送）。
     // 这里存的是上一次采样的值：/metrics 抓取时无需再去加房间表的锁，
     // 代价是最多 5 秒的滞后 —— 对 gauge 类指标完全够用。
@@ -143,6 +162,25 @@ public:
         wsFanoutInLoop_.store(inloopDeliveries, std::memory_order_relaxed);
         wsFanoutCrossThread_.store(crossthreadBatches, std::memory_order_relaxed);
         wsFanoutCrossThreadDeliveries_.store(crossthreadDeliveries, std::memory_order_relaxed);
+    }
+
+    // 投递阶段被捕获的异常次数（RoomRegistry 内部）。
+    // 非 0 说明投递路径发生过异常（通常是分配失败），当时那条消息没能送达。
+    void setFanoutExceptions(uint64_t count) {
+        wsFanoutExceptions_.store(count, std::memory_order_relaxed);
+    }
+
+    // 全局在途投递份数、配置上限、以及「因在途上限被拒」的累计次数。
+    //
+    // inflight / limit 是 gauge：这一对是唯一能直接看出「下游 loop 队列是不是已经
+    // 堆满」的指标 —— 只报当前值不够，不知道上限就无法判断它离爆还有多远。
+    // 只看 ws_messages_dropped_total 也不行：那个数无法区分「分片队列满」和
+    // 「下游 loop 排空跟不上」，而这两者要调的阈值完全不同。
+    // rejected 是 counter，看增量。limit = 0 表示该限制已关闭。
+    void setFanoutInflight(uint64_t inflight, uint64_t limit, uint64_t rejected) {
+        wsFanoutInflight_.store(inflight, std::memory_order_relaxed);
+        wsFanoutInflightLimit_.store(limit, std::memory_order_relaxed);
+        wsFanoutInflightRejected_.store(rejected, std::memory_order_relaxed);
     }
 
     // 运行期开关的当前值（0/1），由 ChatWebsocket::reloadSwitches() 每 5 秒推送。
@@ -203,7 +241,13 @@ public:
            << "ws_overload_notice_suppressed_total " << wsOverloadNoticeSuppressed_.load(std::memory_order_relaxed) << "\n\n"
            << "# HELP ws_json_parse_errors_total Client messages that failed to parse (rate-limited in logs; watch this counter).\n"
            << "# TYPE ws_json_parse_errors_total counter\n"
-           << "ws_json_parse_errors_total " << wsJsonParseErrors_.load(std::memory_order_relaxed) << "\n\n";
+           << "ws_json_parse_errors_total " << wsJsonParseErrors_.load(std::memory_order_relaxed) << "\n\n"
+           << "# HELP ws_cluster_publish_failed_total Redis PUBLISH failures on the cluster bus (cross-instance delivery lost).\n"
+           << "# TYPE ws_cluster_publish_failed_total counter\n"
+           << "ws_cluster_publish_failed_total " << wsClusterPublishFailed_.load(std::memory_order_relaxed) << "\n\n"
+           << "# HELP ws_cluster_packet_dropped_total Inbound cluster-bus packets dropped (parse failure or callback exception).\n"
+           << "# TYPE ws_cluster_packet_dropped_total counter\n"
+           << "ws_cluster_packet_dropped_total " << wsClusterPacketDropped_.load(std::memory_order_relaxed) << "\n\n";
 
         // 房间注册表度量（由 5 秒定时任务推送，最多 5 秒滞后）
         ss << "# HELP ws_rooms_active Number of active chat rooms.\n"
@@ -236,7 +280,19 @@ public:
            << "ws_fanout_deliveries_total "
            << (wsFanoutInLoop_.load(std::memory_order_relaxed) +
                wsFanoutCrossThreadDeliveries_.load(std::memory_order_relaxed))
-           << "\n\n";
+           << "\n"
+           << "# HELP ws_fanout_exceptions_total Exceptions caught inside the fanout drainer (message was not delivered; shard state was recovered).\n"
+           << "# TYPE ws_fanout_exceptions_total counter\n"
+           << "ws_fanout_exceptions_total " << wsFanoutExceptions_.load(std::memory_order_relaxed) << "\n\n"
+           << "# HELP ws_fanout_inflight_deliveries Deliveries dispatched into target IO-loop queues but not yet executed (gauge).\n"
+           << "# TYPE ws_fanout_inflight_deliveries gauge\n"
+           << "ws_fanout_inflight_deliveries " << wsFanoutInflight_.load(std::memory_order_relaxed) << "\n"
+           << "# HELP ws_fanout_inflight_limit Configured cap for ws_fanout_inflight_deliveries (0 = cap disabled).\n"
+           << "# TYPE ws_fanout_inflight_limit gauge\n"
+           << "ws_fanout_inflight_limit " << wsFanoutInflightLimit_.load(std::memory_order_relaxed) << "\n"
+           << "# HELP ws_fanout_inflight_rejected_total Publishes rejected because the global in-flight delivery cap was reached.\n"
+           << "# TYPE ws_fanout_inflight_rejected_total counter\n"
+           << "ws_fanout_inflight_rejected_total " << wsFanoutInflightRejected_.load(std::memory_order_relaxed) << "\n\n";
 
         // HTTP 度量
         ss << "# HELP http_requests_total Total HTTP requests handled.\n"
@@ -287,6 +343,8 @@ private:
     std::atomic<uint64_t> wsEvictedIdle_{0};
     std::atomic<uint64_t> wsOverloadNoticeSuppressed_{0};
     std::atomic<uint64_t> wsJsonParseErrors_{0};
+    std::atomic<uint64_t> wsClusterPublishFailed_{0};
+    std::atomic<uint64_t> wsClusterPacketDropped_{0};
     std::atomic<uint64_t> wsRoomsActive_{0};
     std::atomic<uint64_t> wsRoomShards_{0};
     std::atomic<uint64_t> wsRoomSubscribers_{0};
@@ -294,6 +352,10 @@ private:
     std::atomic<uint64_t> wsFanoutInLoop_{0};
     std::atomic<uint64_t> wsFanoutCrossThread_{0};
     std::atomic<uint64_t> wsFanoutCrossThreadDeliveries_{0};
+    std::atomic<uint64_t> wsFanoutExceptions_{0};
+    std::atomic<uint64_t> wsFanoutInflight_{0};
+    std::atomic<uint64_t> wsFanoutInflightLimit_{0};
+    std::atomic<uint64_t> wsFanoutInflightRejected_{0};
 };
 
 } // namespace Metrics

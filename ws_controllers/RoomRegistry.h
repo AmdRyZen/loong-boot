@@ -201,6 +201,23 @@ class RoomRegistryT
         size_t inlineMaxSubs = 32;
         // 单分片最大积压消息数
         size_t backlogPerShard = 4096;
+        // 全局「在途投递份数」上限：所有目标 loop 队列里尚未执行的投递份数总和。
+        //
+        // 为什么需要它：backlogPerShard 只约束【分片队列】，而按 loop 分组投递之后
+        // 真正的排队点是目标 loop 的 queueInLoop 队列 —— 那是无界的。慢消费者
+        // （或卡住的 loop）会让已出队的批次一直堆在 loop 队列里，此时分片队列早已
+        // 排空、backlogPerShard 永远不会触发，内存无界上涨且调用方收不到任何背压信号
+        // （实测：backlog=4 时 publish 10000 条全部返回成功、dropped=0、连接收 0 条）。
+        //
+        // 语义：达到上限后 publish 直接返回 false（调用方计 ws_messages_dropped_total
+        // 并回 503），【不改变入队顺序】—— 它只是提前拒绝，不做重排、不丢已入队消息，
+        // 因此不影响保序。
+        //
+        // 默认值刻意取得很大（2^18）：它只是「已经在深度异常时」的安全阀，
+        // 正常负载与压测都不会碰到。设 0 = 关闭该限制（退回旧行为）。
+        // 可用 LOONG_WS_MAX_INFLIGHT 覆盖；生效值见 ws_fanout_inflight_limit，
+        // 当前用量见 ws_fanout_inflight_deliveries（两者一起看才有意义）。
+        size_t maxInFlightDeliveries = 1 << 18;
         // 单次连续扇出的消息批上限，超过则让出 worker 重排队，避免热点分片饿死其他房间
         size_t drainBatch = 32;
         // worker 在落眠前的无锁自旋轮数（每轮一条 cpuPause/yield 指令）。
@@ -332,21 +349,39 @@ class RoomRegistryT
                 }
 
                 // 走安全重建协议（见 reshapeLocked 注释）
-                const SubscriberID id = ++r->nextId;
+                const SubscriberID id = nextSubId_.fetch_add(1, std::memory_order_relaxed) + 1;
                 reshapeLocked(*r, want, Entry{id, conn, loop});
                 r->subCount.store(after, std::memory_order_relaxed);
                 return id;
             }
 
-            const SubscriberID id = ++r->nextId;
+            const SubscriberID id = nextSubId_.fetch_add(1, std::memory_order_relaxed) + 1;
             const size_t idx = static_cast<size_t>(id % want);
-            if (r->dist[idx].empty())
+
+            // ── 强异常安全：先构造、后提交 ─────────────────────────────────
+            // 顺序敏感：下列「构造」步骤（reserve / push_back / buildSnapshot）
+            // 都可能因分配失败抛异常，必须在【改动任何权威状态之前】完成。
+            // 原实现是「先 push 进 dist、再写 idToShard、最后 refreshSnapshot」，
+            // 一旦中途抛异常就会留下「权威表已改、快照/计数未更新」的半提交状态，
+            // 而外层拿到的 id_ 仍是 0（赋值没完成）→ unsubscribe(topic, 0) 清不掉，
+            // 幽灵订阅者永久留在快照里继续收消息。
+            //
+            // 提交阶段（move 赋值 / 哈希插入 / 原子加）全部不会抛：
+            // idToShard 先 reserve 好容量，插入不触发 rehash。
+            r->idToShard.reserve(r->idToShard.size() + 1);
+            std::vector<Entry> nextBucket = r->dist[idx];
+            nextBucket.reserve(r->dist[idx].size() + 1);
+            nextBucket.push_back(Entry{id, conn, loop});
+            auto nextSnap = buildSnapshot(nextBucket); // 唯一可能抛异常的一步
+
+            const bool wasEmpty = r->dist[idx].empty();
+            r->dist[idx] = std::move(nextBucket);
+            r->idToShard[id] = idx;
+            r->shards[idx] = refreshSnapshotWith(r->shards[idx], std::move(nextSnap));
+            if (wasEmpty)
             {
                 r->nonEmptyShards.fetch_add(1, std::memory_order_relaxed);
             }
-            r->dist[idx].push_back(Entry{id, conn, loop});
-            r->idToShard[id] = idx;
-            r->shards[idx] = refreshSnapshot(r->shards[idx], r->dist[idx]);
             r->subCount.store(after, std::memory_order_relaxed);
             return id;
         }
@@ -374,14 +409,46 @@ class RoomRegistryT
         const auto it = r->idToShard.find(id);
         if (it == r->idToShard.end())
         {
-            return;
+            return; // 幂等：重复退订 / 不存在的 ID 直接放过
         }
         const size_t idx = it->second;
-        auto& bucket = r->dist[idx];
-        std::erase_if(bucket, [id](const Entry& e) { return e.id == id; });
+
+        // ── 强异常安全：先构造、后提交（理由同 subscribe）─────────────────
+        // 原实现是「先从 dist/idToShard 里 erase、再 refreshSnapshot」，
+        // 而 refreshSnapshot 内部要分配。分配失败时异常逃出，结果是：
+        // 权威成员表已经删了，但 subCount 没减、retired 没置、旧快照里
+        // 仍然含这个连接 —— 已退订的连接继续收消息，且房间永远不会被回收
+        // （实测：分配失败一次后，全部退订完毕 rooms 仍为 1、subscribers 仍为 1）。
+        // 改成「构造阶段可能抛、提交阶段不会抛」之后，失败时房间保持原样，
+        // 调用方可以安全重试。
+        std::vector<Entry> remaining;
+        {
+            const auto& bucket = r->dist[idx];
+            remaining.reserve(bucket.size());
+            for (const auto& e : bucket)
+            {
+                if (e.id != id)
+                {
+                    remaining.push_back(e);
+                }
+            }
+        }
+        auto nextSnap = buildSnapshot(remaining); // 唯一可能抛异常的一步
+        std::shared_ptr<Shard> shard = r->shards[idx];
+        if (!shard)
+        {
+            shard = std::make_shared<Shard>(); // 同样在提交前完成
+        }
+
+        // ── 提交阶段：以下操作都不会抛 ──────────────────────────────────
+        r->dist[idx] = std::move(remaining);
         r->idToShard.erase(it);
-        r->shards[idx] = refreshSnapshot(r->shards[idx], bucket);
-        if (bucket.empty())
+        {
+            std::lock_guard shardLock(shard->mtx);
+            shard->snap = std::move(nextSnap);
+        }
+        r->shards[idx] = std::move(shard);
+        if (r->dist[idx].empty())
         {
             r->nonEmptyShards.fetch_sub(1, std::memory_order_relaxed);
         }
@@ -439,6 +506,19 @@ class RoomRegistryT
     bool publishShared(const std::string& room, std::shared_ptr<const std::string> payload,
                        const RoomHandle& hint = {})
     {
+        // ── 全局在途投递上限：唯一能感知「下游已堵死」的背压信号 ───────────────
+        //
+        // 放在最前面（房间表锁之前）：该判定完全不依赖房间状态，提前拒绝更便宜。
+        // 这里只做「拒绝」，不重排、不丢弃任何已入队消息 ⇒ 不影响保序。
+        // 说明见 Options::maxInFlightDeliveries。
+        if (opt_.maxInFlightDeliveries != 0 &&
+            inFlight_->load(std::memory_order_relaxed) >= opt_.maxInFlightDeliveries)
+        {
+            dropped_.fetch_add(1, std::memory_order_relaxed);
+            inflightRejected_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+
         std::shared_ptr<Room> r;
 
         // ── 快路径：调用方缓存了房间句柄 → 直接复用，不过全局表锁 ─────────────
@@ -473,6 +553,11 @@ class RoomRegistryT
             workers_.empty() || r->subCount.load(std::memory_order_relaxed) <= opt_.inlineMaxSubs;
 
         std::vector<std::shared_ptr<Shard>> needWake;
+        // 预分配容量：needWake 的 push_back 发生在 busy.exchange(true)【之后】，
+        // 一旦在那里分配失败，就会留下「busy=true 但池里没有该分片」的状态 ——
+        // 该分片从此无人抽干（后续消息只入队不投递）。先 reserve 掉这种可能。
+        // 上限就是非空分片数，容量很小。
+        needWake.reserve(r->dist.size());
         {
             // 房间级发布锁：消息顺序的唯一来源。只做「入队」，不做扇出。
             std::lock_guard pubLock(r->pubMtx);
@@ -682,6 +767,31 @@ class RoomRegistryT
         return crossThreadDeliveries_.load(std::memory_order_relaxed);
     }
 
+    // 投递阶段被捕获的异常次数（loop 队列分配失败、连接 send 抛异常等）。
+    //
+    // 为什么必须暴露：这几处原先没有 catch，异常会直接穿出 drainer ——
+    // 线程池模式下等于 std::terminate，内联模式下等于 publish 抛给业务层。
+    // 现在改成「吞掉 + 恢复 busy + 计数」，但如果看不见这个数，
+    // 「消息偶发丢失」就又变成了无迹可查的静默故障。
+    // 判读：非 0 即说明投递路径发生过异常，应查日志与内存压力。
+    size_t fanoutExceptions() const noexcept
+    {
+        return fanoutExceptions_.load(std::memory_order_relaxed);
+    }
+
+    // 当前在途投递份数（瞬时值）。它是判断「下游 loop 是否已经堵死」的唯一直接证据：
+    // 持续贴近 maxInFlightDeliveries 就说明消费端跟不上生产端。
+    size_t inFlightDeliveries() const noexcept
+    {
+        return inFlight_->load(std::memory_order_relaxed);
+    }
+
+    // 因在途上限被拒的 publish 次数（累计）。
+    size_t inflightRejectedCount() const noexcept
+    {
+        return inflightRejected_.load(std::memory_order_relaxed);
+    }
+
   private:
     struct Entry
     {
@@ -726,7 +836,6 @@ class RoomRegistryT
         std::atomic<size_t> nonEmptyShards{0};
         // 已被回收标记：防止退订摘除房间与并发订阅之间出现「孤儿房间」
         std::atomic<bool> retired{false};
-        SubscriberID nextId{0};
     };
 
     // 把「分片成员表」编成「按 loop 分组的投递计划」。
@@ -769,6 +878,27 @@ class RoomRegistryT
                                                   const std::vector<Entry>& bucket)
     {
         auto next = buildSnapshot(bucket);
+        if (!sh)
+        {
+            auto created = std::make_shared<Shard>();
+            created->snap = std::move(next);
+            return created;
+        }
+        {
+            std::lock_guard lock(sh->mtx);
+            sh->snap = std::move(next);
+        }
+        return sh;
+    }
+
+    // 同上，但快照已在【外部构造完成】。
+    //
+    // 存在的理由：强异常安全要求「先构造、后提交」——构造（分配）可能抛异常，
+    // 必须发生在改动权威状态之前；而提交这一步本身不能抛。把两件事拆开之后，
+    // subscribe / unsubscribe 就能做到「要么全改，要么一点没改」。
+    static std::shared_ptr<Shard> refreshSnapshotWith(const std::shared_ptr<Shard>& sh,
+                                                      std::shared_ptr<const Snapshot> next)
+    {
         if (!sh)
         {
             auto created = std::make_shared<Shard>();
@@ -979,7 +1109,39 @@ class RoomRegistryT
             }
 
             // 先投递本条，再决定是否让出 worker —— 顺序不能颠倒，否则本条会被丢掉
-            fanOutToSnapshot(*snap, payload);
+            try
+            {
+                fanOutToSnapshot(*snap, payload);
+            }
+            catch (...)
+            {
+                // ⚠️ 投递阶段（loop 队列分配等）抛异常【绝不能】让它逃出去：
+                //   ① 逃出 workerLoop → 异常穿出 std::thread → std::terminate 整个进程；
+                //   ② 逃出内联路径 → publish 把异常抛给业务调用方（handleNewMessage）。
+                // 更重要的是必须【恢复 busy】—— 原实现让它保持 true，于是该分片
+                // 再也不会被抽干：后续消息只入队不投递，直到队列堆满后开始被拒
+                // （实测：dispatch 抛一次之后，分片永久卡死）。
+                // 本条已出队的消息无法重投（payload 已从队列取走），计一次异常；
+                // 队列里剩下的消息在 busy 复位后由下面这段重新唤醒继续投递。
+                fanoutExceptions_.fetch_add(1, std::memory_order_relaxed);
+                bool more = false;
+                {
+                    std::lock_guard lock(sh->mtx);
+                    sh->busy.store(false, std::memory_order_release);
+                    more = !sh->queue.empty();
+                }
+                if (more && yielding)
+                {
+                    // 池化模式：立刻重新占住 busy 并送回池中。否则剩余消息要等到
+                    // 下一次 publish 才会被唤醒（延迟不可控）。
+                    {
+                        std::lock_guard lock(sh->mtx);
+                        sh->busy.store(true, std::memory_order_release);
+                    }
+                    enqueueReady(sh);
+                }
+                return;
+            }
 
             if (requeue)
             {
@@ -1031,13 +1193,32 @@ class RoomRegistryT
             const bool sameThread = g.loop.isCurrentThread();
             // 只捕获两个 shared_ptr（payload + 连接组），不复制连接列表本身。
             // 连接对象因此至少活到这个批次被执行完，之后才可能析构。
-            g.loop.dispatch([payload, conns = g.conns] {
-                const std::string_view view(*payload);
-                for (const auto& c : *conns)
-                {
-                    c->send(view);
-                }
-            });
+            //
+            // 在途计数：必须【先加后派发】。反过来的话，「已入队但还没计数」的那个
+            // 窗口里上游会以为下游还空着，正好在最该背压的时刻放行。执行完在
+            // lambda 里减回去 —— 份数在派发时就确定，批次一旦入队必然整批执行。
+            const size_t batch = g.conns->size();
+            auto inFlight = inFlight_;
+            inFlight->fetch_add(batch, std::memory_order_relaxed);
+            try
+            {
+                g.loop.dispatch([payload, conns = g.conns, inFlight, batch] {
+                    const std::string_view view(*payload);
+                    for (const auto& c : *conns)
+                    {
+                        c->send(view);
+                    }
+                    inFlight->fetch_sub(batch, std::memory_order_relaxed);
+                });
+            }
+            catch (...)
+            {
+                // 派发失败 ⇒ 这批永远不会被执行，必须立刻把计数还回去。否则在途计数
+                // 只增不减（每次投递失败漏一批），最终把整个进程钉死在上限上 ——
+                // 那是比「一条消息没投出去」严重得多的故障。
+                inFlight->fetch_sub(batch, std::memory_order_relaxed);
+                throw;
+            }
 
             if (sameThread)
             {
@@ -1054,6 +1235,17 @@ class RoomRegistryT
     }
 
     Options opt_;
+
+    // 订阅 ID 分配器：registry 级全局单调，【不随房间回收而重置】。
+    //
+    // 原实现是 Room 的成员 nextId，每个房间从 0 重新开始 —— 于是
+    // 「房间空掉被回收 → 同名房间重建」之后，ID 空间从头复用。
+    // 而 unsubscribe 是按 (room 名, id) 定位的：若某个旧连接对应的
+    // ID 1 在房间重生后与新连接的 ID 1 撞上，一次迟到的退订就会
+    // 误删新订阅者（幂等注释在这种情况下不成立）。
+    // 全局单调分配让「同一个 ID 在同一房间名下的历史里只出现一次」，
+    // 这类跨代误删在结构上不可能发生。
+    std::atomic<SubscriberID> nextSubId_{0};
 
     mutable std::shared_mutex roomsMtx_;
     phmap::flat_hash_map<std::string, std::shared_ptr<Room>> rooms_;
@@ -1073,6 +1265,21 @@ class RoomRegistryT
     mutable std::atomic<size_t> inLoopDeliveries_{0};
     mutable std::atomic<size_t> crossThreadBatches_{0};
     mutable std::atomic<size_t> crossThreadDeliveries_{0};
+    mutable std::atomic<size_t> fanoutExceptions_{0};
+
+    // 全局「在途投递份数」：已派发到目标 loop 队列、尚未执行完的收件人份数之和。
+    //
+    // 用 shared_ptr<atomic> 而不是裸成员：投递 lambda 会在【目标 loop 的队列里】
+    // 多活一会儿，可能活过 registry 本身（压测/退出时控制器先析构、队列里还有批次）。
+    // lambda 捕获这个 shared_ptr 就自带生命周期，不会读到一个已析构的 atomic。
+    // 该指针构造后不再改指向，只改 pointee，因此无并发读指针的问题。
+    mutable std::shared_ptr<std::atomic<size_t>> inFlight_{
+        std::make_shared<std::atomic<size_t>>(0)};
+    // 因在途上限被拒的 publish 次数。与 dropped_ 的区别：
+    // dropped_ 是「所有被拒之和」，这个是「因下游 loop 队列积压被拒」的那部分 ——
+    // 两者的差额就是分片队列满（backlogPerShard）导致的拒绝。
+    // 分开才能判断该调哪个阈值。
+    mutable std::atomic<size_t> inflightRejected_{0};
 };
 
 // 生产实例：drogon WebSocket 连接 + trantor 事件循环句柄

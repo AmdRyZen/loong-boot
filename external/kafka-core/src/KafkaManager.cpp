@@ -44,6 +44,16 @@ KafkaManager& KafkaManager::instance() {
         if (!producer_)
             throw std::runtime_error(std::string("Failed to create Kafka producer: ") + errStr);
 
+        // ⚠️ 必须立刻置空：rd_kafka_new() 成功后【conf 的所有权已转移给 producer】。
+        // librdkafka 头文件原文（rdkafka.h, rd_kafka_conf_t 说明）：
+        //   "A successful call to rd_kafka_new() will assume ownership of the conf
+        //    object and rd_kafka_conf_destroy() must not be called."
+        // 不置空的话，stop() 里那句 rd_kafka_conf_destroy(producer_conf_) 就是对
+        // 已释放内存的二次销毁 —— double free，每次进程退出必触发
+        //（initialize 在 Application 启动回调里是无条件执行的，与落库开关无关）。
+        // 失败路径不置空：那时 conf 仍归调用方所有，仍需在 stop() 里销毁。
+        producer_conf_ = nullptr;
+
         consumer_conf_ = rd_kafka_conf_new();
         if (rd_kafka_conf_set(consumer_conf_, "bootstrap.servers", brokers.c_str(), errStr, sizeof(errStr)) != RD_KAFKA_CONF_OK)
             throw std::runtime_error(std::string("Consumer bootstrap.servers config error: ") + errStr);

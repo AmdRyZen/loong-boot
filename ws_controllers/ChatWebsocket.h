@@ -170,6 +170,16 @@ private:
 
         std::string instanceId;
         std::shared_ptr<drogon::nosql::RedisSubscriber> clusterSubscriber;
+
+        // 集群总线【实际可用】标志：订阅注册成功后才置 true。
+        //
+        // 为什么不能只看配置开关 clusterBusEnabled()：配置说 true 但
+        // Redis 客户端缺失 / newSubscriber 失败 / subscribe 抛异常时，
+        // 总线实际上是死的。此时若仍按「总线开着，在线状态不可知」处理，
+        // 私聊会跳过 404 直接回显 200 —— 发送者收到「成功」而消息其实
+        // 哪儿都没去（假 ACK）。用这个运行时标志替代，才能诚实回答
+        // 「本实例现在到底能不能跨实例投递」。
+        std::atomic<bool> clusterBusReady{false};
     };
 
     std::shared_ptr<Core> core_;
@@ -279,6 +289,7 @@ private:
         readEnv("LOONG_WS_INLINE_MAX_SUBS", opt.inlineMaxSubs);
         readEnv("LOONG_WS_BACKLOG_PER_SHARD", opt.backlogPerShard);
         readEnv("LOONG_WS_DRAIN_BATCH", opt.drainBatch);
+        readEnv("LOONG_WS_MAX_INFLIGHT", opt.maxInFlightDeliveries);
         readEnv("LOONG_WS_WORKER_SPIN_ROUNDS", opt.workerSpinRounds);
         return opt;
     }
@@ -333,6 +344,17 @@ private:
                     const RoomRegistry::RoomHandle& hint = {})
     {
         const bool ok = core.roomRegistry.publish(topic, json, hint);
+        if (!ok)
+        {
+            // ⚠️ 本地入队被拒（背压）时【不能】再广播集群、也不能落库。
+            //
+            // 原实现三条路都走：本地丢弃 + 集群广播 + Kafka 落库。于是
+            // 发送者收到 503「消息未投递」，而其他实例的订阅者实际收到了这条
+            // 消息、历史里也落了盘 —— 跨实例语义自相矛盾，客户端按 503 重发
+            // 还会在别的实例上产生重复。要么整条消息都不发，要么就不该回 503。
+            // 这里选择前者：以「本地是否接受」作为整条消息的统一裁决点。
+            return false;
+        }
         if (broadcastToCluster)
         {
             publishToCluster(core, topic, json);
@@ -341,7 +363,7 @@ private:
         // 关闭时 produceKafkaAsync 首行即短路返回（零开销）。
         // 压测/开发环境务必置 false —— 只生产不消费会把磁盘写满。
         produceKafkaAsync("chat_messages_topic", json);
-        return ok;
+        return true;
     }
 
     // 注：这里曾经用 std::pmr::string，但那是个半成品 —— 全工程从未创建过任何

@@ -38,6 +38,7 @@ void ChatWebsocket::reloadSwitches()
     // 注：enable_cluster_bus 刻意【不】走这条路 —— 它在构造期决定要不要注册
     // Redis 订阅，注册之后无法中途注销，热更新只会造成「开关说 false 但总线还活着」
     // 这种自相矛盾的状态。详见 clusterBusEnabled()。
+    bool parsed = false;
     bool kafka = false;
     try
     {
@@ -46,8 +47,7 @@ void ChatWebsocket::reloadSwitches()
         std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
         std::string errs;
         std::ifstream ifs(Config::filePath(), std::ios::binary);
-        const bool parsed =
-            ifs && Json::parseFromStream(builder, ifs, &root, &errs);
+        parsed = ifs && Json::parseFromStream(builder, ifs, &root, &errs);
         if (parsed)
         {
             const auto& custom = root["custom_config"];
@@ -58,7 +58,7 @@ void ChatWebsocket::reloadSwitches()
         }
         else
         {
-            // 读不到就保持「关闭」并只告警一次。
+            // 读不到就【保持当前值】并只告警一次。
             // 不能每 5 秒刷一行 —— 那正好是本项目反复踩过的「热路径日志放大」。
             static std::atomic<bool> warned{false};
             if (!warned.exchange(true, std::memory_order_relaxed))
@@ -71,6 +71,20 @@ void ChatWebsocket::reloadSwitches()
     }
     catch (...)
     {
+        parsed = false;
+    }
+
+    if (!parsed)
+    {
+        // ⚠️ 关键：解析失败必须【直接返回】，绝不能继续走到下面的 exchange()。
+        // 原实现让 kafka 保持初值 false 并照样 exchange，于是
+        // 「配置文件被编辑器/部署工具短暂替换」的 5 秒窗口会把已经开启的
+        // 落库开关静默改回 false —— 与上面那句「switches keep their current
+        // value」的日志完全相反，排障时极具误导性。
+        // gauge 仍按当前生效值刷新一次，保证 /metrics 不撒谎。
+        Metrics::PrometheusRegistry::instance().setSwitchStates(
+            kafkaPersistenceEnabled().load(std::memory_order_relaxed));
+        return;
     }
 
     // exchange 而不是 store：只有真的发生跳变才留痕。
@@ -277,7 +291,35 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                 const std::string& topic = subscriber.topic_;
                 const std::string& senderName = subscriber.userName_;
 
-                if (!msg_dto.action.empty() && msg_dto.action == "message")
+                const std::string_view action{msg_dto.action};
+
+                // 应用层心跳：touch() 已在上面做过，这里既不广播也不回包。
+                // （chat.html 每 25 秒发一次，用于探测「协议栈还活着但前端 JS 卡死」，
+                //  属纵深防御；正常保活靠 drogon 的协议层 Ping/Pong。）
+                if (action == "ping")
+                {
+                    return;
+                }
+
+                // 未知 action 原先被静默丢弃：客户端拼错字段名/拼错值时，
+                // 服务端既不回包也不记日志，现象是「消息发出去没有任何反应」，
+                // 排障只能靠猜。这里明确回一个可读错误。
+                if (action != "message")
+                {
+                    wsConn->send(buildNoticeJson(-1, "系统通知", "未知的 action，仅支持 message / ping"),
+                                 WebSocketMessageType::Text);
+                    return;
+                }
+
+                // 空内容不广播：原先空 msgContent 也会被当成一条正常消息
+                // 广播给全房间（还占用一个消息 id），属于无效流量放大。
+                if (msg_dto.msgContent.empty())
+                {
+                    wsConn->send(buildNoticeJson(-1, "系统通知", "消息内容不能为空"),
+                                 WebSocketMessageType::Text);
+                    return;
+                }
+
                 {
                     Metrics::PrometheusRegistry::instance().recordWsMessage();
 
@@ -300,10 +342,15 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                         const size_t localDelivered =
                             deliverDirectLocally(*core_, targetUser, json, wsConn, &echoedToSender);
 
-                        // 本实例查无此人，且没开集群总线 → 可以确定不在线，明确告知。
-                        // 开了总线就不能这么断言了：对方可能在别的实例上，同步无法确认，
-                        // 只能投出去让总线去找（宁可静默，也不能误报「不在线」）。
-                        if (localDelivered == 0 && !clusterBusEnabled())
+                        // 本实例查无此人，且【集群总线实际不可用】→ 可以确定不在线，明确告知。
+                        //
+                        // 判定用运行时标志 clusterBusReady 而不是配置开关 clusterBusEnabled()：
+                        // 配置写 true 但 Redis 没起来/订阅失败时，总线其实是死的。
+                        // 那种情况下若仍按「在线状态不可知」跳过 404，就会回一个
+                        // 200 假 ACK —— 发送者以为投递成功，消息却哪儿都没去。
+                        // 宁可诚实回 404，也不给假成功。
+                        if (localDelivered == 0 &&
+                            !core_->clusterBusReady.load(std::memory_order_acquire))
                         {
                             wsConn->send(buildNoticeJson(
                                 404, "系统通知", std::format("用户 {} 当前不在线", targetUser).c_str()));
@@ -439,6 +486,33 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
         //
         // 取不到 loop 时（返回 nullptr）句柄按「本线程」处理，即回退到逐份直接 send，
         // 语义与优化前一致，只是没有加速，不会出错。
+        // ── 注册顺序：先登记「在线」，再订阅房间 ────────────────────────────
+        //
+        // 原实现相反（先 subscribe 再插 userNameToConn），于是存在一个窗口：
+        // 新连接已经在房间里收消息了，但别人此刻给它发私聊会查不到条目 →
+        // 回「用户不在线」。压测里快速反复建连可以把这个小窗口稳定放大。
+        //
+        // 反过来先登记则不会出现这种自相矛盾：条目一旦存在就说明该连接已建立，
+        // 私聊投给它是安全的（send 到未完全就绪的连接由 drogon 静默丢弃，
+        // 与 deliverDirectLocally 现有语义一致）。若后续 subscribe 抛异常，
+        // catch 分支会 forceClose → handleConnectionClosed 按 conn 精确摘除，
+        // 登记与清理仍然成对。
+        {
+            std::unique_lock lock(core_->connMutex);
+            core_->userNameToConn[userName].push_back(Session{wsConn, subscriber});
+            core_->connCount.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        // 注册到房间注册表：分片直接持有连接指针，省掉 std::function 回调中转的开销。
+        //
+        // 同时登记「该连接所属的事件循环」：drogon 的 handleNewConnection 是在
+        // 该连接的 IO 线程里同步调用的（HttpServer::websocketRequestHandling →
+        // WebsocketControllerBinder::handleNewConnection），所以此刻取到的当前线程
+        // loop 就是这条连接的归属 loop。扇出据此分组，每个目标 loop 每条消息只唤醒
+        // 一次，投递在各自 loop 线程内完成 —— 唤醒次数由 O(订阅者数) 降为 O(loop 数)。
+        //
+        // 取不到 loop 时（返回 nullptr）句柄按「本线程」处理，即回退到逐份直接 send，
+        // 语义与优化前一致，只是没有加速，不会出错。
         subscriber->id_ = core_->roomRegistry.subscribe(
             topic, wsConn, TrantorLoopHandle{trantor::EventLoop::getEventLoopOfCurrentThread()});
 
@@ -446,15 +520,6 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
         // 直接命中该房间，不再每条消息都去抢全局 roomsMtx_ 共享锁。
         // 房间被回收后句柄自动失效（retired），publish 会回退查表，无需在退订时清理。
         subscriber->room_ = core_->roomRegistry.acquireRoomHandle(topic);
-
-        // 同一昵称允许多端并存：注册为「昵称 -> 会话列表」，多端都能收到私聊。
-        // 原实现用 emplace 存单连接，同名时静默失败，且断开时按昵称 erase 会误删新连接。
-        // 同时把 Subscriber 一并存下来，供空闲驱逐在锁内直接取用（避免跨线程读连接的 context）。
-        {
-            std::unique_lock lock(core_->connMutex);
-            core_->userNameToConn[userName].push_back(Session{wsConn, subscriber});
-            core_->connCount.fetch_add(1, std::memory_order_relaxed);
-        }
 
         // 每连接一条的诊断信息，不是「有问题」的信号 → DEBUG
         LOG_DEBUG << "Added connection for user: " << userName << " Subscriber ID: " << subscriber->id_
@@ -692,11 +757,23 @@ void ChatWebsocket::initClusterBus()
             core->clusterSubscriber->subscribe(
                 "chat_cluster_bus",
                 [core](const std::string& channel, const std::string& message) {
+                    (void)channel;
                     try
                     {
                         ClusterPacket packet{};
                         if (glz::read_json(packet, message))
                         {
+                            // 入站包解析失败原先完全静默（连日志都没有）。
+                            // 其他实例的版本不兼容 / 载荷被截断时，本实例
+                            // 表现为「莫名收不到消息」，没有任何可查的痕迹。
+                            Metrics::PrometheusRegistry::instance().recordClusterPacketDropped();
+                            static loong::log::RateLimiter badPacketLimiter{1000};
+                            if (badPacketLimiter.allow())
+                            {
+                                LOG_WARN << "Cluster bus packet parse failed, dropped "
+                                         << (1 + badPacketLimiter.takeSuppressed())
+                                         << " occurrence(s) since last log";
+                            }
                             return;
                         }
 
@@ -718,16 +795,36 @@ void ChatWebsocket::initClusterBus()
                         // 房间广播：推给本实例房间内的所有客户端（同样分片并行扇出）
                         core->roomRegistry.publish(packet.topic, packet.json);
                     }
-                    catch (...)
+                    catch (const std::exception& e)
                     {
+                        // 原先这里是空的 catch(...)：投递异常（分配失败等）
+                        // 既无日志也无计数，属于纯盲区。
+                        Metrics::PrometheusRegistry::instance().recordClusterPacketDropped();
+                        Metrics::PrometheusRegistry::instance().recordWsHandlerException();
+                        static loong::log::RateLimiter inboundErrLimiter{1000};
+                        if (inboundErrLimiter.allow())
+                        {
+                            LOG_ERROR << "Cluster bus inbound handling failed: " << e.what()
+                                      << " (" << (1 + inboundErrLimiter.takeSuppressed())
+                                      << " occurrence(s) since last log)";
+                        }
                     }
                 });
+
+            // 订阅调用是 noexcept 的（无错误回调），因此这里只能确认
+            // 「newSubscriber + subscribe 都没抛」—— 这是框架能给的最强信号。
+            // 置位后，私聊的 404 判定才会承认「跨实例可达」；
+            // 未置位时宁可回 404 也不回假 200。
+            core->clusterBusReady.store(true, std::memory_order_release);
 
             LOG_DEBUG << "Redis Cluster Bus initialized successfully, instanceId: " << core->instanceId;
         }
         catch (const std::exception& e)
         {
-            LOG_WARN << "Failed to initialize Redis Cluster Bus: " << e.what();
+            // 保持 clusterBusReady == false：配置说开着但实际没起来时，
+            // 必须让上层按「不可跨实例投递」处理，否则就是假 ACK。
+            LOG_WARN << "Failed to initialize Redis Cluster Bus: " << e.what()
+                     << " — cross-instance delivery is unavailable on this instance";
         }
     });
 }
@@ -770,7 +867,18 @@ void ChatWebsocket::publishToCluster(const Core& core, const std::string& topic,
         redisClient->execCommandAsync(
             [](const drogon::nosql::RedisResult&) {},
             [](const std::exception& e) {
-                LOG_ERROR << "Redis publish error: " << e.what();
+                // ⚠️ 这条回调的触发频率与【消息速率】成正比（Redis 挂掉时每条都走）。
+                // 原先直接 LOG_ERROR 无限流 —— 与已修过的「过载日志放大」是同一类
+                // 问题，只是这次发生在集群路径上。计数不受日志轮转影响，
+                // 是判断「跨实例投递是否在工作」的唯一可靠信号。
+                Metrics::PrometheusRegistry::instance().recordClusterPublishFailed();
+                static loong::log::RateLimiter publishErrLimiter{1000};
+                if (publishErrLimiter.allow())
+                {
+                    LOG_ERROR << "Redis publish error: " << e.what() << " ("
+                              << (1 + publishErrLimiter.takeSuppressed())
+                              << " occurrence(s) since last log, total: ws_cluster_publish_failed_total)";
+                }
             },
             "PUBLISH %s %s",
             "chat_cluster_bus",
@@ -860,4 +968,12 @@ void ChatWebsocket::publishRoomMetrics(const Core& core)
     m.setFanoutStats(core.roomRegistry.inLoopDeliveries(),
                      core.roomRegistry.crossThreadBatches(),
                      core.roomRegistry.crossThreadDeliveries());
+    // 投递阶段异常计数（非 0 说明扇出过程中出过异常、当时那条消息未送达）
+    m.setFanoutExceptions(core.roomRegistry.fanoutExceptions());
+    // 全局在途投递份数（gauge）：唯一能看出「下游 loop 队列是否已堆满」的指标。
+    // 配合 ws_fanout_inflight_limit 一起看 —— 只看当前值不知道离上限还有多远。
+    // 持续贴近上限即说明消费端跟不上，此时 ws_messages_dropped_total 会开始上涨。
+    m.setFanoutInflight(core.roomRegistry.inFlightDeliveries(),
+                        core.roomRegistry.options().maxInFlightDeliveries,
+                        core.roomRegistry.inflightRejectedCount());
 }
