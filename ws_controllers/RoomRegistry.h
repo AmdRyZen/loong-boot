@@ -467,6 +467,13 @@ class RoomRegistryT
         if (const auto mit = rooms_.find(room); mit != rooms_.end() && mit->second == r)
         {
             rooms_.erase(mit);
+            // 记下序号水位线，供同名房间重建时续用（见 roomSeqWatermark_）。
+            // 这里仍持 pubMtx（pubLock 在外层作用域），读 r->seq 是安全的。
+            if (roomSeqWatermark_.size() >= kMaxSeqWatermarks)
+            {
+                roomSeqWatermark_.clear();
+            }
+            roomSeqWatermark_[room] = r->seq;
         }
     }
 
@@ -491,21 +498,52 @@ class RoomRegistryT
 
     /**
      * @brief 向房间发布一条消息（payload 已序列化完成）
+     * @param outSeq 非空时写回本条消息的房间级单调序号（见下方 publishShared 的说明）。
+     *               写回 0 表示「本次没有分配序号」——即房间不存在、无订阅者，
+     *               或消息被背压拒绝。调用方据此决定要不要带序号广播给集群。
      * @return false 表示分片积压达上限、消息被丢弃（调用方需计数并告知客户端）
      */
-    bool publish(const std::string& room, const std::string& payload, const RoomHandle& hint = {})
+    bool publish(const std::string& room, const std::string& payload, const RoomHandle& hint = {},
+                 uint64_t* outSeq = nullptr)
     {
-        return publishShared(room, std::make_shared<const std::string>(payload), hint);
+        return publishShared(room, std::make_shared<const std::string>(payload), hint, outSeq);
     }
 
-    bool publish(const std::string& room, std::string&& payload, const RoomHandle& hint = {})
+    bool publish(const std::string& room, std::string&& payload, const RoomHandle& hint = {},
+                 uint64_t* outSeq = nullptr)
     {
-        return publishShared(room, std::make_shared<const std::string>(std::move(payload)), hint);
+        return publishShared(room, std::make_shared<const std::string>(std::move(payload)), hint,
+                             outSeq);
     }
 
+    // ── 房间级单调序号（跨实例保序的「证人」）──────────────────────────────────
+    //
+    // 为什么需要：本工程的保序是【管道保序】——顺序权威来自「房间 pubMtx → 分片 FIFO
+    // → 目标 loop 的 queueInLoop FIFO」这条链，消息体里不带序号。它在「单实例 +
+    // 单一路径 + 在线实时」下成立，但跨实例广播时会出现一个空洞：
+    //   M1 在实例 A 发、M2 在实例 B 发 ⇒ A 的订阅者走「M1 本地 + M2 总线」，
+    //   B 的订阅者走「M2 本地 + M1 总线」，两条路径延迟不同 ⇒ 两侧可能看到不同顺序。
+    //
+    // 序号在【同一把 pubMtx 内】分配，因此「序号的大小顺序」与「入队顺序」严格一致。
+    // 接收端按 (发送实例, 房间) 记 lastSeq，即可发现：
+    //   · 缺口：序号跳跃 ⇒ 总线链路上丢了消息（Redis 丢包 / 实例崩溃 / 订阅中断）
+    //   · 回退：序号小于等于已见最大值 ⇒ 同一来源的消息被乱序投递
+    //
+    // ⚠️ 能力边界（必须诚实声明）：单靠「每来源一个计数器」【检测不到】上面那个
+    //    跨来源乱序 —— 两个来源的计数器之间没有可比性。要真正消除它需要一个
+    //    全局唯一的定序权威（例如 Redis INCR 或专门的定序实例），代价是给发布
+    //    热路径加一次网络往返。本函数只提供【可观测性】：让「跨实例到底有没有
+    //    丢消息/乱序」从「无从判断」变成「有数可查」。
+    //
+    // 序号从 1 开始（0 保留给「未分配」），被背压拒绝的消息【不占号】——
+    // 否则接收端会把「本地根本没发出去的那条」误报成「传输中丢了一条」。
     bool publishShared(const std::string& room, std::shared_ptr<const std::string> payload,
-                       const RoomHandle& hint = {})
+                       const RoomHandle& hint = {}, uint64_t* outSeq = nullptr)
     {
+        if (outSeq != nullptr)
+        {
+            *outSeq = 0;
+        }
         // ── 全局在途投递上限：唯一能感知「下游已堵死」的背压信号 ───────────────
         //
         // 放在最前面（房间表锁之前）：该判定完全不依赖房间状态，提前拒绝更便宜。
@@ -558,6 +596,8 @@ class RoomRegistryT
         // 该分片从此无人抽干（后续消息只入队不投递）。先 reserve 掉这种可能。
         // 上限就是非空分片数，容量很小。
         needWake.reserve(r->dist.size());
+        // 本条的序号。0 = 未分配（被拒 / 无订阅者），见下方提交点。
+        uint64_t assignedSeq = 0;
         {
             // 房间级发布锁：消息顺序的唯一来源。只做「入队」，不做扇出。
             std::lock_guard pubLock(r->pubMtx);
@@ -656,6 +696,20 @@ class RoomRegistryT
                     enqueueReady(sh);
                 }
             }
+
+            // ── 提交点：分配房间级序号 ──────────────────────────────────────────
+            //
+            // 位置是刻意选在这里（所有 return false 之后、同一把 pubMtx 之内）：
+            //   ① 同一把锁 ⇒ 序号大小顺序 == 入队顺序，接收端才能拿它做缺口检测；
+            //   ② 被背压拒绝的消息不占号 ⇒ 不会把「本地没发出去」误报成「传输丢了」。
+            // r->seq 是普通 uint64_t（不是原子量）：唯一写入点就在这里，且恒在
+            // pubMtx 内；读取点（退订时存水位线）同样持 pubMtx。
+            assignedSeq = ++r->seq;
+        }
+
+        if (outSeq != nullptr)
+        {
+            *outSeq = assignedSeq;
         }
 
         if (needWake.empty())
@@ -836,6 +890,10 @@ class RoomRegistryT
         std::atomic<size_t> nonEmptyShards{0};
         // 已被回收标记：防止退订摘除房间与并发订阅之间出现「孤儿房间」
         std::atomic<bool> retired{false};
+        // 房间级单调序号（从 1 开始，0 = 未分配）。只在 pubMtx 内读写。
+        // 房间被回收时它的当前值会被记进 roomSeqWatermark_，同名房间重建时从这里
+        // 续上 —— 否则重建后序号从 1 重来，接收端会把它当成「大规模乱序/回退」误报。
+        uint64_t seq{0};
     };
 
     // 把「分片成员表」编成「按 loop 分组的投递计划」。
@@ -928,6 +986,13 @@ class RoomRegistryT
             return it->second;
         }
         auto r = std::make_shared<Room>();
+        // 同名房间重建时把序号续上（见 roomSeqWatermark_ 的说明）。
+        // 取出即从水位线表里移除：房间活着的时候序号在 Room 里，不需要两份。
+        if (const auto wit = roomSeqWatermark_.find(room); wit != roomSeqWatermark_.end())
+        {
+            r->seq = wit->second;
+            roomSeqWatermark_.erase(wit);
+        }
         // shards/dist 刻意留空：首次订阅时由 reshapeLocked 按规模一次性建好
         rooms_[room] = r;
         return r;
@@ -1249,6 +1314,19 @@ class RoomRegistryT
 
     mutable std::shared_mutex roomsMtx_;
     phmap::flat_hash_map<std::string, std::shared_ptr<Room>> rooms_;
+
+    // 已回收房间的序号水位线：房间空掉被摘除时把它的 seq 存下来，同名房间重建时续上。
+    //
+    // 为什么必须有：房间在最后一个订阅者离开时会被整体回收（内存友好），但
+    // 「同名房间重建 ⇒ 序号从 1 重来」会让接收端的 (实例, 房间) 基线倒退，
+    // 每次房间重建都误报一次大规模乱序。存水位线后序号在进程生命周期内单调。
+    //
+    // 容量：键是「历史上出现过的房间名」，正常业务下房间名是有限集合（站点/群 ID）。
+    // 万一真的无界增长（房间名带随机后缀的恶意用法），到上限就整体清空 ——
+    // 代价只是「之后重建的房间序号可能倒退一次」，而这只影响诊断计数，
+    // 不影响任何消息投递语义。宁可这样，也不要让一个诊断设施变成内存泄漏。
+    static constexpr size_t kMaxSeqWatermarks = 1 << 16;
+    phmap::flat_hash_map<std::string, uint64_t> roomSeqWatermark_;
 
     std::mutex poolMtx_;
     std::condition_variable poolCv_;

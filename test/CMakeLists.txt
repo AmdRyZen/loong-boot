@@ -26,5 +26,15 @@ ParseAndAddDrogonTests(${PROJECT_NAME})
 add_executable(${PROJECT_NAME}_room_registry test_room_registry.cc)
 target_link_libraries(${PROJECT_NAME}_room_registry PRIVATE Drogon::Drogon)
 
+# ##############################################################################
+# SnowflakeId（全局唯一消息 ID）单元测试
+#
+# 同样自带 int main()，且【不依赖 drogon】—— 纯逻辑，只 include 头文件。
+# 之所以单独一个目标而不是并进 room_registry：它验证的是 ID 生成器，
+# 与房间注册表无关，混在一起会让「哪个失败」变得难判读。
+# ##############################################################################
+add_executable(${PROJECT_NAME}_snowflake_id test_snowflake_id.cc)
+
 enable_testing()
 add_test(NAME room_registry COMMAND ${PROJECT_NAME}_room_registry)
+add_test(NAME snowflake_id COMMAND ${PROJECT_NAME}_snowflake_id)

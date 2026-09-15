@@ -194,6 +194,27 @@ Application::Application()
         // 获取 KafkaManager 的配置
         const std::string brokers = drogon::app().getCustomConfig()["kafka_manager"]["bootstrap.servers"].asString();
 
+        // ── 把 librdkafka 自身的日志接进 drogon 日志系统 ────────────────────────
+        //
+        // 必须在 initialize() 【之前】设置（回调路径上不加锁读它，见 KafkaManager.h）。
+        //
+        // 不设的话 librdkafka 直接写 stderr：不落 log/loong.log、不受 log_level
+        // 控制、也无法限流 —— 实测 broker 不可达时 9 个 consumer 各刷
+        // "1/1 brokers are down"，约 150 行/秒（53 秒 7808 行），是故障期日志
+        // 占盘的主因。接进来之后它和其他日志一样受级别过滤 + 落文件，
+        // 并且 kafka-core 内部已按「每秒最多一条」限流（被压掉的条数见
+        // ws_kafka_log_suppressed_total）。
+        //
+        // 投递失败报告（broker 不可达时唯一能看见失败的路径）同样走这里，
+        // 累计次数见 ws_kafka_delivery_failed_total。
+        kafka::KafkaManager::instance().setLogCallback([](const std::string& msg) {
+            // LOG_WARN 而不是 LOG_ERROR：这些大多是「Kafka 不可达」这类
+            // 环境性问题，重复且可恢复；真正的致命错误 librdkafka 会在
+            // 消息里带上 err 级别，由日志内容区分。用 WARN 也避免它把
+            // 「ERROR 日志」这个信号淹掉。
+            LOG_WARN << "[kafka] " << msg;
+        });
+
         // 初始化 KafkaManager
         kafka::KafkaManager::instance().initialize(brokers);
 

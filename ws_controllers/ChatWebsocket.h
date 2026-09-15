@@ -5,12 +5,14 @@
 #include <drogon/HttpAppFramework.h>
 #include "utils/retry_utils.h"
 #include "utils/RateLimitedLog.h"
+#include "utils/SnowflakeId.h"
 #include "parallel_hashmap/phmap.h"
 #include "RoomRegistry.h"
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <format>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -50,6 +52,7 @@ public:
         HttpAppFramework::instance().getLoop()->runEvery(5.0, [core = core_] {
             checkAndEvictIdleConnections(*core);
             publishRoomMetrics(*core);
+            publishKafkaMetrics();
             // 开关热更新：改 config.json 不必重启进程（见 reloadSwitches 注释）
             reloadSwitches();
         });
@@ -88,6 +91,15 @@ private:
         // 而全站所有房间共用这一把锁 —— 那是唯一的全局串行点。
         // 房间被回收后这个句柄会自动失效（retired），publish 回退查表，无需手动清理。
         RoomRegistry::RoomHandle room_;
+
+        // 本连接所属的 IO loop（建连时从当前线程取，终身不变）。
+        //
+        // 房间扇出走的是 RoomRegistry 内部按 loop 分组的派发；私聊直投原先没有
+        // 这一步，于是「同一昵称的 N 个多端会话」会付 N 次跨线程唤醒（queueInLoop），
+        // 而且没有任何在途额度可言 —— 目标 loop 卡住时 send 只入队不落地，内存无界上涨。
+        // 缓存 loop 之后，私聊也能按 loop 分组派发（唤醒 O(loop 数)）并在派发前
+        // 计入全局在途额度（见 Core::directInFlight）。
+        TrantorLoopHandle loop_;
 
         // 跨线程访问：IO 线程写入（收到任意帧即刷新），主循环定时任务读取（空闲驱逐）。
         // 原先是非原子的 time_point —— 跨线程读写属于 data race（形式上 UB），
@@ -147,7 +159,35 @@ private:
     {
         explicit Core(RoomRegistry::Options opt) : roomRegistry(std::move(opt))
         {
+            // 私聊直投的在途额度上限，可用 LOONG_WS_MAX_DIRECT_INFLIGHT 覆盖（0 = 关闭限制）。
+            size_t v = kDefaultMaxDirectInFlight;
+            if (readEnvSize("LOONG_WS_MAX_DIRECT_INFLIGHT", v))
+            {
+                maxDirectInFlight = v;
+            }
         }
+
+        // ── 私聊直投的全局在途投递额度 ─────────────────────────────────────────
+        //
+        // 为什么需要：deliverDirectLocally 原先对每个目标会话裸调 conn->send()，
+        // 没有任何上限。send 在跨线程时只是 loop->queueInLoop(lambda) —— 目标 loop
+        // 一旦卡住（慢消费者 / 单核被打满），已入队的帧只增不减，内存无界上涨，
+        // 而调用方拿不到任何背压信号（与 RoomRegistry 里 maxInFlightDeliveries
+        // 修掉的那个问题同源，只是发生在私聊路径上）。
+        //
+        // 语义与房间扇出对齐：额度在【派发前】一次性扣减（全有或全无），
+        // 在目标 loop 执行完这批 send 之后归还。因此它度量的是
+        // 「已派发进 loop 队列、尚未执行的份数」，而不是「已送达」。
+        //
+        // 默认值与房间侧一致（2^18）：只是深度异常时的安全阀，正常负载碰不到。
+        static constexpr size_t kDefaultMaxDirectInFlight = 1 << 18;
+        size_t maxDirectInFlight = kDefaultMaxDirectInFlight;
+
+        // 用 shared_ptr<atomic> 而不是裸成员：投递 lambda 会在目标 loop 的队列里
+        // 多活一会儿，可能活过 Core 本身（退出时控制器先析构、队列里还有批次）。
+        // 与 RoomRegistry::inFlight_ 同一手法。指针构造后不再改指向。
+        std::shared_ptr<std::atomic<size_t>> directInFlight{
+            std::make_shared<std::atomic<size_t>>(0)};
 
         // 房间注册表：按订阅者分片 + 多核并行扇出，严格保序。
         // 取代了原先的 drogon::PubSubService（它单线程扇出，房间越大越慢）
@@ -171,6 +211,11 @@ private:
         std::string instanceId;
         std::shared_ptr<drogon::nosql::RedisSubscriber> clusterSubscriber;
 
+        // 集群入站包的房间序基线：key = 发送实例ID + '\x1f' + 房间名 → 已见最大序号。
+        // 只用于诊断（缺口 / 乱序检测），不参与任何投递决策 —— 见 ClusterPacket::roomSeq。
+        std::mutex clusterSeqMtx;
+        phmap::flat_hash_map<std::string, uint64_t> clusterLastSeq;
+
         // 集群总线【实际可用】标志：订阅注册成功后才置 true。
         //
         // 为什么不能只看配置开关 clusterBusEnabled()：配置说 true 但
@@ -193,14 +238,36 @@ private:
     // 两种模式共用同一条 Redis 频道、同一个 instId 回环过滤、同一个 JSON 结构，
     // 只靠 toUser 空/非空区分 —— 少一套解析与订阅生命周期，代价是私聊也要过一次
     // 房间广播那条路（详见 publishToCluster 实现里的取舍说明）。
+    //
+    // roomSeq：房间广播时带上 RoomRegistry 分配的房间级序号（0 = 未分配）。
+    // 接收端据此做缺口/乱序检测，见 ClusterPacket::roomSeq。
     static void publishToCluster(const Core& core, const std::string& topic,
-                                 const std::string& json, const std::string& toUser = {});
+                                 const std::string& json, const std::string& toUser = {},
+                                 uint64_t roomSeq = 0);
+
+    // 用入站包的房间序号更新基线，并检测「缺口」与「回退（乱序）」。
+    //
+    // 只做检测与计数，【不】改变投递行为：
+    //   · 缺口（seq 跳跃）→ ws_cluster_seq_gap_total += 跳跃掉的条数
+    //   · 回退（seq <= 已见最大值）→ ws_cluster_out_of_order_total += 1
+    // 两者都会触发限流告警（触发频率与丢包/乱序量成正比，不能逐条打）。
+    //
+    // 不做回拉补齐：补齐需要一个「可按 (房间, 序号) 区间回放」的持久化日志
+    //（Redis Stream / Kafka 带 partition key），那是另一套设施。当前阶段的目标
+    // 是把「跨实例到底有没有丢/乱序」从「无从判断」变成「有数可查」。
+    static void checkClusterRoomSeq(Core& core, const std::string& originInstId,
+                                    const std::string& room, uint64_t roomSeq);
 
     // 把一条已序列化的私聊消息投递给【本实例上】该用户名的所有在线会话。
     // 返回投递到的会话数（0 = 本实例上没有该用户名的在线会话）。
     //
     // sender 用来判断「发送者本人是否也在目标会话列表里」（同昵称多端）：
     // 在，说明他已经收到自己那一份，调用方不必再补一帧回显。
+    //
+    // backpressured 非空时写回「因在途额度不足而整批未投」的会话份数：
+    //   0  = 未被背压拒绝（0 份投递 + 0 份背压 = 本实例确实没有这个昵称）
+    //   >0 = 本实例有这个昵称，但在途额度已满 ⇒ 调用方应回 503 而不是 404/200
+    // 两者的区别至关重要：404 会让客户端以为「人不在线」，503 才是「服务器忙」。
     //
     // ⚠️ 本函数会被两个线程调用：① 发送方的 IO 线程（本地投递）
     //    ② Redis 订阅回调线程（跨实例收到的私聊）。
@@ -212,11 +279,131 @@ private:
                                        const std::string& targetUser,
                                        const std::string& json,
                                        const WebSocketConnectionPtr& sender,
-                                       bool* echoedToSender = nullptr);
+                                       bool* echoedToSender = nullptr,
+                                       size_t* backpressured = nullptr);
     // 形参用 string_view：开关关闭时（压测/开发常态）调用方不必先构造 std::string，
     // 避免「已经拷贝完了才在函数里 short-circuit」这种白付的分配。
     // 需要所有权的地方（TBB worker）在 lambda 捕获里再落成 std::string。
-    static void produceKafkaAsync(std::string_view topicName, std::string_view payload);
+    static void produceKafkaAsync(std::string_view topicName, std::string_view payload,
+                                  std::string_view key = {});
+
+    // 注：这里曾经用 std::pmr::string，但那是个半成品 —— 全工程从未创建过任何
+    // memory_resource，pmr 容器默认落到 new_delete_resource()，即与 std::string
+    // 同一条分配路径，却额外多带一个 allocator 指针（每字段 +8B，4 字段的 DTO
+    // 直接胖一圈）并多一层虚调用。比 std::string 更慢更大，故退回 std::string。
+    // 若将来真要做端到端 pmr，正确做法是在 IO 线程上挂
+    // thread_local std::pmr::monotonic_buffer_resource 并在构造 VO 时显式传 &res，
+    // 而不是只把字段类型换掉。
+    struct chatMessageDto
+    {
+        std::string key;
+        std::string action;
+        std::string msgContent;
+        std::string toUser;  // 点对点私聊目标用户名 (为空表示房间广播)
+    };
+
+    // 客户端可见的消息 VO。刻意保持最小：落库/回放需要的上下文在下面的
+    // chatPersistVo 里，不要往这里加字段（那会让每条消息的线格式都变胖）。
+    struct chatMessageVo
+    {
+        int code = -1;
+        uint64_t id = 0;
+        std::string name;
+        std::string message;
+    };
+
+    // ── Kafka 落库信封 ──────────────────────────────────────────────────────
+    //
+    // 为什么不直接落客户端 VO（chatMessageVo）：客户端 VO 只带「显示这条消息
+    // 所需的最少字段」（code/id/name/message）。落库与回放需要的是【上下文】：
+    // 这条消息属于哪个房间、是不是私聊、发给谁、房间内第几条、哪个实例写的。
+    // 原实现落的就是客户端 VO，于是回放端拿到一堆「name + message」，无法还原
+    // 它们属于哪个房间 —— 历史回放实际上做不了（本项缺陷的根因）。
+    //
+    // 刻意不往 chatMessageVo 上加字段：那会把「只有回放需要」的字段发给每一个
+    // 客户端，每条消息的线格式都变胖（房间名 / 目标昵称 / 实例 ID 都是长字符串）。
+    // 两条路分开：客户端看到的最小 VO 不变，落库的是自描述信封。
+    struct chatPersistVo
+    {
+        uint64_t id = 0;             // 与客户端看到的 id 一致（snowflake，全局唯一）
+        std::string name;            // 与客户端 VO 的 name 一致（公告里它是房间名，历史原因）
+        std::string message;         // 与客户端看到的文本完全一致（含 "[私聊] " 前缀）
+        std::string room;            // 房间名（房间消息 / 公告）；私聊为空
+        std::string toUser;          // 私聊目标昵称；房间消息为空
+        std::string type;            // "room" | "direct" | "notice"
+        uint64_t roomSeq = 0;        // 房间级序号（房间消息；0 = 未分配）
+        std::string sender;          // 真实发送者昵称（公告里 name 是房间名，故单列）
+        std::string clientMsgId;     // 客户端 dto 的 key 字段，协议未定义语义，预留做幂等
+        std::string originInstance;  // 落库实例 ID：多实例时用于追查「哪个实例写的」
+        int64_t ts = 0;              // 落库时刻（Unix 毫秒，UTC）
+    };
+
+    static int64_t nowMs()
+    {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    }
+
+    static std::string buildPersistJson(const chatPersistVo& vo)
+    {
+        std::string json{};
+        (void)glz::write_json(vo, json);
+        return json;
+    }
+
+    // 落库一条房间消息 / 公告。
+    //
+    // 分区键用【房间名】：相同 key 落同一分区 ⇒ 分区内保序 ⇒ 回放端按分区顺序
+    // 读即可还原房间内的相对顺序。原实现不传 key，librdkafka 会轮询分区，同一个
+    // 房间的消息散落到不同分区 —— 这是「Kafka 历史回放路径本身不保序」的直接原因。
+    static void persistRoomMessage(const Core& core, const std::string& room,
+                                   const std::string& sender, const chatMessageVo& vo,
+                                   uint64_t roomSeq, const char* type,
+                                   const std::string& clientMsgId = {})
+    {
+        chatPersistVo p{};
+        p.id = vo.id;
+        p.name = vo.name;
+        p.message = vo.message;
+        p.room = room;
+        p.type = type;
+        p.roomSeq = roomSeq;
+        p.sender = sender;
+        p.clientMsgId = clientMsgId;
+        p.originInstance = core.instanceId;
+        p.ts = nowMs();
+        produceKafkaAsync("chat_messages_topic", buildPersistJson(p), room);
+    }
+
+    // 落库一条私聊。
+    //
+    // 分区键用【排序后拼接的双方昵称】而不是发送者或接收者：同一个会话的两个
+    // 方向（A→B 与 B→A）必须落同一个分区，否则回放时两个方向散在不同分区，
+    // 会话内的先后顺序就丢了。
+    static void persistDirectMessage(const Core& core, const std::string& sender,
+                                     const std::string& targetUser, const chatMessageVo& vo,
+                                     const std::string& clientMsgId = {})
+    {
+        chatPersistVo p{};
+        p.id = vo.id;
+        p.name = vo.name;
+        p.message = vo.message;
+        p.toUser = targetUser;
+        p.type = "direct";
+        p.sender = sender;
+        p.clientMsgId = clientMsgId;
+        p.originInstance = core.instanceId;
+        p.ts = nowMs();
+
+        const std::string& lo = sender < targetUser ? sender : targetUser;
+        const std::string& hi = sender < targetUser ? targetUser : sender;
+        std::string key;
+        key.reserve(lo.size() + hi.size() + 1);
+        key.append(lo).push_back('|');
+        key.append(hi);
+        produceKafkaAsync("chat_direct_topic", buildPersistJson(p), key);
+    }
 
     // Kafka 落库开关的缓存值（缺省 false = fail-safe，见 .cc 里的说明）。
     //
@@ -262,7 +449,46 @@ private:
         //（已实测 error_code=0），所以旧版本实例发来的包仍能正常解析。
         // 反向（新发旧收）会让旧实例遇到未知键而丢弃该包 —— 只在滚动升级窗口内出现。
         std::string toUser;
+
+        // 发送方为该房间分配的单调序号（见 RoomRegistry::publishShared 的说明）。
+        // 0 = 未分配（无订阅者 / 被背压拒绝 / 私聊包）。
+        //
+        // 接收端按 (instId, topic) 记 lastSeq，据此发现「总线链路上丢了消息」与
+        // 「同一来源的消息被乱序投递」。检测到即计数 + 限流告警，不做回拉补齐
+        //（补齐需要一个持久化的、可按 (房间, 序号) 区间回放的日志，属另一套设施）。
+        uint64_t roomSeq = 0;
     };
+
+    // 集群入站包的序号基线：key = 发送实例 ID + '\x1f' + 房间名。
+    //
+    // 用 phmap::flat_hash_map + 一把互斥量而不是加锁分片：入站处理本身已经是
+    // 「每条跨实例消息一次」的频率，且订阅回调只有一个线程，锁竞争可忽略。
+    // 用互斥量而不是「回调单线程所以免锁」的假设：drogon 的 RedisSubscriber
+    // 回调线程归属是实现细节，不该让正确性依赖它。
+    //
+    // ⚠️ 会随「发送实例重启」而积累过期键（instId 含 pid+纳秒，重启即变）。
+    //    到上限整体清空 —— 代价只是「清空后每个来源要重新建立一次基线」，
+    //    期间不做缺口判断（宁可不报，也不误报）。绝不因此误报缺口。
+    static constexpr size_t kMaxClusterSeqBaselines = 1 << 12;
+
+    // 读一个「无符号整数」环境变量。返回 false 表示未设置或非法（out 保持不变）。
+    // 只解析不抛：启动期不该因为一个环境变量写错就崩。
+    static bool readEnvSize(const char* key, size_t& out)
+    {
+        if (const char* v = std::getenv(key); v != nullptr && *v != '\0')
+        {
+            try
+            {
+                out = static_cast<size_t>(std::stoull(v));
+                return true;
+            }
+            catch (...)
+            {
+                // 非法值静默忽略，沿用默认值
+            }
+        }
+        return false;
+    }
 
     // 扇出参数：默认值适配本机，可用环境变量覆盖（便于压测 A/B 调参，不依赖配置加载时序）
     static RoomRegistry::Options makeFanoutOptions()
@@ -271,26 +497,14 @@ private:
         // 默认不启用扇出线程池（opt.fanoutThreads 保持 0 = 单分片内联扇出）。
         // 多分片并行扇出是实验特性：保序正确性已由单测覆盖，但回声饱和压测下
         // 吞吐不稳定且低于内联路径，需要时用 LOONG_WS_FANOUT_THREADS 显式打开。
-        auto readEnv = [](const char* key, size_t& out) {
-            if (const char* v = std::getenv(key); v != nullptr && *v != '\0')
-            {
-                try
-                {
-                    out = static_cast<size_t>(std::stoull(v));
-                }
-                catch (...)
-                {
-                }
-            }
-        };
-        readEnv("LOONG_WS_MAX_SHARDS", opt.maxShards);
-        readEnv("LOONG_WS_SUBS_PER_SHARD", opt.subsPerShard);
-        readEnv("LOONG_WS_FANOUT_THREADS", opt.fanoutThreads);
-        readEnv("LOONG_WS_INLINE_MAX_SUBS", opt.inlineMaxSubs);
-        readEnv("LOONG_WS_BACKLOG_PER_SHARD", opt.backlogPerShard);
-        readEnv("LOONG_WS_DRAIN_BATCH", opt.drainBatch);
-        readEnv("LOONG_WS_MAX_INFLIGHT", opt.maxInFlightDeliveries);
-        readEnv("LOONG_WS_WORKER_SPIN_ROUNDS", opt.workerSpinRounds);
+        readEnvSize("LOONG_WS_MAX_SHARDS", opt.maxShards);
+        readEnvSize("LOONG_WS_SUBS_PER_SHARD", opt.subsPerShard);
+        readEnvSize("LOONG_WS_FANOUT_THREADS", opt.fanoutThreads);
+        readEnvSize("LOONG_WS_INLINE_MAX_SUBS", opt.inlineMaxSubs);
+        readEnvSize("LOONG_WS_BACKLOG_PER_SHARD", opt.backlogPerShard);
+        readEnvSize("LOONG_WS_DRAIN_BATCH", opt.drainBatch);
+        readEnvSize("LOONG_WS_MAX_INFLIGHT", opt.maxInFlightDeliveries);
+        readEnvSize("LOONG_WS_WORKER_SPIN_ROUNDS", opt.workerSpinRounds);
         return opt;
     }
 
@@ -303,13 +517,26 @@ private:
     // 代价是最多 5 秒的滞后（gauge 类指标可以接受；counter 看增量也不受影响）。
     static void publishRoomMetrics(const Core& core);
 
-    // 全局单调消息序号（进程内唯一）。
-    // 原先用 subscriber.id_（RoomRegistry 的房间内自增订阅号）当消息 id ——
-    // 同一发送者的所有消息 id 相同、跨房间重复，客户端若拿它做去重/排序会错乱。
+    // 把 KafkaManager 的投递失败 / 日志抑制计数拉进 Prometheus registry。
+    //
+    // 为什么要「拉」而不是在失败点直接写指标：投递报告回调运行在 librdkafka 的
+    // poll 线程里（且被 rd_kafka_poll 串行化），在那种地方做任何额外工作都会
+    // 直接拖慢 poll；而 kafka-core 是独立编译的静态库，不该依赖上层的指标单例。
+    // 每 5 秒拉一次既解耦又零热路径成本，代价是最多 5 秒滞后（counter 看增量无碍）。
+    static void publishKafkaMetrics();
+
+    // 全局唯一消息序号。
+    //
+    // 原实现是 `static std::atomic<uint64_t> seq{0}; fetch_add(1)+1` —— 纯进程内
+    // 自增：① 重启后从 1 重来，与历史消息 id 冲突；② 多实例部署时各实例 id 空间
+    // 完全重叠。两种情况下客户端都无法用 id 去重/排序，Kafka 回放里也分不清
+    // 「同一条」和「两条内容相同」。
+    //
+    // 现改为 snowflake 式（41bit 毫秒 + 10bit 实例槽位 + 12bit 序号），
+    // 跨重启、跨实例都不重复，且单实例内严格单调。实现见 utils/SnowflakeId.h。
     static uint64_t nextMessageId() noexcept
     {
-        static std::atomic<uint64_t> seq{0};
-        return seq.fetch_add(1, std::memory_order_relaxed) + 1;
+        return loong::util::SnowflakeId::next();
     }
 
     // ── 客户端可控频率的日志限流 ────────────────────────────────────────────
@@ -341,9 +568,14 @@ private:
     //   但会投错房间 —— 调用方必须保证 hint 与 topic 是同一个订阅者的成对字段。
     bool fanOutRoom(Core& core, const std::string& topic, const std::string& json,
                     bool broadcastToCluster = true,
-                    const RoomRegistry::RoomHandle& hint = {})
+                    const RoomRegistry::RoomHandle& hint = {},
+                    uint64_t* outRoomSeq = nullptr)
     {
-        const bool ok = core.roomRegistry.publish(topic, json, hint);
+        // 房间级序号由 RoomRegistry 在 pubMtx 内分配（见 publishShared 的说明）：
+        // 拿到它才能让接收端判断「总线链路上有没有丢/乱序」，
+        // 也才能把它写进 Kafka 落库信封供回放端还原顺序。
+        uint64_t roomSeq = 0;
+        const bool ok = core.roomRegistry.publish(topic, json, hint, &roomSeq);
         if (!ok)
         {
             // ⚠️ 本地入队被拒（背压）时【不能】再广播集群、也不能落库。
@@ -353,41 +585,25 @@ private:
             // 消息、历史里也落了盘 —— 跨实例语义自相矛盾，客户端按 503 重发
             // 还会在别的实例上产生重复。要么整条消息都不发，要么就不该回 503。
             // 这里选择前者：以「本地是否接受」作为整条消息的统一裁决点。
+            //
+            // 序号也一并作废：被拒的消息不占号（RoomRegistry 的提交点在
+            // 所有 return false 之后），所以 roomSeq 保持 0，接收端不会误报缺口。
             return false;
         }
         if (broadcastToCluster)
         {
-            publishToCluster(core, topic, json);
+            publishToCluster(core, topic, json, /*toUser=*/{}, roomSeq);
         }
-        // Kafka 持久化：由 custom_config.enable_kafka_persistence 控制，
-        // 关闭时 produceKafkaAsync 首行即短路返回（零开销）。
-        // 压测/开发环境务必置 false —— 只生产不消费会把磁盘写满。
-        produceKafkaAsync("chat_messages_topic", json);
+        // ⚠️ Kafka 落库【不在这里】做：落库信封需要「这条消息是谁发的、是聊天
+        //    还是入群/退群公告」这类上下文，而 fanOutRoom 只拿到已序列化好的
+        //    客户端 VO，无法反推。把落库交给调用方（persistRoomMessage），
+        //    它手里有全部上下文，并且能用房间名做分区键。
+        if (outRoomSeq != nullptr)
+        {
+            *outRoomSeq = roomSeq;
+        }
         return true;
     }
-
-    // 注：这里曾经用 std::pmr::string，但那是个半成品 —— 全工程从未创建过任何
-    // memory_resource，pmr 容器默认落到 new_delete_resource()，即与 std::string
-    // 同一条分配路径，却额外多带一个 allocator 指针（每字段 +8B，4 字段的 DTO
-    // 直接胖一圈）并多一层虚调用。比 std::string 更慢更大，故退回 std::string。
-    // 若将来真要做端到端 pmr，正确做法是在 IO 线程上挂
-    // thread_local std::pmr::monotonic_buffer_resource 并在构造 VO 时显式传 &res，
-    // 而不是只把字段类型换掉。
-    struct chatMessageDto
-    {
-        std::string key;
-        std::string action;
-        std::string msgContent;
-        std::string toUser;  // 点对点私聊目标用户名 (为空表示房间广播)
-    };
-
-    struct chatMessageVo
-    {
-        int code = -1;
-        uint64_t id = 0;
-        std::string name;
-        std::string message;
-    };
 
     static std::string buildNoticeJson(int code, const char* name, const char* message)
     {

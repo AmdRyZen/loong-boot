@@ -133,6 +133,45 @@ public:
         wsClusterPacketDropped_.fetch_add(count, std::memory_order_relaxed);
     }
 
+    // 集群总线入站包出现【序号缺口】时，缺口里少掉的消息条数。
+    //
+    // 语义：接收端按 (来源实例, 房间) 记已见最大序号；新包序号跳跃说明中间有
+    // 若干条从该来源发往该房间的消息【没到达本实例】。原因通常是 Redis 发布/订阅
+    // 链路上丢了（连接闪断、订阅重建、实例崩溃时在途的包）。
+    //
+    // ⚠️ 能力边界：它检测的是【同一来源内部】的丢失，检测不到「两个来源的消息
+    //    交错顺序不一致」——两个来源的计数器没有可比性，那需要全局定序权威。
+    // 判读：非 0 且持续增长 = 跨实例实时消息正在丢（本实例的订阅者会比别人少看到
+    //       消息）。累计值不是「当前状态」，而 5 秒定时任务不刷它，所以看到的是实时值。
+    void recordClusterSeqGap(uint64_t missing = 1) {
+        wsClusterSeqGap_.fetch_add(missing, std::memory_order_relaxed);
+    }
+
+    // 集群总线入站包出现【序号回退】的次数（序号 <= 已见最大值）。
+    //
+    // 含义：同一来源发往同一房间的消息，到达本实例的顺序与发送顺序不一致
+    //（或同一包被重复投递）。重复投递本身无害（客户端可凭 msg id 去重），
+    // 乱序则会让不同实例上的订阅者看到不同顺序 —— 都值得计数。
+    // 判读：与 ws_cluster_seq_gap_total 一起看。只有回退没有缺口 ⇒ 大概率是
+    //       总线重复投递；两者都有 ⇒ 链路不稳定。
+    void recordClusterOutOfOrder(uint64_t count = 1) {
+        wsClusterOutOfOrder_.fetch_add(count, std::memory_order_relaxed);
+    }
+
+    // 私聊直投因【在途投递额度不足】而整批未投的会话份数。
+    //
+    // 为什么必须单独有：它与 ws_messages_dropped_total 的差额能区分两种过载 ——
+    //   ws_messages_dropped_total 涨、这里也涨 → 私聊路径的额度先满了；
+    //   ws_messages_dropped_total 涨、这里不动 → 是房间分片积压（该调 backlogPerShard
+    //     或 maxInFlightDeliveries），与私聊无关。
+    // 两者的上游阈值完全不同（Core::maxDirectInFlight vs RoomRegistry::Options），
+    // 混成一个数就只能靠猜。计数单位是【会话份数】，不是消息条数。
+    // 判读：非 0 且持续增长 = 下游某个 loop 队列长期排不空，先看
+    //       ws_fanout_inflight_deliveries 与 ws_connections_current。
+    void recordWsDirectBackpressured(uint64_t count = 1) {
+        wsDirectBackpressured_.fetch_add(count, std::memory_order_relaxed);
+    }
+
     // 房间侧快照（由 ChatWebsocket 的 5 秒定时任务推送）。
     // 这里存的是上一次采样的值：/metrics 抓取时无需再去加房间表的锁，
     // 代价是最多 5 秒的滞后 —— 对 gauge 类指标完全够用。
@@ -192,6 +231,26 @@ public:
         wsKafkaPersistenceEnabled_.store(kafkaPersistence ? 1 : 0, std::memory_order_relaxed);
     }
 
+    // ── Kafka 投递失败与日志抑制（由 5 秒定时任务从 KafkaManager 拉取）──────
+    //
+    // ⚠️ 这一对是【唯一】能反映「broker 不可达」的信号，必须与
+    //    ws_kafka_produce_failed_total 区分开：
+    //      ws_kafka_produce_failed_total = rd_kafka_produce() 当场返回失败
+    //        （本地队列满 / 消息过大 / topic 无效）。broker 挂掉时它【恒为 0】——
+    //        因为消息进了本地队列就算「成功」，真失败要等 delivery.timeout.ms
+    //        （默认 30s）之后才由投递报告回调报出来。
+    //      ws_kafka_delivery_failed_total = 投递报告回调报出的失败（broker 不可达、
+    //        超时、被拒）。实测：broker 指向死地址 + 发 300 条 ⇒ 前者 0，后者 302。
+    //    判读：只看前者会得出「Kafka 一切正常」的错误结论。
+    //
+    // log_suppressed 是 librdkafka 自身日志被限流压掉的条数（原先它直接写 stderr，
+    // 实测 broker 不可达时约 150 行/秒）。非 0 说明确实发生过日志洪水，但被限流了；
+    // 它本身不是故障，而是「日志没有静默」的证据。
+    void setKafkaDeliveryStats(uint64_t deliveryFailed, uint64_t logSuppressed) {
+        wsKafkaDeliveryFailed_.store(deliveryFailed, std::memory_order_relaxed);
+        wsKafkaLogSuppressed_.store(logSuppressed, std::memory_order_relaxed);
+    }
+
     // 生成标准 Prometheus 文本格式导出
     std::string exportPrometheusText() const {
         std::ostringstream ss;
@@ -218,15 +277,24 @@ public:
            << "# HELP ws_messages_received_total Total WebSocket messages processed.\n"
            << "# TYPE ws_messages_received_total counter\n"
            << "ws_messages_received_total " << wsTotalMessages_.load(std::memory_order_relaxed) << "\n\n"
-           << "# HELP ws_messages_dropped_total WebSocket messages dropped due to room shard backlog.\n"
+           << "# HELP ws_messages_dropped_total WebSocket messages refused by the server (room shard backlog or private-delivery backpressure).\n"
            << "# TYPE ws_messages_dropped_total counter\n"
            << "ws_messages_dropped_total " << wsDroppedMessages_.load(std::memory_order_relaxed) << "\n\n"
+           << "# HELP ws_direct_backpressured_total Private-chat delivery slots skipped because the in-flight cap was reached (reason breakdown of ws_messages_dropped_total).\n"
+           << "# TYPE ws_direct_backpressured_total counter\n"
+           << "ws_direct_backpressured_total " << wsDirectBackpressured_.load(std::memory_order_relaxed) << "\n\n"
            << "# HELP ws_kafka_persist_dropped_total Kafka persistence skipped because the TBB pool was saturated (message was still delivered live).\n"
            << "# TYPE ws_kafka_persist_dropped_total counter\n"
            << "ws_kafka_persist_dropped_total " << wsKafkaPersistDropped_.load(std::memory_order_relaxed) << "\n\n"
            << "# HELP ws_kafka_produce_failed_total Kafka produce attempts that ultimately failed (retries exhausted or getTopic threw); live delivery was unaffected but history has gaps.\n"
            << "# TYPE ws_kafka_produce_failed_total counter\n"
            << "ws_kafka_produce_failed_total " << wsKafkaProduceFailed_.load(std::memory_order_relaxed) << "\n\n"
+           << "# HELP ws_kafka_delivery_failed_total Kafka delivery reports that came back failed (broker unreachable / timeout). This is the ONLY counter that sees an unreachable broker.\n"
+           << "# TYPE ws_kafka_delivery_failed_total counter\n"
+           << "ws_kafka_delivery_failed_total " << wsKafkaDeliveryFailed_.load(std::memory_order_relaxed) << "\n\n"
+           << "# HELP ws_kafka_log_suppressed_total librdkafka internal log lines dropped by the rate limiter (they used to flood stderr at ~150 lines/sec).\n"
+           << "# TYPE ws_kafka_log_suppressed_total counter\n"
+           << "ws_kafka_log_suppressed_total " << wsKafkaLogSuppressed_.load(std::memory_order_relaxed) << "\n\n"
            << "# HELP ws_handler_exceptions_total Exceptions caught and swallowed inside WebSocket callbacks (non-zero means check logs).\n"
            << "# TYPE ws_handler_exceptions_total counter\n"
            << "ws_handler_exceptions_total " << wsHandlerExceptions_.load(std::memory_order_relaxed) << "\n\n"
@@ -247,7 +315,13 @@ public:
            << "ws_cluster_publish_failed_total " << wsClusterPublishFailed_.load(std::memory_order_relaxed) << "\n\n"
            << "# HELP ws_cluster_packet_dropped_total Inbound cluster-bus packets dropped (parse failure or callback exception).\n"
            << "# TYPE ws_cluster_packet_dropped_total counter\n"
-           << "ws_cluster_packet_dropped_total " << wsClusterPacketDropped_.load(std::memory_order_relaxed) << "\n\n";
+           << "ws_cluster_packet_dropped_total " << wsClusterPacketDropped_.load(std::memory_order_relaxed) << "\n\n"
+           << "# HELP ws_cluster_seq_gap_total Messages missing from the cluster bus, measured by room-sequence gaps from a single origin instance.\n"
+           << "# TYPE ws_cluster_seq_gap_total counter\n"
+           << "ws_cluster_seq_gap_total " << wsClusterSeqGap_.load(std::memory_order_relaxed) << "\n\n"
+           << "# HELP ws_cluster_out_of_order_total Inbound cluster-bus packets whose room sequence regressed (duplicate or reordered delivery).\n"
+           << "# TYPE ws_cluster_out_of_order_total counter\n"
+           << "ws_cluster_out_of_order_total " << wsClusterOutOfOrder_.load(std::memory_order_relaxed) << "\n\n";
 
         // 房间注册表度量（由 5 秒定时任务推送，最多 5 秒滞后）
         ss << "# HELP ws_rooms_active Number of active chat rooms.\n"
@@ -336,8 +410,11 @@ private:
     std::atomic<int64_t> wsOnlineConnections_{0};
     std::atomic<uint64_t> wsTotalMessages_{0};
     std::atomic<uint64_t> wsDroppedMessages_{0};
+    std::atomic<uint64_t> wsDirectBackpressured_{0};
     std::atomic<uint64_t> wsKafkaPersistDropped_{0};
     std::atomic<uint64_t> wsKafkaProduceFailed_{0};
+    std::atomic<uint64_t> wsKafkaDeliveryFailed_{0};
+    std::atomic<uint64_t> wsKafkaLogSuppressed_{0};
     std::atomic<uint64_t> wsHandlerExceptions_{0};
     std::atomic<uint64_t> wsKafkaPersistenceEnabled_{0};
     std::atomic<uint64_t> wsEvictedIdle_{0};
@@ -345,6 +422,8 @@ private:
     std::atomic<uint64_t> wsJsonParseErrors_{0};
     std::atomic<uint64_t> wsClusterPublishFailed_{0};
     std::atomic<uint64_t> wsClusterPacketDropped_{0};
+    std::atomic<uint64_t> wsClusterSeqGap_{0};
+    std::atomic<uint64_t> wsClusterOutOfOrder_{0};
     std::atomic<uint64_t> wsRoomsActive_{0};
     std::atomic<uint64_t> wsRoomShards_{0};
     std::atomic<uint64_t> wsRoomSubscribers_{0};

@@ -1128,6 +1128,120 @@ static void testInFlightCap()
     }
 }
 
+// ---------------------------------------------------------------------------
+// 13. 房间级序号（跨实例保序的「证人」）
+// ---------------------------------------------------------------------------
+// 断言的语义：
+//   · 序号从 1 开始、每条被接纳的消息 +1（同一把 pubMtx 内分配 ⇒ 序号顺序 == 入队顺序）
+//   · 被背压拒绝的消息【不占号】（否则接收端会把「本地没发出去」误报成「传输丢了」）
+//   · 不同房间各自独立计数（否则接收端按房间判缺口会满屏误报）
+//   · 房间空掉被回收、同名房间重建后序号【续上】而不是从 1 重来
+//     （否则接收端会把房间重建当成一次大规模乱序）
+//   · 无订阅者 / 无该房间时不分配序号（写回 0）
+static void testRoomSeq()
+{
+    std::printf("\ntest: 房间级序号\n");
+    LoopState loop;
+    loop.id = 0;
+
+    RegDynamic::Options opt;
+    opt.maxShards = 1;
+    opt.fanoutThreads = 0;
+    opt.backlogPerShard = 1 << 20;
+    opt.maxInFlightDeliveries = 1 << 20;
+
+    // ---- 13a. 无订阅者 / 无该房间 ⇒ 不分配序号 ----
+    {
+        RegDynamic reg(opt);
+        uint64_t seq = 12345; // 先写个哨兵，验证函数会把它清零
+        CHECK(reg.publish("nobody", std::string("x"), {}, &seq),
+              "向不存在的房间发布返回成功（无订阅者，静默丢弃）");
+        CHECK(seq == 0, "无订阅者时不分配序号（写回 0，接收端据此跳过缺口判断）");
+    }
+
+    // ---- 13b. 单调递增 + 房间之间互相独立 ----
+    {
+        RegDynamic reg(opt);
+        auto c = std::make_shared<MockConn>();
+        auto c2 = std::make_shared<MockConn>();
+        reg.subscribe("seq", c, DynamicLoopHandle{&loop});
+        reg.subscribe("other", c2, DynamicLoopHandle{&loop});
+
+        uint64_t s[5] = {0, 0, 0, 0, 0};
+        bool allOk = true;
+        for (int i = 0; i < 5; ++i)
+        {
+            allOk = reg.publish("seq", std::string("m"), {}, &s[i]) && allOk;
+        }
+        CHECK(allOk, "5 条消息全部被接纳");
+        CHECK(s[0] == 1 && s[1] == 2 && s[2] == 3 && s[3] == 4 && s[4] == 5,
+              "序号从 1 开始、每条 +1（1,2,3,4,5）");
+
+        uint64_t o1 = 0;
+        CHECK(reg.publish("other", std::string("o"), {}, &o1), "另一房间发布成功");
+        CHECK(o1 == 1, "不同房间各自独立计数（other 从 1 开始，不受 seq 房间影响）");
+
+        // hint 快路径也必须写回序号（否则带 hint 的调用方广播时永远不带序号）
+        uint64_t hs = 0;
+        auto handle = reg.acquireRoomHandle("seq");
+        CHECK(reg.publish("seq", std::string("hint"), handle, &hs), "带 hint 发布成功");
+        CHECK(hs == 6, "hint 快路径同样分配序号（续到 6）");
+
+        drainLoop(loop);
+        CHECK(snapshotOf(c).size() == 6, "序号分配不影响投递（6 条全部送达）");
+    }
+
+    // ---- 13c. 被背压拒绝的消息不占号 ----
+    {
+        RegDynamic::Options capped = opt;
+        capped.maxInFlightDeliveries = 3;
+        RegDynamic reg(capped);
+        auto c = std::make_shared<MockConn>();
+        reg.subscribe("cap", c, DynamicLoopHandle{&loop});
+
+        uint64_t a = 0, b = 0, d = 0;
+        uint64_t rejectedSeq = 999;
+        CHECK(reg.publish("cap", std::string("A"), {}, &a), "第 1 条被接受");
+        CHECK(reg.publish("cap", std::string("B"), {}, &b), "第 2 条被接受");
+        CHECK(reg.publish("cap", std::string("C"), {}, &d), "第 3 条被接受");
+        CHECK(a == 1 && b == 2 && d == 3, "被接纳的 3 条序号连续为 1,2,3");
+
+        // 不排空 loop ⇒ 在途 3 = 上限 ⇒ 下一条被拒
+        CHECK(!reg.publish("cap", std::string("D"), {}, &rejectedSeq), "在途达上限 ⇒ 第 4 条被拒");
+        CHECK(rejectedSeq == 0,
+              "被拒的消息不分配序号（否则接收端会把它误报成「传输中丢了一条」）");
+
+        drainLoop(loop);
+        uint64_t e = 0;
+        CHECK(reg.publish("cap", std::string("E"), {}, &e), "排空后重新放行");
+        CHECK(e == 4, "序号连续（1,2,3,4）—— 被拒的那条没有制造缺口");
+    }
+
+    // ---- 13d. 房间回收后同名重建，序号续上而不是从 1 重来 ----
+    {
+        RegDynamic reg(opt);
+        auto c = std::make_shared<MockConn>();
+        const auto id = reg.subscribe("recycle", c, DynamicLoopHandle{&loop});
+
+        uint64_t s1 = 0, s2 = 0;
+        reg.publish("recycle", std::string("1"), {}, &s1);
+        reg.publish("recycle", std::string("2"), {}, &s2);
+        CHECK(s1 == 1 && s2 == 2, "回收前序号为 1,2");
+        drainLoop(loop);
+
+        reg.unsubscribe("recycle", id);
+        CHECK(reg.activeRooms() == 0, "全部退订后房间被回收");
+
+        auto c2 = std::make_shared<MockConn>();
+        reg.subscribe("recycle", c2, DynamicLoopHandle{&loop});
+        uint64_t s3 = 0;
+        reg.publish("recycle", std::string("3"), {}, &s3);
+        CHECK(s3 == 3,
+              "同名房间重建后序号续到 3（修复前会从 1 重来，接收端每次都误报大规模乱序）");
+        drainLoop(loop);
+    }
+}
+
 int main()
 {    testStrictOrdering(0, "线程池并行扇出");
     testStrictOrdering(1000000, "内联扇出");
@@ -1142,6 +1256,7 @@ int main()
     testDispatchExceptionRecovery();
     testSubscriberIdNotReused();
     testInFlightCap();
+    testRoomSeq();
 
     std::printf("\n%s (failures=%d)\n", g_failures == 0 ? "ALL PASSED" : "FAILED", g_failures);
     return g_failures == 0 ? 0 : 1;

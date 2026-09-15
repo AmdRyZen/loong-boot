@@ -100,7 +100,8 @@ void ChatWebsocket::reloadSwitches()
     Metrics::PrometheusRegistry::instance().setSwitchStates(kafka);
 }
 
-void ChatWebsocket::produceKafkaAsync(std::string_view topicName, std::string_view payload)
+void ChatWebsocket::produceKafkaAsync(std::string_view topicName, std::string_view payload,
+                                      std::string_view key)
 {
     // 开关检查必须在【任何字符串构造之前】。
     //
@@ -122,7 +123,8 @@ void ChatWebsocket::produceKafkaAsync(std::string_view topicName, std::string_vi
     // 背压：TBB 池积压超过上限时 submit 会返回 false。
     // 原实现忽略返回值 → 消息被静默丢弃，无日志无指标，上层误以为已落库。
     const bool accepted = TbbCoroutinePool::instance().submit(
-        [topic = std::string(topicName), payload = std::string(payload)] {
+        [topic = std::string(topicName), payload = std::string(payload),
+         partitionKey = std::string(key)] {
             // ⚠️ TbbCoroutinePool 内部对任务包了 catch(...)，lambda 里抛出的任何异常
             // 都会被【静默吞掉】（无日志无指标）。KafkaManager::getTopic 在未初始化 /
             // topic 句柄创建失败时抛 runtime_error —— 不在这里自己接住的话，
@@ -184,7 +186,7 @@ void ChatWebsocket::produceKafkaAsync(std::string_view topicName, std::string_vi
             bool delivered = false;
             rd_kafka_resp_err_t lastErr = RD_KAFKA_RESP_ERR_NO_ERROR;
             retryWithSleep([&]() {
-                if (kafka::KafkaManager::safeProduce(topicPtr, payload))
+                if (kafka::KafkaManager::safeProduce(topicPtr, payload, partitionKey))
                 {
                     delivered = true;
                     return true;
@@ -339,8 +341,46 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
 
                         // ① 本实例本地投递（多端登录：该昵称的所有在线会话都收到）
                         bool echoedToSender = false;
+                        size_t backpressured = 0;
                         const size_t localDelivered =
-                            deliverDirectLocally(*core_, targetUser, json, wsConn, &echoedToSender);
+                            deliverDirectLocally(*core_, targetUser, json, wsConn, &echoedToSender,
+                                                 &backpressured);
+
+                        // ①' 背压：本实例的在途投递额度已满 ⇒ 整条消息【不投、不广播、
+                        //     不落库】，明确回 503。
+                        //
+                        // 与房间扇出同一个裁决点原则（见 fanOutRoom 里那段注释）：
+                        // 若这里仍继续广播集群 + 落库，发送者收到 503 而别的实例
+                        // 已经投出去了 —— 客户端按 503 重发就会在那边产生重复。
+                        //
+                        // ⚠️ 必须先于 404 判定：两者都是 localDelivered == 0，
+                        //    但「本实例有这个人、只是额度满了」和「本实例没这个人」
+                        //    是两件完全不同的事。报 404 会让客户端以为对方不在线。
+                        if (backpressured > 0)
+                        {
+                            auto& metrics = Metrics::PrometheusRegistry::instance();
+                            // 消息级计数进 ws_messages_dropped_total（与其他丢弃同口径），
+                            // 会话级计数进 ws_direct_backpressured_total（原因细分）。
+                            metrics.recordWsMessageDropped();
+                            if (subscriber.shouldSendOverloadNotice())
+                            {
+                                sendOverloadNotice(wsConn);
+                            }
+                            else
+                            {
+                                metrics.recordWsOverloadNoticeSuppressed();
+                            }
+                            // 与房间丢弃共用限流器：同属「过载」这一种现象。
+                            if (overloadLogLimiter_.allow())
+                            {
+                                LOG_WARN << "Private delivery backpressured, message dropped for user "
+                                         << targetUser << ": "
+                                         << (1 + overloadLogLimiter_.takeSuppressed())
+                                         << " occurrence(s) since last log "
+                                         << "(total: ws_direct_backpressured_total)";
+                            }
+                            return;
+                        }
 
                         // 本实例查无此人，且【集群总线实际不可用】→ 可以确定不在线，明确告知。
                         //
@@ -381,7 +421,11 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                         // 生产环境持久化：私聊消息异步推至 Kafka 私聊主题。
                         // 只在发送方实例落库（接收方实例投递时不落），避免跨实例重复。
                         // 受 custom_config.enable_kafka_persistence 控制，关闭时零开销。
-                        produceKafkaAsync("chat_direct_topic", json);
+                        //
+                        // 落的是【自描述信封】而不是客户端 VO：带 toUser/type/sender/
+                        // originInstance/ts，回放端才能还原「谁发给谁」。分区键取
+                        // 「排序后的双方昵称」，保证同一会话两个方向落同一分区。
+                        persistDirectMessage(*core_, senderName, targetUser, msg_vo, msg_dto.key);
                         return;
                     }
 
@@ -399,12 +443,13 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                     (void)glz::write_json(msg_vo, json);
 
                     // 1. 本实例本地房间广播（分片并行扇出）
-                    // 2. 分布式总线：同步广播给集群其他实例
-                    // 3. 生产环境持久化：异步投递到 Kafka 历史消息流
+                    // 2. 分布式总线：同步广播给集群其他实例（带上房间级序号）
+                    // 3. 生产环境持久化：异步投递到 Kafka 历史消息流（分区键 = 房间名）
                     // 带上本连接缓存的房间句柄：hint 与 topic 同源（都是本订阅者的字段），
                     // 因此 publish 可以安全地跳过全局房间表锁。
+                    uint64_t roomSeq = 0;
                     if (!fanOutRoom(*core_, topic, json, /*broadcastToCluster=*/true,
-                                    subscriber.room_))
+                                    subscriber.room_, &roomSeq))
                     {
                         auto& metrics = Metrics::PrometheusRegistry::instance();
                         metrics.recordWsMessageDropped();
@@ -431,7 +476,14 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                                      << " occurrence(s) since last log "
                                      << "(total: ws_messages_dropped_total)";
                         }
+                        // 注意：被拒时【不落库】（与 fanOutRoom 里集群广播的取舍一致）——
+                        // 否则客户端按 503 重发会在历史里留下两条。
+                        return;
                     }
+
+                    // 落库放在投递成功之后：被背压拒绝的消息不落库（见上）。
+                    persistRoomMessage(*core_, topic, senderName, msg_vo, roomSeq, "room",
+                                       msg_dto.key);
                 }
             }
         }
@@ -516,6 +568,11 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
         subscriber->id_ = core_->roomRegistry.subscribe(
             topic, wsConn, TrantorLoopHandle{trantor::EventLoop::getEventLoopOfCurrentThread()});
 
+        // 同一个 loop 句柄再缓存到 Subscriber 上：房间扇出已经按它分组，
+        // 私聊直投也要用（见 Subscriber::loop_ 与 deliverDirectLocally）。
+        // 只取一次，终身复用 —— 连接所属 loop 在生命周期内不会改变。
+        subscriber->loop_ = TrantorLoopHandle{trantor::EventLoop::getEventLoopOfCurrentThread()};
+
         // 缓存房间句柄：此后这条连接的每次发布都带上传回的句柄，publish 走快路径
         // 直接命中该房间，不再每条消息都去抢全局 roomsMtx_ 共享锁。
         // 房间被回收后句柄自动失效（retired），publish 会回退查表，无需在退订时清理。
@@ -539,7 +596,9 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
         //
         // broadcastToCluster = false：在线状态是本实例的本地事实。广播给其他实例后，
         // 那边的同名用户会收到与自己无关的「XX 已加入」；退群公告同理（见下）。
-        if (!fanOutRoom(*core_, topic, json, /*broadcastToCluster=*/false, subscriber->room_))
+        uint64_t roomSeq = 0;
+        if (!fanOutRoom(*core_, topic, json, /*broadcastToCluster=*/false, subscriber->room_,
+                        &roomSeq))
         {
             Metrics::PrometheusRegistry::instance().recordWsMessageDropped();
             // 与消息丢弃共用同一个限流器：同属「房间积压」这一种过载现象。
@@ -550,6 +609,12 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
                          << (1 + overloadLogLimiter_.takeSuppressed())
                          << " occurrence(s) since last log (total: ws_messages_dropped_total)";
             }
+        }
+        else
+        {
+            // 公告也落库（type = "notice"），否则历史回放里会出现「有人说话但
+            // 没人在房间里」的断裂。注意公告不跨实例广播，所以只有本实例写一条。
+            persistRoomMessage(*core_, topic, userName, msg_vo, roomSeq, "notice");
         }
     }
     catch (const std::exception& e)
@@ -643,7 +708,9 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
 
         // 与聊天消息共用同一房间的发布锁，保证「离群公告」与其他消息的相对顺序稳定。
         // 同样不跨实例广播（理由见 handleNewConnection 的入群公告）。
-        if (!fanOutRoom(*core_, topic, json, /*broadcastToCluster=*/false, subscriber.room_))
+        uint64_t roomSeq = 0;
+        if (!fanOutRoom(*core_, topic, json, /*broadcastToCluster=*/false, subscriber.room_,
+                        &roomSeq))
         {
             Metrics::PrometheusRegistry::instance().recordWsMessageDropped();
             // 同上：与消息丢弃共用限流器。
@@ -653,6 +720,10 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
                          << (1 + overloadLogLimiter_.takeSuppressed())
                          << " occurrence(s) since last log (total: ws_messages_dropped_total)";
             }
+        }
+        else
+        {
+            persistRoomMessage(*core_, topic, userName, msg_vo, roomSeq, "notice");
         }
     }
     catch (const std::exception& e)
@@ -666,8 +737,14 @@ size_t ChatWebsocket::deliverDirectLocally(Core& core,
                                           const std::string& targetUser,
                                           const std::string& json,
                                           const WebSocketConnectionPtr& sender,
-                                          bool* echoedToSender)
+                                          bool* echoedToSender,
+                                          size_t* backpressured)
 {
+    if (backpressured != nullptr)
+    {
+        *backpressured = 0;
+    }
+
     // 先在锁内拷出目标会话列表，投递放在锁外 —— 不持锁做 IO。
     std::vector<Session> targets;
     {
@@ -678,32 +755,142 @@ size_t ChatWebsocket::deliverDirectLocally(Core& core,
         }
     }
 
-    size_t delivered = 0;
+    // 真正可投递的份数（表里可能有空 conn 的残条目，那些不该占额度）
+    size_t total = 0;
+    for (const auto& s : targets)
+    {
+        if (s.conn)
+        {
+            ++total;
+        }
+    }
+    if (total == 0)
+    {
+        return 0;
+    }
+
+    // ── 在途额度：先扣后派发，全有或全无 ──────────────────────────────────────
+    //
+    // 「全有或全无」而不是「有多少额度投多少」：后者会让同一个昵称的多端里
+    // 一部分收到、一部分没收到，而调用方只能回一个 503 —— 客户端重试后
+    // 已收到的那部分会看到重复消息。与 RoomRegistry 的多分片预检查同一取舍。
+    //
+    // 额度必须在【派发之前】扣减：反过来的话，「已入队但还没计数」的窗口里
+    // 上游会以为下游还空着，正好在最该背压的时刻放行。
+    auto inFlight = core.directInFlight;
+    if (core.maxDirectInFlight != 0)
+    {
+        size_t cur = inFlight->load(std::memory_order_relaxed);
+        for (;;)
+        {
+            if (cur + total > core.maxDirectInFlight)
+            {
+                if (backpressured != nullptr)
+                {
+                    *backpressured = total;
+                }
+                Metrics::PrometheusRegistry::instance().recordWsDirectBackpressured(total);
+                return 0;
+            }
+            if (inFlight->compare_exchange_weak(cur, cur + total, std::memory_order_relaxed))
+            {
+                break;
+            }
+        }
+    }
+    else
+    {
+        // 限制关闭时仍然计数（gauge 才有意义），只是不检查上限
+        inFlight->fetch_add(total, std::memory_order_relaxed);
+    }
+
+    // ── 按目标 loop 分组 ────────────────────────────────────────────────────
+    //
+    // 分组的意义有两层：
+    //   ① 性能：同一昵称的 N 个多端会话散落在不同 loop 上时，逐份 send 就是
+    //      N 次跨线程唤醒（queueInLoop + 一次系统调用）；分组后每个目标 loop
+    //      只派发一次、携带整批连接，唤醒次数降为 O(loop 数)。与房间扇出的
+    //      A1 优化同一手法。
+    //   ② 正确性：只有在目标 loop 的线程里执行完这批 send，才能把在途额度还回去
+    //      —— 裸 send 只是入队，立刻归还等于额度形同虚设。
+    //
+    // payload 用 shared_ptr 持有：派发出去的批次会活过本函数的栈帧（它要等
+    // 目标 loop 执行到），形参 json 是引用，直接捕获就是悬垂引用。
+    std::shared_ptr<const std::string> payload;
+    std::vector<std::pair<TrantorLoopHandle, std::vector<WebSocketConnectionPtr>>> groups;
+    groups.reserve(4);
+
+    size_t dispatched = 0;
     bool echoed = false;
     for (const auto& s : targets)
     {
         if (!s.conn)
         {
-            continue;
+            continue; // 空连接不占额度（total 里也没算它）
         }
-        // ⚠️ 刻意不判 s.conn->connected()：那是非原子成员，而本函数可能运行在
-        // Redis 订阅回调线程上（跨实例私聊），目标连接却属于另一个 IO 线程 ——
-        // 跨线程读它就是 data race（形式上 UB，且会把整条集群路径变成随机炸弹）。
-        // 已断开的连接上调用 send 是安全的：drogon 在 sendInLoop 里静默丢弃。
-        // 「表里有」≈「在线」也成立：条目在 handleConnectionClosed 里摘除。
-        s.conn->send(json);
-        ++delivered;
         if (sender && s.conn == sender)
         {
             echoed = true;
         }
+
+        const TrantorLoopHandle loop = s.sub ? s.sub->loop_ : TrantorLoopHandle{};
+        if (!loop.valid())
+        {
+            // 取不到 loop（未登记 / 单测路径）：无处排队，退化为直投。
+            // 语义与优化前一致，只是这一份不参与在途计数 —— 立刻归还额度。
+            // ⚠️ 仍不判 connected()（跨线程读非原子成员是 data race）。
+            s.conn->send(json);
+            inFlight->fetch_sub(1, std::memory_order_relaxed);
+            ++dispatched;
+            continue;
+        }
+
+        auto it = std::find_if(groups.begin(), groups.end(),
+                               [&loop](const auto& p) { return p.first == loop; });
+        if (it == groups.end())
+        {
+            groups.emplace_back(loop, std::vector<WebSocketConnectionPtr>{});
+            it = std::prev(groups.end());
+        }
+        it->second.push_back(s.conn);
+    }
+
+    if (!groups.empty())
+    {
+        payload = std::make_shared<const std::string>(json);
+    }
+
+    for (auto& [loop, conns] : groups)
+    {
+        const size_t batch = conns.size();
+        auto batchConns = std::make_shared<const std::vector<WebSocketConnectionPtr>>(
+            std::move(conns));
+        try
+        {
+            loop.dispatch([payload, batchConns, inFlight, batch] {
+                const std::string_view view(*payload);
+                for (const auto& c : *batchConns)
+                {
+                    c->send(view);
+                }
+                inFlight->fetch_sub(batch, std::memory_order_relaxed);
+            });
+        }
+        catch (...)
+        {
+            // 派发失败 ⇒ 这批永远不会被执行，必须立刻把额度还回去。
+            // 否则在途计数只增不减，最终把整条私聊路径钉死在上限上。
+            inFlight->fetch_sub(batch, std::memory_order_relaxed);
+            throw;
+        }
+        dispatched += batch;
     }
 
     if (echoedToSender != nullptr)
     {
         *echoedToSender = echoed;
     }
-    return delivered;
+    return dispatched;
 }
 
 bool ChatWebsocket::clusterBusEnabled()
@@ -761,7 +948,15 @@ void ChatWebsocket::initClusterBus()
                     try
                     {
                         ClusterPacket packet{};
-                        if (glz::read_json(packet, message))
+                        // 容忍未知键：glaze 的默认是 error_on_unknown_keys = true，
+                        // 于是「新版本实例发出的、带新字段的包」会被【旧版本】实例
+                        // 直接丢弃 —— 滚动升级窗口里跨实例消息成片丢失，而现象只是
+                        // 「另一个实例的客户端收不到消息」，极难定位。
+                        // 本工程的消息总线协议还会继续演进（已经加过 toUser / roomSeq），
+                        // 所以入站解析必须前向兼容：多出来的键忽略，不要当错误。
+                        // ⚠️ 这只能让【本次之后】的新字段安全；已经发出去的旧二进制
+                        //    改不了，滚动升级时仍需注意。
+                        if (glz::read<glz::opts{.error_on_unknown_keys = false}>(packet, message))
                         {
                             // 入站包解析失败原先完全静默（连日志都没有）。
                             // 其他实例的版本不兼容 / 载荷被截断时，本实例
@@ -781,6 +976,19 @@ void ChatWebsocket::initClusterBus()
                         if (packet.instId == core->instanceId)
                         {
                             return;
+                        }
+
+                        // ── 房间序检测（只报告，不改变投递行为）──────────────────
+                        //
+                        // 必须在真正投递【之前】做：投递可能抛异常，而「序号已经
+                        // 收到了」是事实，不该因为下游投递失败而漏记。
+                        //
+                        // 基线键用 (instId, topic)：每个来源实例的房间序号是各自
+                        // 独立单调的，跨来源之间没有可比性 —— 见 ClusterPacket::roomSeq
+                        // 里关于能力边界的说明（这里【检测不到】跨来源乱序）。
+                        if (packet.roomSeq != 0 && !packet.topic.empty())
+                        {
+                            checkClusterRoomSeq(*core, packet.instId, packet.topic, packet.roomSeq);
                         }
 
                         if (!packet.toUser.empty())
@@ -829,8 +1037,79 @@ void ChatWebsocket::initClusterBus()
     });
 }
 
+void ChatWebsocket::checkClusterRoomSeq(Core& core, const std::string& originInstId,
+                                        const std::string& room, uint64_t roomSeq)
+{
+    if (roomSeq == 0)
+    {
+        return;
+    }
+
+    // 基线键：来源实例 + 房间。'\x1f'（单元分隔符）不会出现在实例 ID 或房间名里
+    //（实例 ID 是 "inst_<pid>_<nanos>"，房间名来自 HTTP header/参数）——
+    // 用不可能字符拼接，避免 ("a","b|c") 与 ("a|b","c") 撞同一个键。
+    std::string key;
+    key.reserve(originInstId.size() + room.size() + 1);
+    key.append(originInstId).push_back('\x1f');
+    key.append(room);
+
+    uint64_t last = 0;
+    {
+        std::lock_guard lock(core.clusterSeqMtx);
+        if (core.clusterLastSeq.size() >= kMaxClusterSeqBaselines &&
+            !core.clusterLastSeq.contains(key))
+        {
+            // 见 kMaxClusterSeqBaselines 的说明：整体清空，宁可暂时不判，也不误报。
+            core.clusterLastSeq.clear();
+        }
+        auto& slot = core.clusterLastSeq[key];
+        last = slot;
+        if (roomSeq > last)
+        {
+            slot = roomSeq;
+        }
+    }
+
+    if (last == 0)
+    {
+        return; // 首次见到该来源：只建立基线，不做判断
+    }
+
+    if (roomSeq > last + 1)
+    {
+        // 缺口：中间有 (roomSeq - last - 1) 条从该来源发往该房间的消息没到达本实例。
+        const uint64_t lost = roomSeq - last - 1;
+        Metrics::PrometheusRegistry::instance().recordClusterSeqGap(lost);
+        static loong::log::RateLimiter gapLimiter{1000};
+        if (gapLimiter.allow())
+        {
+            LOG_WARN << "Cluster room seq gap from " << originInstId << " room " << room << ": saw "
+                     << last << " then " << roomSeq << " (" << lost << " message(s) missing, "
+                     << (1 + gapLimiter.takeSuppressed())
+                     << " occurrence(s) since last log, total: ws_cluster_seq_gap_total)";
+        }
+        return;
+    }
+
+    if (roomSeq <= last)
+    {
+        // 回退：同一来源的消息乱序到达（或总线重复投递）。重复投递无害（客户端
+        // 可凭 msg id 去重），乱序则会让两侧订阅者看到不同顺序 —— 都值得计数。
+        Metrics::PrometheusRegistry::instance().recordClusterOutOfOrder();
+        static loong::log::RateLimiter oooLimiter{1000};
+        if (oooLimiter.allow())
+        {
+            LOG_WARN << "Cluster room seq regression from " << originInstId << " room " << room
+                     << ": saw " << last << " then " << roomSeq << " ("
+                     << (1 + oooLimiter.takeSuppressed())
+                     << " occurrence(s) since last log, total: ws_cluster_out_of_order_total)";
+        }
+    }
+}
+
 void ChatWebsocket::publishToCluster(const Core& core, const std::string& topic,
-                                     const std::string& json, const std::string& toUser)
+                                     const std::string& json, const std::string& toUser,
+                                     uint64_t roomSeq)
 {
     // 未启用集群总线时直接返回：既省开销，也避免踩 drogon getRedisClient 的空条目坑
     if (!clusterBusEnabled())
@@ -857,7 +1136,8 @@ void ChatWebsocket::publishToCluster(const Core& core, const std::string& topic,
             .instId = core.instanceId,
             .topic = topic,
             .json = json,
-            .toUser = toUser
+            .toUser = toUser,
+            .roomSeq = roomSeq
         };
 
         std::string payload{};
@@ -976,4 +1256,12 @@ void ChatWebsocket::publishRoomMetrics(const Core& core)
     m.setFanoutInflight(core.roomRegistry.inFlightDeliveries(),
                         core.roomRegistry.options().maxInFlightDeliveries,
                         core.roomRegistry.inflightRejectedCount());
+}
+
+void ChatWebsocket::publishKafkaMetrics()
+{
+    // 「拉」而不是「推」的理由见头文件：投递报告回调跑在 librdkafka 的 poll 线程上，
+    // 在那种地方做额外工作会直接拖慢 poll。
+    Metrics::PrometheusRegistry::instance().setKafkaDeliveryStats(
+        kafka::KafkaManager::deliveryFailedCount(), kafka::KafkaManager::suppressedLogCount());
 }
