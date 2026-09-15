@@ -8,6 +8,9 @@
 #include "service/TrieService.h"
 #include "threadPool/threadPool.h"
 #include <drogon/drogon.h>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
 #include <filesystem>
 #include <iostream>
 #include <drogon/version.h>
@@ -95,6 +98,29 @@ constexpr char Loong[] = "\n"
                      "████____███\n"
                      "█ _███_ _█_███";*/
 
+// ── 「进程退出前：先停 Kafka 消费者、再排空 TBB」的钩子 ──────────────────────
+//
+// 为什么需要它：
+//   trantor 的 Socket::bind() 失败时是 `LOG_SYSERR << ...; exit(1);`
+//   （trantor/net/inner/Socket.cc:67）—— 端口被占就会走到这里。
+//   而 exit() 只跑静态析构，【不等其他线程】。此时 TBB worker 可能仍在
+//   AsyncKafkaConsumer::submitMessageTask 里打 LOG_*，但
+//   Logger::outputFunc_()/flushFunc_() 这两个【函数内静态】已经析构，
+//   于是 ~Logger() → AsyncFileLogger::flush() 在已死的 mutex 上加锁
+//   ⇒ std::system_error(EINVAL) ⇒ 从析构里抛出 ⇒ terminate ⇒ abort(134)。
+//
+// 所以退出路径上必须先 requestStop() 两个消费者（join 掉 poll 线程）、
+// 再 waitAll() 排空 TBB，然后才轮到 logger 静态析构。
+//
+// 钩子体与 std::atexit 的注册都在 Application() 构造函数里完成，
+// 但【顺序很关键】：必须先用 setOutputFunction 触碰一次 logger 的函数内静态，
+// 再注册钩子（atexit 是 LIFO）。详见构造函数里那两段注释。
+inline std::function<void()> &kafkaShutdownHook()
+{
+    static std::function<void()> hook;
+    return hook;
+}
+
 class Application final
 {
   public:
@@ -117,6 +143,53 @@ Application::Application()
     try
     {
         //TbbCoroutinePool::instance().init();
+
+        // ── 退出路径防崩（第 1 步）：先「触碰」日志器的函数内静态 ──────────────
+        //
+        // 【症状】端口被占时进程以 SIGABRT(134) 退出，而不是干净的 exit(1)。
+        //
+        // 【成因链（已实测复现 + 崩溃报告比对确认）】
+        //   1) drogon 在 createListeners() 里做端口探测
+        //      （ListenerManager.cc:104 构造临时 TcpServer），bind 失败 ⇒
+        //      trantor Socket::bindAddress() 直接 `LOG_SYSERR; exit(1);`
+        //      （trantor/net/inner/Socket.cc:67-68）。
+        //   2) `exit()` 只跑 atexit + 静态析构，【不等其他线程】。
+        //      此刻 Kafka poll 线程仍在往 TBB 投递、TBB worker 仍在 LOG_ERROR。
+        //   3) 日志器的两个【函数内静态】outputFunc_()/flushFunc_()
+        //      （trantor/utils/Logger.h:291-302）随静态析构被销毁 —— 里面那个
+        //      lambda 持有 asyncFileLoggerPtr_ 的 shared_ptr 副本
+        //      （HttpAppFrameworkImpl.cc:1230-1235），lambda 一销毁，
+        //      AsyncFileLogger 的 mutex 就没了。
+        //   4) 还在跑的 TBB worker 接着 ~Logger() → AsyncFileLogger::flush()
+        //      在已死的 mutex 上加锁 ⇒ std::system_error(EINVAL) ⇒
+        //      从析构里抛出 ⇒ std::terminate ⇒ abort(134)。
+        //      崩溃报告栈：__throw_system_error ← AsyncFileLogger::flush ←
+        //      ~Logger ← AsyncKafkaConsumer::submitMessageTask 的 lambda ←
+        //      TbbCoroutinePool::submit 的 lambda ← tbb worker。
+        //
+        // 【修法】利用 atexit 的 LIFO 语义：atexit 处理器与静态析构共用一个栈，
+        //   按「注册/构造顺序的逆序」执行。所以先【触碰一次】那两个静态让它们
+        //   在此刻完成构造，再注册退出钩子 —— 钩子必然排在它们析构之前。
+        //
+        //   放在构造函数最前面（早于两个 Kafka 消费者静态）也有讲究：
+        //   消费者析构里还有 `LOG_DEBUG << "...consumer stopped."`，构造越早
+        //   ⇒ 析构越晚 ⇒ 那条日志也落在日志器还活着的时候。
+        //
+        //   ⚠️ 不能依赖「某条 LOG_* 会先初始化它」：log_level=WARN 时
+        //      LOG_DEBUG/LOG_INFO 宏直接短路（trantor Logger.h 的宏会先判级别），
+        //      Logger 临时对象根本不构造，静态也就从没被初始化过。
+        //   ⚠️ 不能放在 beginningAdvice 里：它在 HttpAppFrameworkImpl.cc:675
+        //      才触发，而端口探测在 623 行（createListeners）—— 端口冲突这条路
+        //      根本走不到 advice。实测：advice 版本 5/5 仍 abort(134)。
+        //   ⚠️ 这里 setOutputFunction 传的就是 trantor 的默认行为
+        //      （defaultOutputFunction/defaultFlushFunction 是 protected，
+        //        外部取不到，只能等价重写）。若配置了 log_path，
+        //      setupFileLogger()（HttpAppFrameworkImpl.cc:1230）紧接着就会把它
+        //      覆盖成文件日志；若没配，行为与默认完全一致 —— 不改变语义。
+        trantor::Logger::setOutputFunction(
+            [](const char *msg, const uint64_t len)
+            { std::fwrite(msg, 1, static_cast<size_t>(len), stdout); },
+            [] { std::fflush(stdout); });
 
         // 获取 KafkaManager 的配置
         const std::string brokers = drogon::app().getCustomConfig()["kafka_manager"]["bootstrap.servers"].asString();
@@ -143,6 +216,33 @@ Application::Application()
             },
             4 // 可调线程数
         );
+
+        // ── 退出路径防崩（第 2 步）：填装并注册钩子 ────────────────────────────
+        //
+        // 钩子体：停 Kafka 消费者（join poll 线程）→ 排空 TBB 在途任务。
+        // 两步都幂等，析构函数稍后还会再调一次，无副作用。
+        //
+        // 注册时机必须【晚于】上面那次 setOutputFunction —— atexit 是 LIFO，
+        // 越晚注册越早执行，这样才能抢在日志器静态析构之前动手。
+        App::kafkaShutdownHook() = [] {
+            asyncKafkaConsumer.requestStop();
+            asyncKafkaConsumerOne.requestStop();
+            TbbCoroutinePool::instance().waitAll();
+        };
+
+        std::atexit([] {
+            try
+            {
+                if (auto &hook = App::kafkaShutdownHook())
+                {
+                    hook();
+                }
+            }
+            catch (...)
+            {
+                // 退出路径上不允许任何异常逃逸：抛出去就是 terminate/abort
+            }
+        });
 
         // 初始化 MqttManager 并连接到 MQTT broker  mosquitto/emqx start
         //MqttManager::instance().initialize(app().getCustomConfig()["mqtt_manager"]["servers"].asString(), app().getCustomConfig()["mqtt_manager"]["client_id"].asString());

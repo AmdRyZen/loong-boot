@@ -38,6 +38,15 @@ public:
 
     ~AsyncKafkaConsumerOne()
     {
+        requestStop();
+        consumers_.clear();
+        LOG_DEBUG << "AsyncKafkaConsumerOne consumer stopped.";
+    }
+
+    // 同 AsyncKafkaConsumer::requestStop()：**幂等**，可被析构调用，也可被
+    // 「进程退出钩子」提前调用（见 aop/Application.h 里对 exit() 竞态的说明）。
+    void requestStop()
+    {
         stop_ = true;
         for (auto& thread : pollThreads_)
         {
@@ -50,8 +59,6 @@ public:
         // consumer，否则退出瞬间在途任务会用到已销毁的 consumer（use-after-free）。
         // 任务 lambda 捕获裸 rd_kafka_t*，并会 commit / destroy message。
         TbbCoroutinePool::instance().waitAll();
-        consumers_.clear();
-        LOG_DEBUG << "AsyncKafkaConsumerOne consumer stopped.";
     }
 
 private:

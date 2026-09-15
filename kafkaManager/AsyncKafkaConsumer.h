@@ -38,6 +38,24 @@ public:
 
     ~AsyncKafkaConsumer()
     {
+        requestStop();
+        consumers_.clear();
+        LOG_DEBUG << "AsyncKafkaConsumer consumer stopped.";
+    }
+
+    // 停掉 poll 线程并把 TBB 池里的在途任务排空。**幂等**，可被析构调用，
+    // 也可被「进程退出钩子」提前调用（见 aop/Application.h）。
+    //
+    // ⚠️ 为什么必须能提前调用：drogon 在监听失败等致命错误里会直接 `exit(1)`
+    //    （trantor Socket::bind → LOG_SYSERR + exit(1)）。`exit()` 会跑静态析构
+    //    但**不等待其他线程**，于是「poll 线程还在往 TBB 投递 + TBB worker 正在
+    //    `LOG_*`」与「日志器被静态析构」并发发生 —— 日志器 mutex 已失效，
+    //    `~Logger()` → `AsyncFileLogger::flush()` 抛 `std::system_error(EINVAL)`，
+    //    而 TBB worker 没有异常处理器 ⇒ `std::terminate` ⇒ SIGABRT(134)。
+    //    实测：端口被占时秒崩，崩溃报告里能同时看到
+    //    `~AsyncKafkaConsumerOne` 正在 `thread::join` 和 TBB worker 正在 terminate。
+    void requestStop()
+    {
         stop_ = true;
         for (auto& thread : pollThreads_)
         {
@@ -55,8 +73,6 @@ public:
         // 在途任务会访问已经销毁的 consumer → use-after-free。
         // waitAll() 保证这些任务全部结束后才轮到 consumer 析构。
         TbbCoroutinePool::instance().waitAll();
-        consumers_.clear();
-        LOG_DEBUG << "AsyncKafkaConsumer consumer stopped.";
     }
 
 private:
