@@ -35,6 +35,22 @@ target_link_libraries(${PROJECT_NAME}_room_registry PRIVATE Drogon::Drogon)
 # ##############################################################################
 add_executable(${PROJECT_NAME}_snowflake_id test_snowflake_id.cc)
 
+# ##############################################################################
+# Kafka 落库信封（utils/ChatPersistEnvelope.h）单元测试
+#
+# 自带 int main()，同样【不依赖 drogon / 网络 / Kafka】—— 只 include 头文件，
+# 唯一的外部依赖是 glaze（纯头文件库，链接 glaze::glaze 只为拿包含目录）。
+#
+# 覆盖的是三件「错了也不报错、只静默失效」的事：
+#   ① 信封键集合（回放端 schema 契约，少一个键就静默缺字段）
+#   ② 空串字段是否照常输出（glaze skip_null_members 的默认行为，属别人的默认值）
+#   ③ 私聊分区键必须排序后拼接（否则 A→B / B→A 散在不同分区，会话内顺序丢失）
+# 这三条以前只能靠「真实例 + 真 broker + 消费主题」验证（e2e 级）。
+# ##############################################################################
+add_executable(${PROJECT_NAME}_chat_persist test_chat_persist.cc)
+target_link_libraries(${PROJECT_NAME}_chat_persist PRIVATE glaze::glaze)
+
 enable_testing()
 add_test(NAME room_registry COMMAND ${PROJECT_NAME}_room_registry)
 add_test(NAME snowflake_id COMMAND ${PROJECT_NAME}_snowflake_id)
+add_test(NAME chat_persist COMMAND ${PROJECT_NAME}_chat_persist)

@@ -585,6 +585,23 @@
         const HEARTBEAT_MS = 25000;   // 必须明显小于服务端的 60 秒阈值
         let heartbeatTimer = null;
 
+        // 每条消息的唯一 id —— 服务端幂等去重的键
+        //（对应 custom_config.enable_message_dedup / Core::dedupSeen）。
+        //
+        // 必须【每条消息一个新值】。此前的实现把 key 填成房间名，而房间名在同一
+        // 房间里恒定：服务端一旦打开去重，该用户的第二条消息起会被全部当成重发
+        // 而静默丢弃 —— 现象是「消息发出去没有任何反应」，且房间里其他人也收不到。
+        // 服务端因此把去重开关默认关掉；客户端这边补上唯一 id，两者缺一不可。
+        //
+        // crypto.randomUUID 只在安全上下文（https / localhost）存在，
+        // 用 file:// 直接打开这个页面时没有它，故留一个降级实现。
+        function newMsgId() {
+            if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+                return crypto.randomUUID();
+            }
+            return 'm_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
+        }
+
         function sendHeartbeat() {
             if (!ws || ws.readyState !== WebSocket.OPEN) return;
             try {
@@ -778,7 +795,7 @@
             const toUser = document.getElementById('toUser').value.trim();
 
             const payload = JSON.stringify({
-                key: document.getElementById('roomName').value.trim(),
+                key: newMsgId(),
                 action: "message",
                 msgContent: content,
                 toUser: toUser
@@ -810,7 +827,7 @@
                     break;
                 }
                 const payload = JSON.stringify({
-                    key: room,
+                    key: newMsgId(),
                     action: "message",
                     msgContent: `batch_bench_msg_${i}`
                 });

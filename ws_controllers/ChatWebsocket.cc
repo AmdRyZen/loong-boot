@@ -26,6 +26,16 @@ std::atomic<bool>& ChatWebsocket::kafkaPersistenceEnabled() noexcept
     return enabled;
 }
 
+std::atomic<bool>& ChatWebsocket::messageDedupEnabled() noexcept
+{
+    // 缺省 false。理由见头文件 Core::dedupSeen：去重的前提是「客户端为每条消息
+    // 生成唯一 key」，而本工程既有的 chat.html 把 key 填成了房间名 ——
+    // 默认打开等于把「客户端还没升级」变成「同一房间内该用户的消息被静默吞掉」。
+    // 这个方向的错误不可接受，所以默认必须是关，由部署方确认客户端已升级后再打开。
+    static std::atomic<bool> enabled{false};
+    return enabled;
+}
+
 void ChatWebsocket::reloadSwitches()
 {
     // 由构造函数与 5 秒定时任务调用。做成可重读是为了避免「改配置必须重启」——
@@ -40,6 +50,7 @@ void ChatWebsocket::reloadSwitches()
     // 这种自相矛盾的状态。详见 clusterBusEnabled()。
     bool parsed = false;
     bool kafka = false;
+    bool dedup = false;
     try
     {
         Json::Value root;
@@ -54,6 +65,10 @@ void ChatWebsocket::reloadSwitches()
             if (custom.isMember("enable_kafka_persistence"))
             {
                 kafka = custom["enable_kafka_persistence"].asBool();
+            }
+            if (custom.isMember("enable_message_dedup"))
+            {
+                dedup = custom["enable_message_dedup"].asBool();
             }
         }
         else
@@ -83,7 +98,8 @@ void ChatWebsocket::reloadSwitches()
         // value」的日志完全相反，排障时极具误导性。
         // gauge 仍按当前生效值刷新一次，保证 /metrics 不撒谎。
         Metrics::PrometheusRegistry::instance().setSwitchStates(
-            kafkaPersistenceEnabled().load(std::memory_order_relaxed));
+            kafkaPersistenceEnabled().load(std::memory_order_relaxed),
+            messageDedupEnabled().load(std::memory_order_relaxed));
         return;
     }
 
@@ -97,7 +113,17 @@ void ChatWebsocket::reloadSwitches()
         LOG_WARN << "Kafka persistence switch changed: " << (prev ? "true" : "false") << " -> "
                  << (kafka ? "true" : "false") << " (custom_config.enable_kafka_persistence)";
     }
-    Metrics::PrometheusRegistry::instance().setSwitchStates(kafka);
+
+    // 去重开关同样留痕。这条尤其重要：打开它会让「客户端 key 不唯一」的客户端
+    // 开始丢消息，事后必须能查到是什么时候被打开的。
+    const bool prevDedup = messageDedupEnabled().exchange(dedup, std::memory_order_relaxed);
+    if (prevDedup != dedup)
+    {
+        LOG_WARN << "Message dedup switch changed: " << (prevDedup ? "true" : "false") << " -> "
+                 << (dedup ? "true" : "false") << " (custom_config.enable_message_dedup)";
+    }
+
+    Metrics::PrometheusRegistry::instance().setSwitchStates(kafka, dedup);
 }
 
 void ChatWebsocket::produceKafkaAsync(std::string_view topicName, std::string_view payload,
@@ -332,6 +358,85 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                 {
                     Metrics::PrometheusRegistry::instance().recordWsMessage();
 
+                    // 全局唯一消息 id 在这里分配一次（原先在两个分支里各调一次）。
+                    // 放在判重【之前】：id 只是 snowflake 序号，中间浪费一个号没有
+                    // 任何语义影响（客户端不会拿它做连续性断言），但省掉了
+                    // 「在去重表锁里分配 id」这件事。
+                    const uint64_t msgId = nextMessageId();
+
+                    // ── 消息去重（客户端重发幂等，B2）────────────────────────────
+                    //
+                    // 位置：在所有格式校验之后、任何投递/落库之前。
+                    //   太早 → 格式错误的重发也会被当成重复，客户端就永远收不到那条错误提示；
+                    //   太晚 → 重复消息已经广播出去了，去重就没有意义。
+                    if (messageDedupEnabled().load(std::memory_order_relaxed) && !msg_dto.key.empty())
+                    {
+                        // 键 = (发送者昵称, 客户端 dto.key)。必须带上发送者：
+                        // key 由客户端提供，两个客户端撞上同一个值是完全可能的。
+                        // 分隔符用 \x1f（US，单元分隔符）—— 昵称里出现它的概率远低于
+                        // '|' 之类可打印字符，且无需转义。
+                        std::string dedupKey;
+                        dedupKey.reserve(senderName.size() + msg_dto.key.size() + 1);
+                        dedupKey.append(senderName).push_back('\x1f');
+                        dedupKey.append(msg_dto.key);
+
+                        const int64_t nowMsVal = loong::chat::nowMs();
+                        uint64_t dupOfId = 0;
+                        {
+                            std::lock_guard lock(core_->dedupMtx);
+                            const auto it = core_->dedupSeen.find(dedupKey);
+                            if (it != core_->dedupSeen.end())
+                            {
+                                dupOfId = it->second.msgId;
+                                // 刷新时间戳：客户端在重试退避里连发多次时，
+                                // 不应该因为「首次处理已过去 120 秒」而在重试中途被放行。
+                                it->second.atMs = nowMsVal;
+                            }
+                            else
+                            {
+                                if (core_->dedupSeen.size() >= Core::kMaxDedupEntries)
+                                {
+                                    // 到上限整体清空（与 roomSeqWatermark_ 同一手法）。
+                                    // 宁可让一小段窗口里的重发不再被识别，也不要让
+                                    // 一个优化设施变成内存泄漏。
+                                    core_->dedupSeen.clear();
+                                }
+                                core_->dedupSeen.emplace(std::move(dedupKey),
+                                                         Core::DedupEntry{msgId, nowMsVal});
+                            }
+                        }
+
+                        if (dupOfId != 0)
+                        {
+                            // 重发：不再广播、不再落库，但【仍然回显】。
+                            //
+                            // 为什么必须回显：客户端重发通常正是因为它没收到上一次的回显
+                            //（闪断重连 / 超时）。若这里静默丢弃，客户端的重试循环永远
+                            // 等不到应答，会一直重发下去。
+                            //
+                            // 回显里带的是【首次处理时分配的 id】而不是本次的新号 ——
+                            // 客户端按 id 去重时能把两份回显认成同一条，
+                            // 而房间里的其他人始终只看到一条。
+                            chatMessageVo echo{};
+                            echo.code = 200;
+                            echo.id = dupOfId;
+                            echo.name = std::string_view(senderName);
+                            // 私聊的显示文本带 "[私聊] " 前缀，必须与首次处理保持一致，
+                            // 否则客户端看到的重发回显与首次回显文案不同。
+                            echo.message =
+                                msg_dto.toUser.empty()
+                                    ? msg_dto.msgContent
+                                    : std::format("[私聊] {}", std::string_view(msg_dto.msgContent));
+                            echo.type = "message";
+
+                            std::string echoJson{};
+                            (void)glz::write_json(echo, echoJson);
+                            wsConn->send(echoJson, WebSocketMessageType::Text);
+                            Metrics::PrometheusRegistry::instance().recordWsMessageDeduped();
+                            return;
+                        }
+                    }
+
                     // 判断是否为点对点私聊 (toUser 非空)
                     if (!msg_dto.toUser.empty())
                     {
@@ -339,7 +444,7 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
 
                         chatMessageVo msg_vo{};
                         msg_vo.code = 200;
-                        msg_vo.id = nextMessageId();
+                        msg_vo.id = msgId; // 与去重表里登记的是同一个号（见上）
                         msg_vo.name = std::string_view(senderName);
                         msg_vo.message = std::format("[私聊] {}", std::string_view(msg_dto.msgContent));
                         msg_vo.type = "message";
@@ -443,7 +548,7 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                     // 也不再经 TBB 池（多线程池会打乱入队顺序，下游再怎么串行都救不回来）。
                     chatMessageVo msg_vo{};
                     msg_vo.code = 200;
-                    msg_vo.id = nextMessageId();
+                    msg_vo.id = msgId; // 与去重表里登记的是同一个号（见上）
                     msg_vo.name = std::string_view(senderName);
                     msg_vo.message = std::move(msg_dto.msgContent);
                     msg_vo.type = "message";
@@ -480,10 +585,16 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                         // ws_messages_dropped_total（counter 不受限流影响）。
                         if (overloadLogLimiter_.allow())
                         {
+                            // 房间名与订阅者数是「慢消费者定位」的关键上下文：
+                            // 原先这条日志既不说哪个房间、也不说那个房间多大，
+                            // 看到刷屏只能靠 ws_room_max_backlog 猜。
+                            // subscribersIn() 会加一次房间表共享锁 —— 这里每秒最多
+                            // 一次（限流器已放行），可以接受；绝不能挪到限流之前。
                             LOG_WARN << "Room backlog full, message dropped: "
                                      << (1 + overloadLogLimiter_.takeSuppressed())
-                                     << " occurrence(s) since last log "
-                                     << "(total: ws_messages_dropped_total)";
+                                     << " occurrence(s) since last log in room '" << topic << "' ("
+                                     << core_->roomRegistry.subscribersIn(topic)
+                                     << " subscriber(s); total: ws_messages_dropped_total)";
                         }
                         // 注意：被拒时【不落库】（与 fanOutRoom 里集群广播的取舍一致）——
                         // 否则客户端按 503 重发会在历史里留下两条。
@@ -1250,11 +1361,40 @@ void ChatWebsocket::checkAndEvictIdleConnections(Core& core)
     }
 }
 
-void ChatWebsocket::publishRoomMetrics(const Core& core)
+void ChatWebsocket::publishRoomMetrics(Core& core)
 {
     auto& m = Metrics::PrometheusRegistry::instance();
     const auto s = core.roomRegistry.stats();
-    m.setRoomStats(s.rooms, s.shards, s.subscribers, s.maxRoomSubscribers);
+    m.setRoomStats(s.rooms, s.shards, s.subscribers, s.maxRoomSubscribers, s.queuedMessages,
+                   s.maxRoomBacklog);
+
+    // ── 「最深积压房间」的边沿日志（C2）───────────────────────────────────────
+    //
+    // 房间名【不能】做成指标标签：它来自客户端 header，基数无界，是 Prometheus
+    // 最经典的踩坑。所以数值进指标（ws_room_max_backlog），名字只能进日志。
+    //
+    // 两重防噪：
+    //   ① 阈值 = 单分片上限的 1/4。低于它属于正常抖动 —— 一条消息从入队到被抽走
+    //      之间队列总有一瞬间非空，逐次上报只会变成噪声。
+    //   ② 只在「最深房间换了名字」时打。稳态下同一个房间长期最深 ⇒ 只打一行。
+    //      这比「每 5 秒一行」和「每条丢弃一行」都克制，但仍能回答
+    //      「到底是谁在积压」——这正是原先完全缺失的信息。
+    const size_t cap = core.roomRegistry.options().backlogPerShard;
+    const size_t warnAt = cap > 4 ? cap / 4 : 1;
+    if (s.maxRoomBacklog >= warnAt)
+    {
+        if (s.worstRoom != core.lastWorstRoomLogged)
+        {
+            core.lastWorstRoomLogged = s.worstRoom;
+            LOG_WARN << "Room backlog: deepest is '" << s.worstRoom << "' with " << s.maxRoomBacklog
+                     << " queued message(s) (cap per shard: " << cap
+                     << ", see ws_room_max_backlog / ws_room_queued_messages)";
+        }
+    }
+    else
+    {
+        core.lastWorstRoomLogged.clear();
+    }
     // 扇出分组效果（counter，看增量）：batches = 唤醒次数，deliveries = 实际份数
     m.setFanoutStats(core.roomRegistry.inLoopDeliveries(),
                      core.roomRegistry.crossThreadBatches(),
@@ -1275,4 +1415,51 @@ void ChatWebsocket::publishKafkaMetrics()
     // 在那种地方做额外工作会直接拖慢 poll。
     Metrics::PrometheusRegistry::instance().setKafkaDeliveryStats(
         kafka::KafkaManager::deliveryFailedCount(), kafka::KafkaManager::suppressedLogCount());
+}
+
+void ChatWebsocket::sweepDedupTable(Core& core)
+{
+    // 去重表的 TTL 清理。由 5 秒定时任务驱动。
+    //
+    // 为什么必须有 TTL 而不只是容量上限：
+    //   ① 容量上限只在「写满」时才回收，稳态下内存停在高水位；
+    //   ② 更要紧的是【错误用法的杀伤范围】。若客户端把 key 填成房间名，
+    //      没有 TTL 的话它从第二条消息起会被永久静默丢弃 ——
+    //      有 120 秒窗口的话，最坏也只是两分钟内丢消息，且能靠改客户端恢复。
+    //
+    // 但它是 O(表大小) 的，因此【先去重关闭时是空表】这条快速路径必须成立：
+    // 表为空时循环立刻结束，不产生任何开销。
+    //
+    // ⚠️ 判空也必须在锁内：dedupSeen 是普通容器，锁外读 size/empty 就是 data race
+    //    （IO 线程可能正在插入）。锁本身是零竞争的，不值得为省它引入 UB。
+    const int64_t cutoff = loong::chat::nowMs() - Core::kDedupTtlMs;
+    std::lock_guard lock(core.dedupMtx);
+    if (core.dedupSeen.empty())
+    {
+        return;
+    }
+    for (auto it = core.dedupSeen.begin(); it != core.dedupSeen.end();)
+    {
+        if (it->second.atMs < cutoff)
+        {
+            it = core.dedupSeen.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+}
+
+void ChatWebsocket::installLatencySink(Core& core)
+{
+    // 注册表把「量到多少纳秒」交给这个回调，上报动作留在本层。
+    //
+    // 回调跑在【目标 IO loop】上（见 RoomRegistry::fanOutToSnapshot 里的说明），
+    // 因此这里只允许做无锁、无分配、无 I/O 的事 —— recordFanoutLatencyNanos
+    // 正好是纯原子操作。任何「写日志 / 发 HTTP / 加锁」都会直接拖慢事件循环，
+    // 这在本工程是反复踩过的坑（librdkafka 的 deliveryReportCallback 就是反例）。
+    core.roomRegistry.setLatencySink([](uint64_t nanos) {
+        Metrics::PrometheusRegistry::instance().recordFanoutLatencyNanos(nanos);
+    });
 }

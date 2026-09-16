@@ -6,6 +6,7 @@
 #include "utils/retry_utils.h"
 #include "utils/RateLimitedLog.h"
 #include "utils/SnowflakeId.h"
+#include "utils/ChatPersistEnvelope.h"
 #include "parallel_hashmap/phmap.h"
 #include "RoomRegistry.h"
 #include <algorithm>
@@ -43,6 +44,10 @@ public:
         // 若不在这里同步一次，启动后到第一次定时刷新之间会处于「配置说开、实际关」的状态。
         reloadSwitches();
 
+        // 把端到端延迟直方图的数据出口接到 Prometheus registry 上。
+        // 注册表本身不依赖指标代码（单测不链接 drogon / 指标单例），所以接线放在这里。
+        installLatencySink(*core_);
+
         // 注册定时任务：空闲超时连接驱逐 + 房间指标采集 + 开关热更新。
         //
         // 回调按值捕获 core_（shared_ptr），而不是捕获 this：
@@ -53,6 +58,8 @@ public:
             checkAndEvictIdleConnections(*core);
             publishRoomMetrics(*core);
             publishKafkaMetrics();
+            // 去重表 TTL 清理（去重关闭时表为空，立即返回）
+            sweepDedupTable(*core);
             // 开关热更新：改 config.json 不必重启进程（见 reloadSwitches 注释）
             reloadSwitches();
         });
@@ -193,6 +200,43 @@ private:
         // 取代了原先的 drogon::PubSubService（它单线程扇出，房间越大越慢）
         // 与 RoomSerialDispatcher（保序职责已内聚到 RoomRegistry 的房间级发布锁）。
         RoomRegistry roomRegistry;
+
+        // 上一次「最深积压房间」日志里写过的房间名。
+        //
+        // 放在 Core 里而不是做成 publishRoomMetrics 的函数内静态量：函数内静态量
+        // 会让「同一个进程里两个控制器实例」共用一份状态（多实例测试时会互相清掉
+        // 对方的去重标记），而且它的生命周期与静态析构顺序绑定，退出阶段是个隐患。
+        std::string lastWorstRoomLogged;
+
+        // ── 消息去重（客户端重发幂等）──────────────────────────────────────────
+        //
+        // 为什么需要：客户端在「没收到回显」时会重发（网络闪断后重连再发、
+        // 用户连点、中间代理重试）。服务端若不识别，房间里的其他人会看到两条。
+        //
+        // 键 = (发送者昵称, 客户端 dto.key)。为什么必须带上发送者：key 由客户端
+        // 提供，两个客户端完全可能撞上同一个值。
+        //
+        // ⚠️ 开关缺省 false，理由不是性能而是【协议前提】：
+        //    本工程此前的 chat.html 把 key 填成【房间名】—— 那种客户端一旦开着去重，
+        //    该用户在同一房间里的第二条消息起会被全部当成重发而静默丢弃。
+        //    所以：服务端默认关；客户端必须为每条消息生成唯一 id
+        //    （chat.html 已改成 crypto.randomUUID()）。两者缺一不可。
+        struct DedupEntry
+        {
+            uint64_t msgId = 0; // 首次处理时分配的消息 id（重发时用它回显）
+            int64_t atMs = 0;   // 首次处理时刻（TTL 清理用）
+        };
+        phmap::flat_hash_map<std::string, DedupEntry> dedupSeen;
+        std::mutex dedupMtx;
+
+        // 去重表容量上限：到上限整体清空（与 roomSeqWatermark_、集群序号基线
+        // 同一手法）。代价是清空后的一小段窗口里重发不再被识别，
+        // 而绝不因此让一个「优化」设施变成内存泄漏。
+        static constexpr size_t kMaxDedupEntries = 1 << 16;
+        // 去重窗口。超过就清掉 —— 除了回收内存，更重要的是限制
+        // 「客户端复用同一个 key」这种错误用法的杀伤范围：没有 TTL 的话，
+        // 一个 key 填成房间名的客户端会从第二条消息起永久被静默丢弃。
+        static constexpr int64_t kDedupTtlMs = 120'000;
 
         // 用户名 -> 该用户名下的所有在线会话（同一昵称允许多端并存，多端都能收到私聊）
         // 原先的 name -> 单连接 语义在「同名多连接」时会串号：旧连接断开时会把新连接的
@@ -340,34 +384,18 @@ private:
     //
     // （chatMessageVo 上的 type 是唯一例外 —— 它短、且客户端真的需要，
     //   理由见那个字段自己的注释。这里的 room/toUser/originInstance 仍然只落库。）
-    struct chatPersistVo
-    {
-        uint64_t id = 0;             // 与客户端看到的 id 一致（snowflake，全局唯一）
-        std::string name;            // 与客户端 VO 的 name 一致（公告里它是房间名，历史原因）
-        std::string message;         // 与客户端看到的文本完全一致（含 "[私聊] " 前缀）
-        std::string room;            // 房间名（房间消息 / 公告）；私聊为空
-        std::string toUser;          // 私聊目标昵称；房间消息为空
-        std::string type;            // "room" | "direct" | "notice"
-        uint64_t roomSeq = 0;        // 房间级序号（房间消息；0 = 未分配）
-        std::string sender;          // 真实发送者昵称（公告里 name 是房间名，故单列）
-        std::string clientMsgId;     // 客户端 dto 的 key 字段，协议未定义语义，预留做幂等
-        std::string originInstance;  // 落库实例 ID：多实例时用于追查「哪个实例写的」
-        int64_t ts = 0;              // 落库时刻（Unix 毫秒，UTC）
-    };
-
-    static int64_t nowMs()
-    {
-        return std::chrono::duration_cast<std::chrono::milliseconds>(
-                   std::chrono::system_clock::now().time_since_epoch())
-            .count();
-    }
-
-    static std::string buildPersistJson(const chatPersistVo& vo)
-    {
-        std::string json{};
-        (void)glz::write_json(vo, json);
-        return json;
-    }
+    // ⚠️ 结构与序列化已抽到 utils/ChatPersistEnvelope.h（namespace loong::chat）。
+    //
+    // 为什么抽出去：这几个东西原本是这里的 private static，只有「跑真实例 + 连真 broker
+    // + 消费主题」才能验证（e2e 级），而它们恰恰是最容易写错又最难发现的一类逻辑 ——
+    // 信封少一个键 ⇒ 回放端按固定 schema 读会静默缺字段；私聊分区键忘了排序 ⇒
+    // A→B 与 B→A 落不同分区、会话内顺序静默丢失。抽成纯函数后普通单测就能锁死
+    // （test/test_chat_persist.cc）。
+    //
+    // 这里保留同名类型别名，让下面 persistXxx 的代码尽量少改。
+    // （自由函数不能用类作用域 using 声明引入 —— 那是给基类成员用的 —— 所以
+    //   buildPersistJson / nowMs 在调用处写全限定名。）
+    using chatPersistVo = loong::chat::PersistVo;
 
     // 落库一条房间消息 / 公告。
     //
@@ -405,8 +433,8 @@ private:
         p.sender = sender;
         p.clientMsgId = clientMsgId;
         p.originInstance = core.instanceId;
-        p.ts = nowMs();
-        produceKafkaAsync("chat_messages_topic", buildPersistJson(p), room);
+        p.ts = loong::chat::nowMs();
+        produceKafkaAsync("chat_messages_topic", loong::chat::buildPersistJson(p), room);
     }
 
     // 落库一条私聊。
@@ -434,15 +462,11 @@ private:
         p.sender = sender;
         p.clientMsgId = clientMsgId;
         p.originInstance = core.instanceId;
-        p.ts = nowMs();
+        p.ts = loong::chat::nowMs();
 
-        const std::string& lo = sender < targetUser ? sender : targetUser;
-        const std::string& hi = sender < targetUser ? targetUser : sender;
-        std::string key;
-        key.reserve(lo.size() + hi.size() + 1);
-        key.append(lo).push_back('|');
-        key.append(hi);
-        produceKafkaAsync("chat_direct_topic", buildPersistJson(p), key);
+        // 排序拼接的逻辑在 loong::chat::directPartitionKey（有单测锁住「两方向同键」）。
+        produceKafkaAsync("chat_direct_topic", loong::chat::buildPersistJson(p),
+                          loong::chat::directPartitionKey(sender, targetUser));
     }
 
     // Kafka 落库开关的缓存值（缺省 false = fail-safe，见 .cc 里的说明）。
@@ -450,6 +474,11 @@ private:
     // 用原子量而不是 `static const`：后者只在首次调用时求值一次，
     // 于是「改 config.json 不生效、必须重启」—— 压测时切换落库开关很烦。
     static std::atomic<bool>& kafkaPersistenceEnabled() noexcept;
+
+    // 消息去重（客户端重发幂等）开关：读 custom_config.enable_message_dedup，
+    // 缺省 false。理由见 Core::dedupSeen 上方的注释 —— 默认开会让「key 填成房间名」
+    // 的既有客户端静默丢消息，方向性的错误不能靠默认值兜。
+    static std::atomic<bool>& messageDedupEnabled() noexcept;
 
     // 重读配置里的各个运行期开关。由构造函数与 5 秒定时任务调用。
     // 只覆盖【可以安全热更新】的开关；enable_cluster_bus 不在此列（见下）。
@@ -545,6 +574,14 @@ private:
         readEnvSize("LOONG_WS_DRAIN_BATCH", opt.drainBatch);
         readEnvSize("LOONG_WS_MAX_INFLIGHT", opt.maxInFlightDeliveries);
         readEnvSize("LOONG_WS_WORKER_SPIN_ROUNDS", opt.workerSpinRounds);
+        // 端到端延迟直方图的采样掩码（必须是 2^n - 1；0 = 关闭采样）。
+        // 用局部 size_t 中转：readEnvSize 的形参是 size_t&，而这里刻意用
+        // uint64_t 存掩码，直接传引用在 LP64 上能编过、但换平台就是隐患。
+        size_t sampleMask = static_cast<size_t>(opt.latencySampleMask);
+        if (readEnvSize("LOONG_WS_LATENCY_SAMPLE", sampleMask))
+        {
+            opt.latencySampleMask = sampleMask;
+        }
         return opt;
     }
 
@@ -555,7 +592,7 @@ private:
     // 把 RoomRegistry 的房间侧快照与扇出分组计数推送到 Prometheus registry。
     // 由 5 秒定时任务驱动：/metrics 抓取时就不必再去加房间表的锁，
     // 代价是最多 5 秒的滞后（gauge 类指标可以接受；counter 看增量也不受影响）。
-    static void publishRoomMetrics(const Core& core);
+    static void publishRoomMetrics(Core& core);
 
     // 把 KafkaManager 的投递失败 / 日志抑制计数拉进 Prometheus registry。
     //
@@ -564,6 +601,18 @@ private:
     // 直接拖慢 poll；而 kafka-core 是独立编译的静态库，不该依赖上层的指标单例。
     // 每 5 秒拉一次既解耦又零热路径成本，代价是最多 5 秒滞后（counter 看增量无碍）。
     static void publishKafkaMetrics();
+
+    // 把 RoomRegistry 的延迟采样出口接到 Prometheus registry。
+    //
+    // 为什么单独一个函数（而不是在构造函数里直接写 lambda）：那需要在本头文件里
+    // include utils/PrometheusMetrics.h，而后者又 include TbbCoroutinePool.h ——
+    // 一个 WebSocket 控制器头文件不该把 TBB 也拖进来。定义放在 .cc 里，
+    // 头文件只留一个声明。
+    static void installLatencySink(Core& core);
+
+    // 清理去重表里过期的条目（TTL = Core::kDedupTtlMs）。由 5 秒定时任务驱动。
+    // 去重关闭时表恒为空，本函数立即返回。
+    static void sweepDedupTable(Core& core);
 
     // 全局唯一消息序号。
     //

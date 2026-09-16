@@ -58,6 +58,18 @@ public:
         wsDroppedMessages_.fetch_add(count, std::memory_order_relaxed);
     }
 
+    // 被识别为【客户端重发】而不再广播/落库的消息数（幂等去重命中）。
+    //
+    // 为什么必须单独计数：这条路径是「静默吞掉一条消息」，从房间其他人视角
+    // 看不出任何异常，从客户端视角也只会看到一条正常的回显。
+    // 若没有这个数，两种完全相反的情况无法区分：
+    //   · 客户端在正常重试（该数涨、房间消息数不涨）—— 属于设计预期；
+    //   · 客户端把 key 复用成了非唯一值（该数暴涨、用户报告「消息发不出去」）
+    //     —— 那是误判，要立刻关掉 custom_config.enable_message_dedup。
+    void recordWsMessageDeduped(uint64_t count = 1) {
+        wsMessagesDeduped_.fetch_add(count, std::memory_order_relaxed);
+    }
+
     // 因 TBB 协程池饱和而被丢弃的 Kafka 持久化次数。
     //
     // 与 recordWsMessageDropped() 的区别：这条消息【已经投递给订阅者了】，
@@ -178,11 +190,38 @@ public:
     void setRoomStats(uint64_t rooms,
                       uint64_t shards,
                       uint64_t subscribers,
-                      uint64_t maxRoomSubscribers) {
+                      uint64_t maxRoomSubscribers,
+                      uint64_t queuedMessages = 0,
+                      uint64_t maxRoomBacklog = 0) {
         wsRoomsActive_.store(rooms, std::memory_order_relaxed);
         wsRoomShards_.store(shards, std::memory_order_relaxed);
         wsRoomSubscribers_.store(subscribers, std::memory_order_relaxed);
         wsRoomMaxSubscribers_.store(maxRoomSubscribers, std::memory_order_relaxed);
+        wsRoomQueued_.store(queuedMessages, std::memory_order_relaxed);
+        wsRoomMaxBacklog_.store(maxRoomBacklog, std::memory_order_relaxed);
+    }
+
+    // 端到端扇出延迟的一个样本（纳秒）。
+    //
+    // 由 RoomRegistry 通过注入的回调在【目标 IO loop 上】调用，因此：
+    //   · 必须便宜：一次除法 + 线性扫描 ≤11 个边界 + 3 个原子加。实测远低于
+    //     它要测量的那段路径本身（一次跨线程唤醒就是微秒级）。
+    //   · 必须无锁：多个 IO loop 并发调用，且不能阻塞 loop。
+    //
+    // 桶是【非累计】存储、导出时才累计：按 Prometheus 的累计语义直接存，
+    // 每来一个样本就要写「所有 ≥ 它的桶」，代价 O(桶数) 而不是 O(1)。
+    void recordFanoutLatencyNanos(uint64_t nanos) {
+        const uint64_t us = nanos / 1000;
+        size_t i = 0;
+        while (i < kFanoutLatencyBucketCount && us > kFanoutLatencyBoundsUs[i]) {
+            ++i;
+        }
+        // i == kFanoutLatencyBucketCount ⇒ 落在 +Inf 桶里，只需要计入 count/sum
+        if (i < kFanoutLatencyBucketCount) {
+            wsFanoutLatencyBuckets_[i].fetch_add(1, std::memory_order_relaxed);
+        }
+        wsFanoutLatencySumUs_.fetch_add(us, std::memory_order_relaxed);
+        wsFanoutLatencyCount_.fetch_add(1, std::memory_order_relaxed);
     }
 
     // 扇出分组效果（A1 优化的效果观测，同样由 5 秒定时任务推送）。
@@ -227,8 +266,9 @@ public:
     // 为什么必须有：开关现在支持热更新，那就必须能看见「此刻到底是开还是关」——
     // 否则又回到「改了配置到底生效没有」的盲区（原实现是 static const，
     // 只在首次调用求值一次，改配置永远不生效且没有任何提示）。
-    void setSwitchStates(bool kafkaPersistence) {
+    void setSwitchStates(bool kafkaPersistence, bool messageDedup = false) {
         wsKafkaPersistenceEnabled_.store(kafkaPersistence ? 1 : 0, std::memory_order_relaxed);
+        wsMessageDedupEnabled_.store(messageDedup ? 1 : 0, std::memory_order_relaxed);
     }
 
     // ── Kafka 投递失败与日志抑制（由 5 秒定时任务从 KafkaManager 拉取）──────
@@ -284,6 +324,12 @@ public:
            << "# HELP ws_messages_dropped_total WebSocket messages refused by the server (room shard backlog or private-delivery backpressure).\n"
            << "# TYPE ws_messages_dropped_total counter\n"
            << "ws_messages_dropped_total " << wsDroppedMessages_.load(std::memory_order_relaxed) << "\n\n"
+           << "# HELP ws_messages_deduped_total Messages recognised as client retries and therefore not re-broadcast (idempotency dedup). Expected to grow slowly; a sharp rise means a client is reusing a non-unique key.\n"
+           << "# TYPE ws_messages_deduped_total counter\n"
+           << "ws_messages_deduped_total " << wsMessagesDeduped_.load(std::memory_order_relaxed) << "\n"
+           << "# HELP ws_message_dedup_enabled Effective value of custom_config.enable_message_dedup (hot-reloaded every 5s).\n"
+           << "# TYPE ws_message_dedup_enabled gauge\n"
+           << "ws_message_dedup_enabled " << wsMessageDedupEnabled_.load(std::memory_order_relaxed) << "\n"
            << "# HELP ws_direct_backpressured_total Private-chat delivery slots skipped because the in-flight cap was reached (reason breakdown of ws_messages_dropped_total).\n"
            << "# TYPE ws_direct_backpressured_total counter\n"
            << "ws_direct_backpressured_total " << wsDirectBackpressured_.load(std::memory_order_relaxed) << "\n\n"
@@ -339,7 +385,13 @@ public:
            << "ws_room_subscribers_total " << wsRoomSubscribers_.load(std::memory_order_relaxed) << "\n"
            << "# HELP ws_room_max_subscribers Subscriber count of the largest room (fanout cost driver).\n"
            << "# TYPE ws_room_max_subscribers gauge\n"
-           << "ws_room_max_subscribers " << wsRoomMaxSubscribers_.load(std::memory_order_relaxed) << "\n\n";
+           << "ws_room_max_subscribers " << wsRoomMaxSubscribers_.load(std::memory_order_relaxed) << "\n"
+           << "# HELP ws_room_queued_messages Messages sitting in room shard queues at the last 5s sample, summed over all rooms (gauge). Sustained growth means the drainers cannot keep up.\n"
+           << "# TYPE ws_room_queued_messages gauge\n"
+           << "ws_room_queued_messages " << wsRoomQueued_.load(std::memory_order_relaxed) << "\n"
+           << "# HELP ws_room_max_backlog Backlog of the single most backed-up room at the last 5s sample (gauge). Compare with the per-shard cap (LOONG_WS_BACKLOG_PER_SHARD): approaching it means the next publish to that room gets refused. NOTE: instantaneous sample, so a short burst can be missed - cross-check ws_messages_dropped_total. NOTE: with inline fanout (the default, no LOONG_WS_FANOUT_THREADS) the publisher drains its own shard, so this stays near 0 by construction; the signals there are ws_messages_dropped_total and the right tail of ws_fanout_latency_us.\n"
+           << "# TYPE ws_room_max_backlog gauge\n"
+           << "ws_room_max_backlog " << wsRoomMaxBacklog_.load(std::memory_order_relaxed) << "\n\n";
 
         // 扇出分组效果（A1）。两个都是 counter：看增量，不看绝对值。
         // 健康形态：crossthread_batches 增量 ≈ 消息数 × IO线程数，远小于
@@ -371,6 +423,41 @@ public:
            << "# HELP ws_fanout_inflight_rejected_total Publishes rejected because the global in-flight delivery cap was reached.\n"
            << "# TYPE ws_fanout_inflight_rejected_total counter\n"
            << "ws_fanout_inflight_rejected_total " << wsFanoutInflightRejected_.load(std::memory_order_relaxed) << "\n\n";
+
+        // ── 端到端扇出延迟直方图（C1）───────────────────────────────────────────
+        //
+        // 量的是【服务端可观测】的那一段：publish 被调用 → 目标 loop 把这一批字节
+        // 交给 drogon 的发送路径。刻意【不】量「客户端收到」—— 那个数把服务端排队、
+        // 网络传输、客户端 JS 卡顿揉成一个数，慢了也不知道该查谁。
+        //
+        // 单位是微秒而不是秒：这条路径的正常值在个位数微秒到几百微秒之间，
+        // 用秒会把所有桶压成 0.000xxx，读起来毫无分辨率。名字里带 _us 避免歧义。
+        //
+        // ⚠️ 按【批次】计数而非按消息：一个房间的订阅者分散在 K 个 IO loop 上时，
+        //    一条消息会产生 K 个样本（每个 loop 一个）。好处是「某个 loop 特别慢」
+        //    会直接体现在右尾；代价是 count ≠ 消息数。看分位数不受影响。
+        //
+        // 采样率见 RoomRegistry::Options::latencySampleMask（默认 1/64）；
+        // 未采样的消息不进统计，因此 count 是「采样到的批次数」而不是消息数。
+        ss << "# HELP ws_fanout_latency_us Publish-to-socket-write latency per fanout batch, in microseconds (sampled; see ws_fanout_latency_sampled_total).\n"
+           << "# TYPE ws_fanout_latency_us histogram\n";
+        {
+            uint64_t cumulative = 0;
+            for (size_t i = 0; i < kFanoutLatencyBucketCount; ++i)
+            {
+                cumulative += wsFanoutLatencyBuckets_[i].load(std::memory_order_relaxed);
+                ss << "ws_fanout_latency_us_bucket{le=\"" << kFanoutLatencyBoundsUs[i] << "\"} "
+                   << cumulative << "\n";
+            }
+            const uint64_t sampled = wsFanoutLatencyCount_.load(std::memory_order_relaxed);
+            ss << "ws_fanout_latency_us_bucket{le=\"+Inf\"} " << sampled << "\n"
+               << "ws_fanout_latency_us_sum "
+               << wsFanoutLatencySumUs_.load(std::memory_order_relaxed) << "\n"
+               << "ws_fanout_latency_us_count " << sampled << "\n"
+               << "# HELP ws_fanout_latency_sampled_total Batches that entered the latency histogram (1/N of all batches; N is the sampling mask).\n"
+               << "# TYPE ws_fanout_latency_sampled_total counter\n"
+               << "ws_fanout_latency_sampled_total " << sampled << "\n\n";
+        }
 
         // HTTP 度量
         ss << "# HELP http_requests_total Total HTTP requests handled.\n"
@@ -414,6 +501,8 @@ private:
     std::atomic<int64_t> wsOnlineConnections_{0};
     std::atomic<uint64_t> wsTotalMessages_{0};
     std::atomic<uint64_t> wsDroppedMessages_{0};
+    std::atomic<uint64_t> wsMessagesDeduped_{0};
+    std::atomic<uint64_t> wsMessageDedupEnabled_{0};
     std::atomic<uint64_t> wsDirectBackpressured_{0};
     std::atomic<uint64_t> wsKafkaPersistDropped_{0};
     std::atomic<uint64_t> wsKafkaProduceFailed_{0};
@@ -432,6 +521,8 @@ private:
     std::atomic<uint64_t> wsRoomShards_{0};
     std::atomic<uint64_t> wsRoomSubscribers_{0};
     std::atomic<uint64_t> wsRoomMaxSubscribers_{0};
+    std::atomic<uint64_t> wsRoomQueued_{0};
+    std::atomic<uint64_t> wsRoomMaxBacklog_{0};
     std::atomic<uint64_t> wsFanoutInLoop_{0};
     std::atomic<uint64_t> wsFanoutCrossThread_{0};
     std::atomic<uint64_t> wsFanoutCrossThreadDeliveries_{0};
@@ -439,6 +530,19 @@ private:
     std::atomic<uint64_t> wsFanoutInflight_{0};
     std::atomic<uint64_t> wsFanoutInflightLimit_{0};
     std::atomic<uint64_t> wsFanoutInflightRejected_{0};
+
+    // 端到端扇出延迟直方图（微秒桶）。见 recordFanoutLatencyNanos。
+    //
+    // 桶边界为什么这样选：本机实测 publish 调用本身约 115 ns、一次跨线程唤醒
+    // 在微秒级，正常值落在 1~50 µs；所以边界从 10 µs 起密集铺开，右端一直铺到
+    // 50 ms（那已经是「下游明显堵了」的量级）。第一档 <10 µs 与最后一档 >50 ms
+    // 分别兜住两端。
+    static constexpr size_t kFanoutLatencyBucketCount = 11;
+    static constexpr uint64_t kFanoutLatencyBoundsUs[kFanoutLatencyBucketCount] = {
+        10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 50000};
+    std::atomic<uint64_t> wsFanoutLatencyBuckets_[kFanoutLatencyBucketCount]{};
+    std::atomic<uint64_t> wsFanoutLatencySumUs_{0};
+    std::atomic<uint64_t> wsFanoutLatencyCount_{0};
 };
 
 } // namespace Metrics

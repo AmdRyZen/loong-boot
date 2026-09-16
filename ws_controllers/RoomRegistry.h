@@ -68,6 +68,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -175,6 +176,13 @@ class RoomRegistryT
     // shared_ptr 的 deleter 在 RoomRegistry 内部构造时就已类型擦除。
     using RoomHandle = std::shared_ptr<Room>;
 
+    // 端到端延迟样本的出口（由宿主注入，见 setLatencySink）。
+    //
+    // 为什么用回调而不是直接引用指标单例：本模板要能被【不链接 drogon / 不链接
+    // 指标代码】的单测实例化（test_room_registry.cc 就是如此）。注册表只管
+    // 「量到了多少纳秒」，怎么上报是宿主的事。
+    using LatencySink = std::function<void(uint64_t nanos)>;
+
     struct Options
     {
         // 单房间最大分片槽位数 = 单房间最大并行扇出度。
@@ -230,6 +238,20 @@ class RoomRegistryT
         // 原先是 workerLoop() 里的 constexpr，调参要重新编译；提到这里后可经
         // LOONG_WS_WORKER_SPIN_ROUNDS 覆盖，便于压测 A/B。
         size_t workerSpinRounds = 4000;
+
+        // ── 端到端延迟直方图的采样掩码 ────────────────────────────────────────
+        //
+        // 语义：掩码为 2^n - 1 时，每 2^n 条 publish 采样一条；0 = 完全关闭采样。
+        // 只接受 2^n - 1（用位与代替取模，取模在热路径上是一次真正的除法）。
+        //
+        // 为什么要采样而不是全量：一次 steady_clock::now() 实测 16.83 ns，
+        // 而发布热路径里 publish 调用本身约 115 ns —— 每条都取时间戳等于直接
+        // 多付 ~15% 的发布开销。1/64 采样后摊薄到 ~0.26 ns（+0.2%），
+        // 而 p50/p99 这类分位数用 1/64 的样本估算是完全够的。
+        //
+        // 默认开（1/64）：这是唯一能回答「消息到底慢在哪一段」的指标，默认关闭
+        // 等于永远没人打开。要 A/B 掉这 0.2% 就用 LOONG_WS_LATENCY_SAMPLE=0。
+        uint64_t latencySampleMask = 63;
     };
 
     explicit RoomRegistryT(Options opt = Options{}) : opt_(opt)
@@ -251,6 +273,24 @@ class RoomRegistryT
             // 0 会让 worker 完全不自旋、立刻落眠 —— 那是配置错误而不是意图，
             // 因为每次唤醒都要走一次 futex。按默认值兜底。
             opt_.workerSpinRounds = 4000;
+        }
+
+        if (opt_.latencySampleMask != 0)
+        {
+            // 掩码必须是 2^n - 1（用位与代替取模，取模在热路径上是一次真除法）。
+            // 传了别的值就向下取到最近的 2^n - 1 —— 静默纠偏好过让采样率变成一个
+            // 谁也算不清的数（例如 100 会给出周期 20 的怪节奏，反而更贵）。
+            uint64_t filled = opt_.latencySampleMask;
+            filled |= filled >> 1;
+            filled |= filled >> 2;
+            filled |= filled >> 4;
+            filled |= filled >> 8;
+            filled |= filled >> 16;
+            filled |= filled >> 32;
+            if (filled != opt_.latencySampleMask)
+            {
+                opt_.latencySampleMask = filled >> 1;
+            }
         }
 
         // 没有线程池就谈不上并行扇出，分片数强制收敛为 1，避免白付分片记账开销
@@ -544,6 +584,23 @@ class RoomRegistryT
         {
             *outSeq = 0;
         }
+
+        // ── 端到端延迟的起点（未采样时恒为 0）──────────────────────────────────
+        //
+        // 采样点刻意放在【最前面】：它度量的是「调用方把消息交给注册表」到
+        // 「目标 loop 真的把字节写进 socket」之间的全部时间 —— 在途上限判定、
+        // 房间表查找、分片排队、跨线程唤醒、目标 loop 排队，全都算在内。
+        // 只从 drain 开始量的话，最需要被看见的「排队等待」恰好被排除在外。
+        //
+        // 采样决定本身也要便宜：一次 relaxed fetch_add（实测 1.59 ns）+ 位与。
+        // 掩码为 0 时连 fetch_add 都不做 —— 关掉采样就是零开销。
+        uint64_t t0ns = 0;
+        if (opt_.latencySampleMask != 0 && *latencySinkHolder_ &&
+            (latencyCounter_.fetch_add(1, std::memory_order_relaxed) & opt_.latencySampleMask) == 0)
+        {
+            t0ns = nowNanosSteady();
+        }
+
         // ── 全局在途投递上限：唯一能感知「下游已堵死」的背压信号 ───────────────
         //
         // 放在最前面（房间表锁之前）：该判定完全不依赖房间状态，提前拒绝更便宜。
@@ -628,7 +685,7 @@ class RoomRegistryT
                             dropped_.fetch_add(1, std::memory_order_relaxed);
                             return false;
                         }
-                        sh->queue.push_back(payload);
+                        sh->queue.push_back(QueuedMessage{payload, t0ns});
                         // 门铃：仅在「空闲 → 忙」跳变时入池，热点分片不会每条消息都惊动线程池。
                         // exchange 与 drain 的 busy=false 都在分片锁内完成，不会丢唤醒。
                         if (!sh->busy.exchange(true, std::memory_order_acq_rel))
@@ -677,7 +734,7 @@ class RoomRegistryT
                     }
                     const std::shared_ptr<Shard>& sh = r->shards[i];
                     std::lock_guard shardLock(sh->mtx);
-                    sh->queue.push_back(payload);
+                    sh->queue.push_back(QueuedMessage{payload, t0ns});
                     // 门铃：仅在「空闲 → 忙」跳变时入池，热点分片不会每条消息都惊动线程池。
                     // exchange 与 drain 的 busy=false 都在分片锁内完成，不会丢唤醒。
                     if (!sh->busy.exchange(true, std::memory_order_acq_rel))
@@ -775,6 +832,9 @@ class RoomRegistryT
         size_t shards = 0;             // 全体房间的「非空分片」总数
         size_t subscribers = 0;        // 全体房间的订阅者总数
         size_t maxRoomSubscribers = 0; // 最大单房间订阅者数（扇出成本的关键指标）
+        size_t queuedMessages = 0;     // 全体房间的分片队列积压总条数
+        size_t maxRoomBacklog = 0;     // 单房间最大积压条数（该房间所有分片之和）
+        std::string worstRoom;         // 上面对应的房间名（仅用于日志）
     };
 
     Stats stats() const
@@ -784,13 +844,43 @@ class RoomRegistryT
         s.rooms = rooms_.size();
         for (const auto& [name, r] : rooms_)
         {
-            (void)name;
             s.shards += r->nonEmptyShards.load(std::memory_order_relaxed);
             const size_t n = r->subCount.load(std::memory_order_relaxed);
             s.subscribers += n;
             if (n > s.maxRoomSubscribers)
             {
                 s.maxRoomSubscribers = n;
+            }
+
+            // ── 积压深度（C2「慢消费者 / 慢房间」定位）─────────────────────────
+            //
+            // 为什么必须看这个数：分片队列的深度是【服务端唯一能自己观察到的】
+            // 「下游消费不过来」的信号。drogon 公开的 WebSocketConnection 上
+            // 既没有 bufferedAmount 也没有高水位回调（已核实），所以
+            // 「某个连接的发包缓冲区满了」这件事在服务端是看不到的 ——
+            // 能看到的只有「它所在的 loop / 分片开始积压」。
+            //
+            // 代价：逐分片加一次锁。本函数 5 秒才跑一次，且分片数 = 活跃房间数
+            // 量级，完全可忽略。
+            //
+            // 锁序安全性：本函数已持有 roomsMtx_（共享）再取分片锁，而代码里
+            // 没有任何路径「持有分片锁再去取 roomsMtx_」（publish 是
+            // pubMtx → 分片锁；drainShard 只取分片锁），故不成环。
+            size_t backlog = 0;
+            for (const auto& sh : r->shards)
+            {
+                if (!sh)
+                {
+                    continue; // 空槽位（惰性创建，见 Room::shards 注释）
+                }
+                std::lock_guard shardLock(sh->mtx);
+                backlog += sh->queue.size();
+            }
+            s.queuedMessages += backlog;
+            if (backlog > s.maxRoomBacklog)
+            {
+                s.maxRoomBacklog = backlog;
+                s.worstRoom = name;
             }
         }
         return s;
@@ -846,6 +936,15 @@ class RoomRegistryT
         return inflightRejected_.load(std::memory_order_relaxed);
     }
 
+    // 注入端到端延迟的出口。未注入 ⇒ 完全不采样（Options::latencySampleMask 失效）。
+    //
+    // 语义：整块替换（不是「追加一个监听者」）。已经在目标 loop 队列里的批次
+    // 仍持有旧的 shared_ptr，因此替换不会让在途样本丢失，也不会与读方竞争。
+    void setLatencySink(LatencySink sink)
+    {
+        latencySinkHolder_ = std::make_shared<LatencySink>(std::move(sink));
+    }
+
   private:
     struct Entry
     {
@@ -867,12 +966,27 @@ class RoomRegistryT
     // 分组后的投递计划（只读，扇出热路径直接遍历）
     using Snapshot = std::vector<Group>;
 
+    // 分片队列里的一条消息。
+    //
+    // 为什么不是裸 shared_ptr：端到端延迟要在【目标 loop 真的执行到这一批】时
+    // 才知道终点，而起点在 publish。时间戳必须跟着消息走过「分片队列 → drain →
+    // loop 队列 → 执行」这一整条路，只能挂在队列元素上。
+    //
+    // t0ns == 0 表示这条【未被采样】：下游据此跳过统计。
+    // 这条约束不是可选的 —— 若把 0 当成真实时间戳，now - 0 会得到一个
+    // 「1970 年发布」的天文数字，全部落进 +Inf 桶，直方图直接被污染。
+    struct QueuedMessage
+    {
+        std::shared_ptr<const std::string> payload;
+        uint64_t t0ns = 0;
+    };
+
     struct Shard
     {
         // 一把锁同时保护 queue / snap / busy 的写入。
         // 扇出（send）刻意放在锁外，因此不会阻塞发布方入队。
         std::mutex mtx;
-        std::deque<std::shared_ptr<const std::string>> queue;
+        std::deque<QueuedMessage> queue;
         // copy-on-write 快照：扇出线程每条消息只拷贝一次 shared_ptr，无 O(N) 引用计数风暴
         std::shared_ptr<const Snapshot> snap = std::make_shared<const Snapshot>();
         std::atomic<bool> busy{false};
@@ -1154,6 +1268,7 @@ class RoomRegistryT
         for (;;)
         {
             std::shared_ptr<const std::string> payload;
+            uint64_t t0ns = 0;
             std::shared_ptr<const Snapshot> snap;
             bool requeue = false;
             {
@@ -1164,7 +1279,8 @@ class RoomRegistryT
                     sh->busy.store(false, std::memory_order_release);
                     return;
                 }
-                payload = std::move(sh->queue.front());
+                payload = std::move(sh->queue.front().payload);
+                t0ns = sh->queue.front().t0ns;
                 sh->queue.pop_front();
                 snap = sh->snap;
                 if (yielding && ++processed >= opt_.drainBatch && !sh->queue.empty())
@@ -1176,7 +1292,7 @@ class RoomRegistryT
             // 先投递本条，再决定是否让出 worker —— 顺序不能颠倒，否则本条会被丢掉
             try
             {
-                fanOutToSnapshot(*snap, payload);
+                fanOutToSnapshot(*snap, payload, t0ns);
             }
             catch (...)
             {
@@ -1217,13 +1333,45 @@ class RoomRegistryT
         }
     }
 
+    // 单调时钟（纳秒）。用 steady_clock 而不是 system_clock：
+    // 延迟是「两个时刻之差」，system_clock 会被 NTP 校时 / 手动改钟推动，
+    // 差值可能为负或凭空多出几秒。t0 与终点必须来自同一个钟。
+    static uint64_t nowNanosSteady() noexcept
+    {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count());
+    }
+
+    // 记录一个延迟样本。sink 按值传入（shared_ptr），因此本函数可以在
+    // 「已离开 registry 生命周期」的投递 lambda 里安全调用。
+    static void recordLatency(const std::shared_ptr<LatencySink>& sink, uint64_t t0ns) noexcept
+    {
+        if (t0ns == 0 || !sink || !*sink)
+        {
+            return;
+        }
+        try
+        {
+            const uint64_t now = nowNanosSteady();
+            // now < t0ns 只可能来自「同一毫秒内的时钟回退」之类的平台怪癖，
+            // 夹到 0 而不是让它回绕成天文数字（回绕会污染 +Inf 桶）。
+            (*sink)(now > t0ns ? now - t0ns : 0);
+        }
+        catch (...)
+        {
+            // 指标代码绝不能成为投递路径上的新异常源：这个 lambda 跑在目标 loop 上，
+            // 异常会直接穿进 trantor 的事件循环。
+        }
+    }
+
     // 真正的扇出：锁外执行。
     //
     // 逐组投递：命中本线程的组直接 send（零跨线程开销）；跨线程的组只唤醒一次、
     // 携带整批连接，实际 send 在目标 loop 的线程内完成 → 走 drogon/trantor 的
     // isInLoopThread() 快路径。唤醒次数由 O(订阅者数) 降为 O(目标 loop 数)。
-    void fanOutToSnapshot(const Snapshot& snap,
-                          const std::shared_ptr<const std::string>& payload) const
+    void fanOutToSnapshot(const Snapshot& snap, const std::shared_ptr<const std::string>& payload,
+                          uint64_t t0ns) const
     {
         for (const auto& g : snap)
         {
@@ -1252,6 +1400,7 @@ class RoomRegistryT
                     c->send(view);
                 }
                 inLoopDeliveries_.fetch_add(g.conns->size(), std::memory_order_relaxed);
+                recordLatency(latencySinkHolder_, t0ns);
                 continue;
             }
 
@@ -1264,16 +1413,30 @@ class RoomRegistryT
             // lambda 里减回去 —— 份数在派发时就确定，批次一旦入队必然整批执行。
             const size_t batch = g.conns->size();
             auto inFlight = inFlight_;
+            // 采样出口也按值捕获一份 shared_ptr。为什么不是捕获 this：
+            // 这个 lambda 会在【目标 loop 的队列里】多活一会儿，可能活过 registry
+            // 本身（退出时控制器先析构、队列里还有批次）—— 捕获 this 就是
+            // use-after-free。与 inFlight_ 同一手法，代价也一样（一次引用计数增减，
+            // 而 inFlight 本来就已经在付这笔钱）。
+            auto latencySink = latencySinkHolder_;
             inFlight->fetch_add(batch, std::memory_order_relaxed);
             try
             {
-                g.loop.dispatch([payload, conns = g.conns, inFlight, batch] {
+                g.loop.dispatch([payload, conns = g.conns, inFlight, batch, t0ns,
+                                 latencySink] {
                     const std::string_view view(*payload);
                     for (const auto& c : *conns)
                     {
                         c->send(view);
                     }
                     inFlight->fetch_sub(batch, std::memory_order_relaxed);
+                    // 终点在【这里】：本批字节已经交给 drogon 的发送路径。
+                    // 一个目标 loop 记一个样本 ⇒ 大房间（多 loop）会产出多个样本，
+                    // 直方图按「批次」而非「消息」加权。这是刻意的取舍：
+                    // 每条消息只记一次就得在多个 loop 之间做归并，而「哪个 loop 慢」
+                    // 恰恰是这套指标要回答的问题之一（慢 loop 的样本会更靠右）。
+                    // t0ns == 0（未采样）时 recordLatency 直接返回。
+                    recordLatency(latencySink, t0ns);
                 });
             }
             catch (...)
@@ -1358,6 +1521,16 @@ class RoomRegistryT
     // 两者的差额就是分片队列满（backlogPerShard）导致的拒绝。
     // 分开才能判断该调哪个阈值。
     mutable std::atomic<size_t> inflightRejected_{0};
+
+    // 端到端延迟的采样出口与采样计数器（见 Options::latencySampleMask）。
+    //
+    // 出口用 shared_ptr 持有而不是裸 std::function 成员：投递 lambda 会在目标 loop
+    // 的队列里多活一会儿、可能活过 registry 本身，按值捕获这个 shared_ptr 就自带
+    // 生命周期。mutable 是因为 fanOutToSnapshot 是 const 成员却要读它。
+    mutable std::shared_ptr<LatencySink> latencySinkHolder_ = std::make_shared<LatencySink>();
+    // 采样计数器：多个 IO 线程并发 publish，故用原子量。语义只是「大致每 N 条采
+    // 一条」，不要求精确，relaxed 足够（没有任何其他数据依赖它的顺序）。
+    std::atomic<uint64_t> latencyCounter_{0};
 };
 
 // 生产实例：drogon WebSocket 连接 + trantor 事件循环句柄
