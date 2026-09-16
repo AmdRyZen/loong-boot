@@ -698,6 +698,20 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
         subscriber->userName_ = userName;
         wsConn->setContext(subscriber);
 
+        // ── 连接级输出流控：装上 trantor 的高水位回调 ────────────────────────────
+        //
+        // 为什么必须动 drogon 下面那一层：WebSocketConnection::send 只是把帧塞进
+        // trantor 的 outputBuffer_，既没有上限也没有丢弃策略；房间背压、在途额度、
+        // 60 秒空闲驱逐这三层保护【都管不到这一层】。trantor 提供了
+        // setHighWaterMarkCallback，但 drogon 全工程从不调用它（lib/src 里零引用）
+        // —— 槽位是空的，所以只能由我们自己装。
+        //
+        // 怎么拿到 trantor::TcpConnection：drogon::HttpRequest::getConnectionPtr()
+        // 是公开 API，返回的就是 HttpServer 把连接升级成 WebSocket 时用的同一个
+        // 对象（HttpServer.cc: make_shared<WebSocketConnectionImpl>(conn)）。
+        // 实测（探针）：建连时该 weak_ptr 有效。
+        installConnectionHighWaterMark(*core_, req, subscriber);
+
         Metrics::PrometheusRegistry::instance().recordWsConnect();
 
         // 注册到房间注册表：分片直接持有连接指针，省掉 std::function 回调中转的开销。
@@ -738,7 +752,8 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
         // 取不到 loop 时（返回 nullptr）句柄按「本线程」处理，即回退到逐份直接 send，
         // 语义与优化前一致，只是没有加速，不会出错。
         subscriber->id_ = core_->roomRegistry.subscribe(
-            topic, wsConn, TrantorLoopHandle{trantor::EventLoop::getEventLoopOfCurrentThread()});
+            topic, wsConn, TrantorLoopHandle{trantor::EventLoop::getEventLoopOfCurrentThread()},
+            subscriber->gate);
 
         // 同一个 loop 句柄再缓存到 Subscriber 上：房间扇出已经按它分组，
         // 私聊直投也要用（见 Subscriber::loop_ 与 deliverDirectLocally）。
@@ -1461,12 +1476,144 @@ void ChatWebsocket::publishRoomMetrics(Core& core)
                      core.roomRegistry.crossThreadDeliveries());
     // 投递阶段异常计数（非 0 说明扇出过程中出过异常、当时那条消息未送达）
     m.setFanoutExceptions(core.roomRegistry.fanoutExceptions());
+    // 因目标连接闸门关着而【主动没喂】的份数。真正交给 drogon send() 的份数
+    // = ws_fanout_deliveries_total − 本值（deliveries 是入队份数，含被跳过的）。
+    m.setFanoutGatedDrops(core.roomRegistry.gatedDrops());
     // 全局在途投递份数（gauge）：唯一能看出「下游 loop 队列是否已堆满」的指标。
     // 配合 ws_fanout_inflight_limit 一起看 —— 只看当前值不知道离上限还有多远。
     // 持续贴近上限即说明消费端跟不上，此时 ws_messages_dropped_total 会开始上涨。
     m.setFanoutInflight(core.roomRegistry.inFlightDeliveries(),
                         core.roomRegistry.options().maxInFlightDeliveries,
                         core.roomRegistry.inflightRejectedCount());
+}
+
+void ChatWebsocket::installConnectionHighWaterMark(Core& core, const HttpRequestPtr& req,
+                                                   const std::shared_ptr<Subscriber>& sub)
+{
+    // connHwmBytes == 0 ⇒ 保护关闭（对照实验用）。老行为就是没有保护，所以直接返回。
+    if (core.connHwmBytes == 0 || !req || !sub)
+    {
+        return;
+    }
+
+    std::shared_ptr<trantor::TcpConnection> tcp;
+    try
+    {
+        tcp = req->getConnectionPtr().lock();
+    }
+    catch (...)
+    {
+        tcp = nullptr;
+    }
+    if (!tcp)
+    {
+        // 拿不到底层连接（drogon 版本差异 / 请求对象已回收）⇒ 退化为「没有保护」。
+        // 不能在这里抛：本函数在 handleNewConnection 的中途，抛出去会让这条连接
+        // 走 catch 分支被 forceClose —— 为了一层保护而拒绝服务是得不偿失的。
+        Metrics::PrometheusRegistry::instance().recordWsHwmInstallFailed();
+        LOG_WARN << "输出缓冲保护未装上（getConnectionPtr 失效），本连接退化为无上限缓冲";
+        return;
+    }
+
+    // 回调只捕获 weak_ptr：它会被连接对象长期持有，捕获 shared_ptr 会让 Subscriber
+    // 与连接互相引用成环（Subscriber 在 Core::userNameToConn 里，连接在 drogon 里）。
+    std::weak_ptr<Subscriber> weakSub(sub);
+    tcp->setHighWaterMarkCallback(
+        [weakSub](const trantor::TcpConnectionPtr&, size_t pending) {
+            auto s = weakSub.lock();
+            if (!s)
+            {
+                return; // 连接已注销
+            }
+            // 这个回调在饱和负载下会被每条帧触发（实测 60 秒 1381 万次），
+            // 所以下面全部是 relaxed 原子操作，没有锁、没有分配、没有日志。
+            //
+            // 置位闸门：扇出线程下一次读它就是「跳过这条连接」。
+            s->gate->store(1, std::memory_order_relaxed);
+            // 记时间戳：sweepConnectionFlow 靠「距上次触发多久」判断缓冲是否已回落。
+            s->lastCongestedNanos_.store(Subscriber::nowNanos(), std::memory_order_relaxed);
+            // 峰值取 max 用 CAS：普通 load+store 会把并发到达的更高值覆盖成更低值，
+            // 于是「观测到的峰值」可能低于真实峰值 —— 而这个数正是用来判断
+            // 「保护有没有生效、内存最坏能到多少」的。
+            uint64_t prev = s->peakPendingBytes_.load(std::memory_order_relaxed);
+            const auto cur = static_cast<uint64_t>(pending);
+            while (cur > prev && !s->peakPendingBytes_.compare_exchange_weak(
+                                     prev, cur, std::memory_order_relaxed))
+            {
+            }
+            // 全局计数与全局峰值（Registry 内部同样是 atomic，无锁无分配）。
+            Metrics::PrometheusRegistry::instance().recordWsConnHwmHit(cur);
+        },
+        core.connHwmBytes);
+}
+
+void ChatWebsocket::sweepConnectionFlow(Core& core)
+{
+    try
+    {
+        const auto now = Subscriber::nowNanos();
+        const auto clearNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::milliseconds(core.congestionClearMs))
+                                    .count();
+
+        // 与空闲驱逐同一手法：先在共享锁内拷出 (conn, sub) 快照，再在锁外判定。
+        // 判定完全不需要碰 WebSocketConnection 的 context —— 那些成员是非原子的。
+        std::vector<Session> snapshot;
+        {
+            std::shared_lock lock(core.connMutex);
+            snapshot.reserve(core.connCount.load(std::memory_order_relaxed));
+            for (const auto& [name, sessions] : core.userNameToConn)
+            {
+                (void)name;
+                snapshot.insert(snapshot.end(), sessions.begin(), sessions.end());
+            }
+        }
+
+        uint64_t congested = 0;
+        uint64_t cleared = 0;
+        uint64_t peak = 0;
+        for (const auto& s : snapshot)
+        {
+            if (!s.sub)
+            {
+                continue;
+            }
+            const auto p = s.sub->peakPendingBytes_.load(std::memory_order_relaxed);
+            if (p > peak)
+            {
+                peak = p;
+            }
+            if (s.sub->gate->load(std::memory_order_relaxed) == 0)
+            {
+                continue;
+            }
+            const auto last = s.sub->lastCongestedNanos_.load(std::memory_order_relaxed);
+            if (last != 0 && now - last > clearNanos)
+            {
+                // 距上次高水位触发已超过 congestionClearMs ⇒ 认为缓冲已降回水位
+                // 以下，开闸放行一批。若对端仍然跟不上，下一批 send 会立刻再次
+                // 触发回调把闸门关上 —— 这正是「拥塞连接每 clearAfterMs 放行一批」
+                // 的自限制行为，不会把它饿死，也不会让它无界积压。
+                s.sub->gate->store(0, std::memory_order_relaxed);
+                ++cleared;
+                continue;
+            }
+            ++congested;
+        }
+
+        auto& m = Metrics::PrometheusRegistry::instance();
+        m.setWsConnsCongested(congested);
+        m.setWsConnPeakPending(peak);
+        if (cleared != 0)
+        {
+            m.recordWsConnCongestionCleared(cleared);
+        }
+    }
+    catch (const std::exception& e)
+    {
+        Metrics::PrometheusRegistry::instance().recordWsHandlerException();
+        LOG_ERROR << "Error in sweepConnectionFlow: " << e.what();
+    }
 }
 
 void ChatWebsocket::publishKafkaMetrics()

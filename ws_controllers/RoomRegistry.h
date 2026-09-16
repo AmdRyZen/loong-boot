@@ -375,9 +375,14 @@ class RoomRegistryT
      *             生产代码应从【连接的 IO 线程】里取
      *             trantor::EventLoop::getEventLoopOfCurrentThread() 传入
      *             —— drogon 的 handleNewConnection 正是在该线程内同步调用的。
+     * @param gate 连接级投递闸门（见 Entry::gate）。nullptr = 永远投递；
+     *             传入后，闸门非 0 期间本连接会被扇出【跳过】并计入 gatedDrops()。
+     *             调用方负责把 shared_ptr 活得比订阅久（ChatWebsocket 放在
+     *             与连接同生命周期的 Subscriber 里）。
      * @return 订阅 ID，用于 unsubscribe
      */
-    SubscriberID subscribe(const std::string& room, ConnPtr conn, LoopH loop = LoopH{})
+    SubscriberID subscribe(const std::string& room, ConnPtr conn, LoopH loop = LoopH{},
+                           std::shared_ptr<std::atomic<uint8_t>> gate = nullptr)
     {
         // reshape 前的「等排空」不能持 pubMtx 做无界自旋 —— 那会阻塞该房间的
         // 全部 publish 与 unsubscribe（只要有一个分片长时间 busy，整个房间就卡住）。
@@ -433,7 +438,7 @@ class RoomRegistryT
 
                 // 走安全重建协议（见 reshapeLocked 注释）
                 const SubscriberID id = nextSubId_.fetch_add(1, std::memory_order_relaxed) + 1;
-                reshapeLocked(*r, want, Entry{id, conn, loop});
+                reshapeLocked(*r, want, Entry{id, conn, loop, gate});
                 r->subCount.store(after, std::memory_order_relaxed);
                 return id;
             }
@@ -454,7 +459,7 @@ class RoomRegistryT
             r->idToShard.reserve(r->idToShard.size() + 1);
             std::vector<Entry> nextBucket = r->dist[idx];
             nextBucket.reserve(r->dist[idx].size() + 1);
-            nextBucket.push_back(Entry{id, conn, loop});
+            nextBucket.push_back(Entry{id, conn, loop, gate});
             auto nextSnap = buildSnapshot(nextBucket); // 唯一可能抛异常的一步
 
             const bool wasEmpty = r->dist[idx].empty();
@@ -1128,6 +1133,26 @@ class RoomRegistryT
         return inflightRejected_.load(std::memory_order_relaxed);
     }
 
+    // 因【目标连接闸门关着】被跳过的投递份数（累计）。
+    //
+    // 与 droppedCount() 的区别（两者不可混算）：
+    //   droppedCount()  —— 消息在【被接受之前】就被拒了（分片背压 / 在途额度）。
+    //                      那条消息对【所有】订阅者都不存在。
+    //   gatedDrops()    —— 消息已被接受、也正常分配了 seq，只是【这一个订阅者】
+    //                      当前拥塞，服务端主动没喂给它。同一批里的其他订阅者照收。
+    //                      该订阅者会看到 seq 缺口，走既有 replay/sync_done 补齐。
+    //
+    // 判读：它是「本进程为了不让某个慢消费者的 socket 缓冲无界增长而主动放弃的帧数」。
+    // 持续增长 = 有客户端跟不上（该扩消费端或降低房间扇出），不是服务端故障。
+    //
+    // ⚠️ 与 ws_fanout_deliveries_total 的关系：那个计数是【入队份数】，包含这里
+    //    被跳过的份数（批次的份数在派发时就定了，收件人集合不可变）。
+    //    真正交给 drogon send() 的份数 = deliveries − gatedDrops。
+    size_t gatedDrops() const noexcept
+    {
+        return gatedDrops_->load(std::memory_order_relaxed);
+    }
+
     // 注入端到端延迟的出口。未注入 ⇒ 完全不采样（Options::latencySampleMask 失效）。
     //
     // 语义：整块替换（不是「追加一个监听者」）。已经在目标 loop 队列里的批次
@@ -1144,15 +1169,37 @@ class RoomRegistryT
         ConnPtr conn;
         // 该连接所属的事件循环（订阅时抓取，终身不变）
         LoopH loop{};
+
+        // ── 连接级投递闸门（2026-09-16）─────────────────────────────────────
+        //
+        // 语义：nullptr ⇒ 永远投递；非 nullptr 且 load() != 0 ⇒ 本连接当前拥塞，
+        // 扇出时【跳过】它，不调 send()，并计入 gatedDrops()。
+        //
+        // 为什么需要：drogon 的 WebSocketConnection::send 没有上限也没有丢弃策略，
+        // 写不出去的数据全部堆进 trantor 的 outputBuffer_。实测（10 连接回声压测）
+        // 单连接 pending 60 秒内从 262 KB 单调涨到 36.8 MB 且仍在涨，RSS 峰值 1.1 GB
+        // —— 房间背压 / 在途额度 / 60 秒空闲驱逐三层保护【都管不到这一层】。
+        //
+        // 为什么由调用方注入而不是注册表自己判：注册表拿不到 socket 状态，
+        // 只有上层（ChatWebsocket，在建连时能经 HttpRequest::getConnectionPtr()
+        // 拿到 trantor::TcpConnection）才装得上高水位回调。
+        // 注册表只负责「你说闸门关着，我就不喂」，不解释闸门为什么关着。
+        //
+        // 跨线程读的是 atomic ⇒ 与 fanOutToSnapshot 并发是安全的。
+        std::shared_ptr<std::atomic<uint8_t>> gate{};
     };
 
     // 投递计划的一个分组：同一 loop 上的若干连接。
     // conns 用 shared_ptr<const> 共享，扇出时每个跨线程批次只拷贝一个指针，
     // 不产生「按连接逐个拷贝」的开销。
+    //
+    // 元素类型是 Entry 而不是裸 ConnPtr：扇出要在 send 之前读该连接的闸门，
+    // 闸门挂在 Entry 上。Entry 只在订阅/退订/reshape 时被搬进快照（不在热路径上），
+    // 多带的 id/loop 两个字段是静态成本，换掉的是「热路径再去查一次表」。
     struct Group
     {
         LoopH loop;
-        std::shared_ptr<const std::vector<ConnPtr>> conns;
+        std::shared_ptr<const std::vector<Entry>> conns;
     };
 
     // 分组后的投递计划（只读，扇出热路径直接遍历）
@@ -1219,7 +1266,7 @@ class RoomRegistryT
     // 所以这里用线性查找而非哈希表 —— 避免每次重建都付一次哈希表构造成本。
     static std::shared_ptr<const Snapshot> buildSnapshot(const std::vector<Entry>& bucket)
     {
-        std::vector<std::pair<LoopH, std::vector<ConnPtr>>> tmp;
+        std::vector<std::pair<LoopH, std::vector<Entry>>> tmp;
         tmp.reserve(bucket.size() > 16 ? 16 : bucket.size());
         for (const auto& e : bucket)
         {
@@ -1231,18 +1278,18 @@ class RoomRegistryT
                                    [&e](const auto& p) { return p.first == e.loop; });
             if (it == tmp.end())
             {
-                tmp.emplace_back(e.loop, std::vector<ConnPtr>{});
+                tmp.emplace_back(e.loop, std::vector<Entry>{});
                 it = std::prev(tmp.end());
             }
-            it->second.push_back(e.conn);
+            it->second.push_back(e);
         }
 
         auto snap = std::make_shared<Snapshot>();
         snap->reserve(tmp.size());
-        for (auto& [loop, conns] : tmp)
+        for (auto& [loop, entries] : tmp)
         {
             snap->push_back(
-                Group{loop, std::make_shared<const std::vector<ConnPtr>>(std::move(conns))});
+                Group{loop, std::make_shared<const std::vector<Entry>>(std::move(entries))});
         }
         return snap;
     }
@@ -1698,6 +1745,16 @@ class RoomRegistryT
     // 逐组投递：命中本线程的组直接 send（零跨线程开销）；跨线程的组只唤醒一次、
     // 携带整批连接，实际 send 在目标 loop 的线程内完成 → 走 drogon/trantor 的
     // isInLoopThread() 快路径。唤醒次数由 O(订阅者数) 降为 O(目标 loop 数)。
+    // 闸门是否关着（关着 ⇒ 本次投递跳过，不调 send）。
+    //
+    // 抽成函数是为了让两处投递循环（直投分支 / loop 批次）写法完全一致 ——
+    // 这两处必须同语义，否则「有 loop 句柄」和「没 loop 句柄」会给出不同的投递结果。
+    // relaxed 足够：闸门只是一个「尽快生效」的提示位，不参与任何需要顺序的推理。
+    static bool isGated(const Entry& e) noexcept
+    {
+        return e.gate && e.gate->load(std::memory_order_relaxed) != 0;
+    }
+
     void fanOutToSnapshot(const Snapshot& snap, const std::shared_ptr<const std::string>& payload,
                           uint64_t t0ns) const
     {
@@ -1723,9 +1780,19 @@ class RoomRegistryT
             if (!g.loop.valid())
             {
                 const std::string_view view(*payload);
-                for (const auto& c : *g.conns)
+                size_t gated = 0;
+                for (const auto& e : *g.conns)
                 {
-                    c->send(view);
+                    if (isGated(e))
+                    {
+                        ++gated;
+                        continue;
+                    }
+                    e.conn->send(view);
+                }
+                if (gated != 0)
+                {
+                    gatedDrops_->fetch_add(gated, std::memory_order_relaxed);
                 }
                 inLoopDeliveries_.fetch_add(g.conns->size(), std::memory_order_relaxed);
                 recordLatency(latencySinkHolder_, t0ns);
@@ -1747,15 +1814,28 @@ class RoomRegistryT
             // use-after-free。与 inFlight_ 同一手法，代价也一样（一次引用计数增减，
             // 而 inFlight 本来就已经在付这笔钱）。
             auto latencySink = latencySinkHolder_;
+            // 闸门丢弃计数同样要能在批次执行时累加，而批次可能活过 registry 本身
+            // ⇒ 与 inFlight_ / latencySinkHolder_ 同一手法：按值捕获 shared_ptr。
+            auto gatedDrops = gatedDrops_;
             inFlight->fetch_add(batch, std::memory_order_relaxed);
             try
             {
                 g.loop.dispatch([payload, conns = g.conns, inFlight, batch, t0ns,
-                                 latencySink] {
+                                 latencySink, gatedDrops] {
                     const std::string_view view(*payload);
-                    for (const auto& c : *conns)
+                    size_t gated = 0;
+                    for (const auto& e : *conns)
                     {
-                        c->send(view);
+                        if (isGated(e))
+                        {
+                            ++gated;
+                            continue;
+                        }
+                        e.conn->send(view);
+                    }
+                    if (gated != 0)
+                    {
+                        gatedDrops->fetch_add(gated, std::memory_order_relaxed);
                     }
                     inFlight->fetch_sub(batch, std::memory_order_relaxed);
                     // 终点在【这里】：本批字节已经交给 drogon 的发送路径。
@@ -1861,6 +1941,14 @@ class RoomRegistryT
     // 两者的差额就是分片队列满（backlogPerShard）导致的拒绝。
     // 分开才能判断该调哪个阈值。
     mutable std::atomic<size_t> inflightRejected_{0};
+
+    // 因目标连接闸门关着而被跳过的投递份数（见 gatedDrops() 的语义说明）。
+    //
+    // 与 inFlight_ 同一手法用 shared_ptr<atomic>：投递批次在目标 loop 的队列里
+    // 执行时才会读到闸门状态并累加，那一刻 registry 可能已经析构。
+    // 注意方向与 inFlight_ 相反 —— 这个数只增不减，没有「派发失败要还回去」的问题。
+    mutable std::shared_ptr<std::atomic<size_t>> gatedDrops_{
+        std::make_shared<std::atomic<size_t>>(0)};
 
     // 端到端延迟的采样出口与采样计数器（见 Options::latencySampleMask）。
     //

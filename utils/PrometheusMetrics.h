@@ -248,6 +248,63 @@ public:
         wsFanoutExceptions_.store(count, std::memory_order_relaxed);
     }
 
+    // 因目标连接的输出缓冲闸门关着，扇出【主动没喂】的份数。
+    //
+    // 与 ws_messages_dropped_total 的区别（不可混算）：
+    //   那个是「消息被接受之前就被拒」—— 对所有订阅者都不存在；
+    //   这个是「消息已被接受、seq 已分配，只是这一个订阅者当前拥塞没喂」。
+    // 真正交给 drogon send() 的份数 = ws_fanout_deliveries_total − 本值
+    // （deliveries 是入队份数，含被跳过的那些）。
+    //
+    // 判读：持续增长 = 有客户端跟不上（该扩消费端 / 降扇出），不是服务端故障。
+    //       它会伴随该客户端看到 seq 缺口 —— 客户端按 seq 检测后走 replay 补齐。
+    void setFanoutGatedDrops(uint64_t count) {
+        wsFanoutGatedDrops_.store(count, std::memory_order_relaxed);
+    }
+
+    // 连接级输出缓冲保护的状态（见 ChatWebsocket::installConnectionHighWaterMark）。
+    //
+    // 为什么必须有一套：这层保护是唯一能限制「单连接待写缓冲」的东西 ——
+    // drogon 的 send 没有上限也没有丢弃策略，房间背压 / 在途额度 / 空闲驱逐
+    // 三层都管不到它。实测（10 连接回声压测）单连接 pending 60 秒内从 262 KB
+    // 单调涨到 36.8 MB 且仍在涨，RSS 峰值 1.1 GB。
+    //
+    // hits 是 counter：高水位回调的触发次数。注意它【不是】「多少条消息被保护」，
+    //   而是「缓冲越线期间又发生了一次 send」—— 饱和时每条帧都会触发
+    //   （实测 60 秒 1381 万次）。它涨得快只说明保护在生效、对端一直跟不上。
+    // peak 是 gauge：所有连接中观测到的最大待写缓冲字节数（各连接取峰值再取 max）。
+    //   这是回答「内存最坏能到多少」的直接证据；它应当稳定在阈值附近，
+    //   而不像修前那样随时间单调上涨。
+    // congested 是 gauge：当前闸门关着的连接数。持续 > 0 说明有慢消费者。
+    // cleared 是 counter：闸门自动重开的次数。健康形态是它随 congested 一起回落。
+    void recordWsConnHwmHit(uint64_t pendingBytes) {
+        wsConnHwmHits_.fetch_add(1, std::memory_order_relaxed);
+        // 全局峰值取 max 必须用 CAS：load+store 会把并发到达的更高值覆盖成更低值，
+        // 于是「最坏能到多少」这个数会偏小 —— 那正好是这套指标要回答的问题。
+        uint64_t prev = wsConnPeakPending_.load(std::memory_order_relaxed);
+        while (pendingBytes > prev && !wsConnPeakPending_.compare_exchange_weak(
+                                          prev, pendingBytes, std::memory_order_relaxed)) {
+        }
+    }
+
+    void recordWsConnCongestionCleared(uint64_t count = 1) {
+        wsConnCongestionCleared_.fetch_add(count, std::memory_order_relaxed);
+    }
+
+    void setWsConnsCongested(uint64_t count) {
+        wsConnsCongested_.store(count, std::memory_order_relaxed);
+    }
+
+    void setWsConnPeakPending(uint64_t bytes) {
+        wsConnPeakPending_.store(bytes, std::memory_order_relaxed);
+    }
+
+    // 高水位保护没能装上的连接数（getConnectionPtr() 拿不到底层 TcpConnection）。
+    // 非 0 说明这些连接退化为「无上限缓冲」的老行为，值得查 drogon 版本。
+    void recordWsHwmInstallFailed(uint64_t count = 1) {
+        wsHwmInstallFailed_.fetch_add(count, std::memory_order_relaxed);
+    }
+
     // 全局在途投递份数、配置上限、以及「因在途上限被拒」的累计次数。
     //
     // inflight / limit 是 gauge：这一对是唯一能直接看出「下游 loop 队列是不是已经
@@ -413,7 +470,25 @@ public:
            << "\n"
            << "# HELP ws_fanout_exceptions_total Exceptions caught inside the fanout drainer (message was not delivered; shard state was recovered).\n"
            << "# TYPE ws_fanout_exceptions_total counter\n"
-           << "ws_fanout_exceptions_total " << wsFanoutExceptions_.load(std::memory_order_relaxed) << "\n\n"
+           << "ws_fanout_exceptions_total " << wsFanoutExceptions_.load(std::memory_order_relaxed) << "\n"
+           << "# HELP ws_fanout_gated_drops_total Fanout deliveries skipped because the target connection's output buffer was above its high-water mark. The message WAS accepted and got a seq; only this one subscriber was not fed, so it will see a seq gap and recover via replay. Frames actually handed to send() = ws_fanout_deliveries_total - this.\n"
+           << "# TYPE ws_fanout_gated_drops_total counter\n"
+           << "ws_fanout_gated_drops_total " << wsFanoutGatedDrops_.load(std::memory_order_relaxed) << "\n\n"
+           << "# HELP ws_conn_hwm_hits_total Times the per-connection output high-water mark callback fired. Not a message count: while the buffer stays above the mark every send triggers it. A fast rise means the protection is working and the peer keeps falling behind.\n"
+           << "# TYPE ws_conn_hwm_hits_total counter\n"
+           << "ws_conn_hwm_hits_total " << wsConnHwmHits_.load(std::memory_order_relaxed) << "\n"
+           << "# HELP ws_conn_peak_pending_bytes Largest pending (unsent) output buffer observed across all connections, in bytes. This is the direct answer to 'how much memory can the output buffers reach'. It should sit near the high-water mark; before this protection existed it grew without bound (36.8 MB on a single connection in 60s).\n"
+           << "# TYPE ws_conn_peak_pending_bytes gauge\n"
+           << "ws_conn_peak_pending_bytes " << wsConnPeakPending_.load(std::memory_order_relaxed) << "\n"
+           << "# HELP ws_conns_congested Current number of connections whose output gate is closed (fanout is not feeding them).\n"
+           << "# TYPE ws_conns_congested gauge\n"
+           << "ws_conns_congested " << wsConnsCongested_.load(std::memory_order_relaxed) << "\n"
+           << "# HELP ws_conn_congestion_cleared_total Times a connection's output gate was reopened after its buffer fell back below the high-water mark.\n"
+           << "# TYPE ws_conn_congestion_cleared_total counter\n"
+           << "ws_conn_congestion_cleared_total " << wsConnCongestionCleared_.load(std::memory_order_relaxed) << "\n"
+           << "# HELP ws_hwm_install_failed_total Connections that could not be given output-buffer protection (getConnectionPtr() returned nothing). They fall back to unbounded buffering, i.e. the pre-fix behaviour.\n"
+           << "# TYPE ws_hwm_install_failed_total counter\n"
+           << "ws_hwm_install_failed_total " << wsHwmInstallFailed_.load(std::memory_order_relaxed) << "\n\n"
            << "# HELP ws_fanout_inflight_deliveries Deliveries dispatched into target IO-loop queues but not yet executed (gauge).\n"
            << "# TYPE ws_fanout_inflight_deliveries gauge\n"
            << "ws_fanout_inflight_deliveries " << wsFanoutInflight_.load(std::memory_order_relaxed) << "\n"
@@ -530,6 +605,12 @@ private:
     std::atomic<uint64_t> wsFanoutInflight_{0};
     std::atomic<uint64_t> wsFanoutInflightLimit_{0};
     std::atomic<uint64_t> wsFanoutInflightRejected_{0};
+    std::atomic<uint64_t> wsFanoutGatedDrops_{0};
+    std::atomic<uint64_t> wsConnHwmHits_{0};
+    std::atomic<uint64_t> wsConnPeakPending_{0};
+    std::atomic<uint64_t> wsConnsCongested_{0};
+    std::atomic<uint64_t> wsConnCongestionCleared_{0};
+    std::atomic<uint64_t> wsHwmInstallFailed_{0};
 
     // 端到端扇出延迟直方图（微秒桶）。见 recordFanoutLatencyNanos。
     //

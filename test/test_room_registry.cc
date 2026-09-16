@@ -1490,6 +1490,104 @@ static void testJournalReplay()
     }
 }
 
+// ── 15. 连接级投递闸门（拥塞跳过）──────────────────────────────────────────────
+//
+// 回归的是「每连接输出缓冲无界」这个缺陷的【服务端侧对策】：
+// 上层（ChatWebsocket）在建连时经 HttpRequest::getConnectionPtr() 拿到
+// trantor::TcpConnection 并装上高水位回调，越过阈值就把该连接的闸门关上；
+// 注册表在扇出时读到闸门关着就跳过它、不调 send()，并计入 gatedDrops()。
+//
+// 这里锁的是注册表这一侧的契约（高水位回调本身属于 drogon/trantor 集成，
+// 单测里没有真实 socket，只能由 e2e 覆盖）：
+//   ① 不传闸门（老调用方 / 默认参数）⇒ 行为与改动前逐字节一致；
+//   ② 闸门非 0 ⇒ 只跳过【那一条】连接，同一批次里其他订阅者照收；
+//   ③ 闸门归零 ⇒ 立刻恢复投递（闸门不是单向的，否则慢消费者会被永久饿死）；
+//   ④ 被跳过的份数单独计数，且【不计入】分片背压的 droppedCount()。
+static void testConnectionGate()
+{
+    std::printf("test: 连接级投递闸门（拥塞跳过）\n");
+
+    LoopState loop;
+    RegDynamic::Options opt;
+    opt.maxShards = 1;
+    opt.fanoutThreads = 0; // 内联扇出：发布线程直接投递，drain 一次即可判定
+
+    // ---- 15a~15d. 走 loop 批次分支（有 loop 句柄）----
+    {
+        RegDynamic reg(opt);
+
+        auto normal = std::make_shared<MockConn>();
+        auto gated = std::make_shared<MockConn>();
+        auto gate = std::make_shared<std::atomic<uint8_t>>(0);
+
+        const auto idNormal = reg.subscribe("g", normal, DynamicLoopHandle{&loop});
+        const auto idGated = reg.subscribe("g", gated, DynamicLoopHandle{&loop}, gate);
+
+        // ---- 15a. 闸门开着（=0）时两条都收 ----
+        reg.publish("g", std::string("m1"));
+        drainLoop(loop);
+        CHECK(snapshotOf(normal).size() == 1 && snapshotOf(gated).size() == 1,
+              "闸门为 0 时两条连接都收到消息");
+        CHECK(reg.gatedDrops() == 0, "没有闸门跳过时 gatedDrops 保持 0");
+
+        // ---- 15b. 关上闸门：只跳过那一条，另一条照收 ----
+        //
+        // 「只跳过那一条」是本用例的核心：闸门挂在 Entry 上而不是房间上，
+        // 关掉一条连接绝不能影响同房间的其他订阅者。
+        gate->store(1, std::memory_order_relaxed);
+        reg.publish("g", std::string("m2"));
+        reg.publish("g", std::string("m3"));
+        drainLoop(loop);
+        CHECK(snapshotOf(normal).size() == 3, "未被闸门挡住的连接继续收到全部消息");
+        CHECK(snapshotOf(gated).size() == 1, "被闸门挡住的连接一条都没收到");
+        CHECK(reg.gatedDrops() == 2, "被跳过的份数逐条计入 gatedDrops（2 条消息 × 1 条连接）");
+        // 口径必须分开：那条消息是被【接受】了的（分片队列没满、seq 也分配了），
+        // 只是这一个订阅者没喂。混进 droppedCount() 会让「服务端在丢消息」这个
+        // 判断失真 —— 实际上丢的只是某一个慢消费者的帧。
+        CHECK(reg.droppedCount() == 0, "闸门跳过【不算】分片背压丢弃（两者口径不同）");
+
+        // ---- 15c. 闸门归零 ⇒ 立刻恢复 ----
+        gate->store(0, std::memory_order_relaxed);
+        reg.publish("g", std::string("m4"));
+        drainLoop(loop);
+        CHECK(snapshotOf(gated).size() == 2, "闸门归零后立刻恢复投递（闸门不是单向的）");
+        CHECK(reg.gatedDrops() == 2, "恢复后不再累加跳过数");
+
+        // ---- 15d. 不传闸门（老签名 / 默认参数）行为不变 ----
+        auto plain = std::make_shared<MockConn>();
+        const auto idPlain = reg.subscribe("g", plain, DynamicLoopHandle{&loop});
+        gate->store(1, std::memory_order_relaxed);
+        reg.publish("g", std::string("m5"));
+        drainLoop(loop);
+        CHECK(snapshotOf(plain).size() == 1, "未提供闸门的订阅者永远收（nullptr = 不设闸门）");
+
+        reg.unsubscribe("g", idNormal);
+        reg.unsubscribe("g", idGated);
+        reg.unsubscribe("g", idPlain);
+    }
+
+    // ---- 15e. 无 loop 句柄（直投分支）必须同语义 ----
+    //
+    // 扇出有两处投递循环（!loop.valid() 的直投分支 / loop 批次）。
+    // 两处读闸门必须完全一致，否则「有 loop 句柄」与「没 loop 句柄」会给出
+    // 不同的投递结果 —— 而 loop 句柄只在取不到时才失效，属于线上会发生的情况。
+    {
+        RegDynamic reg(opt);
+        auto normal = std::make_shared<MockConn>();
+        auto gated = std::make_shared<MockConn>();
+        auto gate = std::make_shared<std::atomic<uint8_t>>(1); // 一上来就关着
+
+        reg.subscribe("g2", normal, DynamicLoopHandle{}); // 无效句柄 ⇒ 直投分支
+        reg.subscribe("g2", gated, DynamicLoopHandle{}, gate);
+
+        reg.publish("g2", std::string("d1"));
+        drainLoop(loop);
+        CHECK(snapshotOf(normal).size() == 1 && snapshotOf(gated).empty(),
+              "直投分支同样遵守闸门：关着的一条都不发");
+        CHECK(reg.gatedDrops() == 1, "直投分支的跳过同样被计数");
+    }
+}
+
 int main()
 {    testStrictOrdering(0, "线程池并行扇出");
     testStrictOrdering(1000000, "内联扇出");
@@ -1506,6 +1604,7 @@ int main()
     testInFlightCap();
     testRoomSeq();
     testJournalReplay();
+    testConnectionGate();
 
     std::printf("\n%s (failures=%d)\n", g_failures == 0 ? "ALL PASSED" : "FAILED", g_failures);
     return g_failures == 0 ? 0 : 1;

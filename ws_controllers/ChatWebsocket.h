@@ -55,7 +55,10 @@ public:
         // 或静态析构顺序与预期不同，也不会出现 use-after-free。
         // （原先捕获 this 且丢弃了 TimerId，退出阶段存在悬空访问窗口。）
         HttpAppFramework::instance().getLoop()->runEvery(5.0, [core = core_] {
+            // 空闲超时连接驱逐
             checkAndEvictIdleConnections(*core);
+            // 连接级输出流控：重开闸门 + 汇总拥塞状态
+            sweepConnectionFlow(*core);
             publishRoomMetrics(*core);
             publishKafkaMetrics();
             // 去重表 TTL 清理（去重关闭时表为空，立即返回）
@@ -147,6 +150,43 @@ private:
 
         std::atomic<int64_t> lastActiveNanos_{nowNanos()};
         std::atomic<int64_t> lastOverloadNoticeNanos_{0};
+
+        // ── 连接级输出流控（2026-09-16）────────────────────────────────────────
+        //
+        // 要解决的问题：drogon 的 WebSocketConnection::send 既没有上限也没有丢弃
+        // 策略，写不出去的数据全部堆进 trantor 的 outputBuffer_。实测（10 连接回声
+        // 压测，60 秒）单连接 pending 从 262 KB 单调涨到 36.8 MB 且仍在涨，RSS 峰值
+        // 1.1 GB —— 房间背压、在途额度、60 秒空闲驱逐这三层保护都管不到这一层。
+        //
+        // 修法：给每条连接一个闸门（gate），由 trantor 的高水位回调置位，扇出时
+        // 读到关着就跳过该连接（见 RoomRegistry::Entry::gate）。
+        //
+        // 为什么闸门放在 Subscriber 里、而不是 WebSocketConnection 的 context 里：
+        // 后者的 hasContext()/getContextRef() 读的是非原子成员（WebSocketConnection.h
+        // 的 contextPtr_），从扇出线程读属于 data race —— 这正是 Session 结构当初
+        // 要把 Subscriber 一起带上的原因。Subscriber 里这些字段都是原子量。
+        //
+        // 0 = 正常投递，非 0 = 拥塞跳过。用 uint8_t 而不是 bool：语义上它是一个
+        // 「闸门」，将来若要区分「拥塞」与「半开」不必改类型。
+        std::shared_ptr<std::atomic<uint8_t>> gate{
+            std::make_shared<std::atomic<uint8_t>>(0)};
+
+        // 高水位回调最近一次触发的时间（纳秒，steady_clock）。
+        //
+        // 回调只在「待写缓冲已越过水位」时被调用，所以
+        // 「距上次触发已超过 clearAfterMs」就是「已经降回水位以下」的代理信号 ——
+        // 我们拿不到缓冲大小，只能靠这个。
+        //
+        // ⚠️ 这个信号是【自限制】的，不是缺陷：闸门关着期间扇出不再调 send，
+        //    回调也就不再触发；超过 clearAfterMs 后闸门自动打开、放行一批；
+        //    若对端仍然跟不上，回调立刻再次触发、闸门重新关上。
+        //    净效果是「拥塞连接每 clearAfterMs 收到一批」——既不会饿死它，
+        //    也不会让它的缓冲无界增长。这正是我们想要的行为。
+        std::atomic<int64_t> lastCongestedNanos_{0};
+
+        // 本连接的待写缓冲观测到的峰值（字节）。由高水位回调直接给出 ——
+        // 回调的第二个参数就是 pending 字节数，比事后去问 socket 更准且零成本。
+        std::atomic<uint64_t> peakPendingBytes_{0};
     };
 
     // 一个在线会话：连接 + 它的 Subscriber。
@@ -174,6 +214,21 @@ private:
             {
                 maxDirectInFlight = v;
             }
+
+            // 连接级输出缓冲的高水位阈值。0 = 关闭整套保护（对照实验用：
+            // 关掉之后单连接待写缓冲会重新变成无界，见 ws_conn_peak_pending_bytes）。
+            size_t hwm = kDefaultConnHwmBytes;
+            if (readEnvSize("LOONG_WS_CONN_HWM_BYTES", hwm))
+            {
+                connHwmBytes = hwm;
+            }
+
+            // 闸门自动重开所需的安静时长（毫秒）。调大 ⇒ 拥塞连接被放行得更稀疏。
+            size_t clearMs = static_cast<size_t>(kDefaultCongestionClearMs);
+            if (readEnvSize("LOONG_WS_CONGESTION_CLEAR_MS", clearMs))
+            {
+                congestionClearMs = static_cast<int64_t>(clearMs);
+            }
         }
 
         // ── 私聊直投的全局在途投递额度 ─────────────────────────────────────────
@@ -197,6 +252,29 @@ private:
         // 与 RoomRegistry::inFlight_ 同一手法。指针构造后不再改指向。
         std::shared_ptr<std::atomic<size_t>> directInFlight{
             std::make_shared<std::atomic<size_t>>(0)};
+
+        // ── 连接级输出缓冲的「高水位」阈值（2026-09-16）───────────────────────
+        //
+        // 单条连接的待写缓冲（trantor::TcpConnection 的 outputBuffer_）越过这个
+        // 字节数即视为拥塞：扇出不再喂它，直到它降回水位以下。
+        //
+        // 为什么需要一个阈值而不是「有积压就丢」：正常的瞬时抖动（一次 GC、
+        // 一次网络重传）也会让缓冲短暂非空，按非空就丢会把健康连接也打成缺口。
+        // 4 MiB ≈ 4.6 万条 90 字节的帧 —— 一个跟得上的客户端永远不会接近它。
+        //
+        // 调大 = 更容忍突发、峰值内存更高；调小 = 更快保护内存、更容易给慢客户端
+        // 造成缺口（缺口由客户端按 seq 检测后走 replay/sync_done 补齐）。
+        // 设 0 或负数 = 关闭整套保护（回到「无界缓冲」的老行为，仅用于对照实验）。
+        static constexpr size_t kDefaultConnHwmBytes = 4u << 20; // 4 MiB
+        size_t connHwmBytes = kDefaultConnHwmBytes;
+
+        // 闸门自动重开所需的「安静时长」：距上次高水位触发超过它，就认为缓冲
+        // 已经降回水位以下，把闸门打开放行一批（见 Subscriber::lastCongestedNanos_）。
+        //
+        // 它同时决定了「拥塞连接多久被放行一次」，也就是保护生效时的最小投递速率。
+        // 1 秒是个保守值：既让慢客户端不至于完全饿死，又不给它积累缓冲的机会。
+        static constexpr int64_t kDefaultCongestionClearMs = 1000;
+        int64_t congestionClearMs = kDefaultCongestionClearMs;
 
         // 房间注册表：按订阅者分片 + 多核并行扇出，严格保序。
         // 取代了原先的 drogon::PubSubService（它单线程扇出，房间越大越慢）
@@ -671,6 +749,30 @@ private:
     // 下面两个都由 5 秒定时任务驱动，因此做成静态函数 + 显式传入 Core：
     // 定时器回调捕获的是 core_（shared_ptr），不依赖控制器的生命周期。
     static void checkAndEvictIdleConnections(Core& core);
+
+    // 连接级输出流控的「重开闸门 + 汇总」环节，由 5 秒定时任务驱动。
+    //
+    // 做两件事：
+    //   ① 把「距上次高水位触发已超过 congestionClearMs」的连接的闸门打开；
+    //   ② 汇总当前拥塞连接数（gauge）与各连接观测到的待写缓冲峰值。
+    //
+    // 为什么放在主循环的定时任务里、而不是每条连接一个定时器：一是连接数可能很大
+    // （每连接一个定时器 = 每秒 N 次唤醒），二是这里只需要读 Subscriber 里的
+    // 原子量 —— 绝对不能去碰 trantor::TcpConnection：它的 bytesSent_ 等成员是
+    // 非原子量，跨线程读属于 data race（Session 结构当初就是为躲这个才带上
+    // Subscriber 的）。闸门的置位由连接自己 IO 线程里的高水位回调完成。
+    //
+    // 代价：闸门重开最多滞后 5 秒（定时任务周期）。这与空闲驱逐同一量级，
+    // 对「慢客户端」这个场景完全够用 —— 它在拥塞期间本来就收不到实时消息。
+    static void sweepConnectionFlow(Core& core);
+
+    // 给一条刚建立的连接装上「待写缓冲高水位」保护：越过 core.connHwmBytes 就把该
+    // 连接的闸门关上，扇出随即停止喂它（见 RoomRegistry::Entry::gate）。
+    //
+    // 拿不到底层 TcpConnection 时只记一个计数并返回 —— 绝不能因此拒绝这条连接，
+    // 因为「没有保护」本来就是改动前的行为，退化到它是安全的。
+    static void installConnectionHighWaterMark(Core& core, const HttpRequestPtr& req,
+                                               const std::shared_ptr<Subscriber>& sub);
 
     // 把 RoomRegistry 的房间侧快照与扇出分组计数推送到 Prometheus registry。
     // 由 5 秒定时任务驱动：/metrics 抓取时就不必再去加房间表的锁，
