@@ -557,6 +557,13 @@ class RoomRegistryT
                 roomSeqWatermark_.clear();
             }
             roomSeqWatermark_[room] = r->seq;
+
+            // 日志也要活过这次回收（见 retainJournalLocked）。
+            // 搬运发生在 roomsMtx_ 独占锁内，publish 热路径完全不受影响。
+            if (opt_.journalCap != 0 && !r->journal.empty())
+            {
+                retainJournalLocked(room, std::move(r->journal));
+            }
         }
     }
 
@@ -916,7 +923,10 @@ class RoomRegistryT
             const auto it = rooms_.find(room);
             if (it == rooms_.end())
             {
-                return out; // 房间不存在（或已因无人订阅而回收）⇒ 无日志可回放
+                // 房间不存在：可能从未建过，也可能【刚被回收】。后者要查暂存区 ——
+                // 重连时房间往往正是空的（客户端自己就是最后离开的那个）。
+                // 注意这里仍持有 roomsMtx_，replayFromRetained 依赖这一点。
+                return replayFromRetained(room, sinceSeq);
             }
             r = it->second;
         }
@@ -1194,8 +1204,11 @@ class RoomRegistryT
         // 房间消息日志（回放源，见 Options::journalCap）。
         //
         // 与 seq 同一把 pubMtx 保护 ⇒ 「日志里的先后」与「序号的先后」恒一致。
-        // 房间被回收（最后一个订阅者离开）时日志随之销毁 —— 空房间没有订阅者，
-        // 也就没有客户端需要补齐。
+        //
+        // 生命周期：房间被回收时日志会被【搬运】到 roomJournals_ 而不是销毁，
+        // 同名房间重建时再搬回来（见 retainJournalLocked 的说明）。
+        // 原实现随 Room 一起销毁，于是「房间空过一轮」就等于「老客户端必然报 206」——
+        // 而房间空掉最常见的原因恰恰是「客户端自己就是最后一个离开的人」。
         std::deque<JournalEntry> journal;
     };
 
@@ -1296,9 +1309,126 @@ class RoomRegistryT
             r->seq = wit->second;
             roomSeqWatermark_.erase(wit);
         }
+        // 把上次回收时暂存的日志搬回来（取出即从暂存区移除，避免两份）。
+        if (const auto jit = roomJournals_.find(room); jit != roomJournals_.end())
+        {
+            r->journal = std::move(jit->second);
+            roomJournals_.erase(jit);
+            forgetJournalOrderLocked(room);
+        }
         // shards/dist 刻意留空：首次订阅时由 reshapeLocked 按规模一次性建好
         rooms_[room] = r;
         return r;
+    }
+
+    // ── 回放日志暂存区（房间回收后仍可回放）──────────────────────────────────
+    //
+    // 房间被回收时日志搬到这里（而不是销毁），同名房间重建时搬回去。目的只有一个：
+    // 「房间里没人了」是重连场景里最常见的一种，若日志随 Room 一起销毁，
+    // 它的游标只能拿到 206 —— 明明服务端还留着内容。
+    //
+    // 为什么不用 Redis / Kafka 做这件事：回放的消费者是【刚重连的客户端】，
+    // 要的是秒级窗口；存档是 Kafka 的事（而且默认关）。引入「聊天要 Redis 才能补齐」
+    // 的硬依赖不划算。对外的口子只有 replay() 一个，将来要换实现也只换这几个函数。
+    //
+    // ⚠️ 调用约定：retain/forget/evict 都【必须】在持有 roomsMtx_ 独占锁时调用；
+    //    replayFromRetained 只读，持共享锁即可（replay 就是那样调它的）。
+    void retainJournalLocked(const std::string& room, std::deque<JournalEntry>&& j)
+    {
+        if (const auto old = roomJournals_.find(room); old != roomJournals_.end())
+        {
+            journalRetainedEntries_ -= old->second.size();
+            old->second = std::move(j);
+            journalRetainedEntries_ += old->second.size();
+        }
+        else
+        {
+            journalRetainedEntries_ += j.size();
+            roomJournals_.emplace(room, std::move(j));
+            journalOrder_.push_back(room);
+        }
+        while ((roomJournals_.size() > kMaxJournalRooms ||
+                journalRetainedEntries_ > kMaxJournalEntries) &&
+               !journalOrder_.empty())
+        {
+            evictOldestJournalLocked();
+        }
+    }
+
+    // FIFO 淘汰最久未被回收的一个房间。用插入序而不是 LRU：少维护一个时间戳，
+    // 而且「最久没被回收过」的房间本来就是最不可能被重连的。
+    void evictOldestJournalLocked()
+    {
+        const std::string& victim = journalOrder_.front();
+        if (const auto it = roomJournals_.find(victim); it != roomJournals_.end())
+        {
+            journalRetainedEntries_ -= it->second.size();
+            roomJournals_.erase(it);
+        }
+        journalOrder_.pop_front();
+    }
+
+    void forgetJournalOrderLocked(const std::string& room)
+    {
+        for (auto it = journalOrder_.begin(); it != journalOrder_.end(); ++it)
+        {
+            if (*it == room)
+            {
+                journalOrder_.erase(it);
+                return;
+            }
+        }
+    }
+
+    // 房间当前不在 rooms_ 里时的回放：唯一的来源是暂存区。
+    // ⚠️ 调用方必须已持有 roomsMtx_（共享锁即可，本函数只读）。
+    ReplayResult replayFromRetained(const std::string& room, uint64_t sinceSeq) const
+    {
+        ReplayResult out;
+        const auto it = roomJournals_.find(room);
+        if (it == roomJournals_.end())
+        {
+            // 连暂存区都没有：房间从未建过，或暂存条目已被 FIFO 淘汰。
+            // 无从判断客户端是否落后（连 maxSeq 都不知道），只能如实报「不完整」。
+            out.reset = (sinceSeq != 0);
+            return out;
+        }
+        const auto& j = it->second;
+        out.maxSeq = j.empty() ? 0 : j.back().seq;
+        // 序号水位线比日志末尾更权威：日志只留最近 journalCap 条，
+        // 房间在回收前可能已经发过更多。
+        if (const auto wit = roomSeqWatermark_.find(room); wit != roomSeqWatermark_.end())
+        {
+            out.maxSeq = std::max(out.maxSeq, wit->second);
+        }
+        if (sinceSeq == 0)
+        {
+            return out; // 没有游标：不回放（与房间存在时的语义一致）
+        }
+        if (j.empty())
+        {
+            out.reset = (sinceSeq < out.maxSeq); // 与 replay() 的判据保持一致
+            return out;
+        }
+        out.oldestSeq = j.front().seq;
+        if (sinceSeq + 1 < out.oldestSeq)
+        {
+            out.reset = true;
+        }
+        if (sinceSeq > out.maxSeq)
+        {
+            out.reset = true;
+            return out;
+        }
+        out.entries.reserve(j.size());
+        for (const auto& e : j)
+        {
+            if (e.seq > sinceSeq)
+            {
+                out.entries.push_back(e);
+            }
+        }
+        return out;
     }
 
     // 分片数随房间规模阶梯增长：1 / 2 / 4 / ... / maxShards。
@@ -1679,6 +1809,18 @@ class RoomRegistryT
     // 不影响任何消息投递语义。宁可这样，也不要让一个诊断设施变成内存泄漏。
     static constexpr size_t kMaxSeqWatermarks = 1 << 16;
     phmap::flat_hash_map<std::string, uint64_t> roomSeqWatermark_;
+
+    // 已回收房间的回放日志暂存区（见 retainJournalLocked）。
+    //
+    // 两道上限都要有：房间数限制「多少个房间占位」，条目总数限制「最坏内存」。
+    // 每条 JournalEntry 持一个 shared_ptr，payload 本体（~120B 的字符串）也一直活着，
+    // 所以按条目算：65536 条 ≈ 10MB 量级 —— 这是可接受的最坏值，
+    // 而实际远低于此（只有「回收时还留着日志」的房间才占位）。
+    static constexpr size_t kMaxJournalRooms = 4096;
+    static constexpr size_t kMaxJournalEntries = 1 << 16;
+    phmap::flat_hash_map<std::string, std::deque<JournalEntry>> roomJournals_;
+    std::deque<std::string> journalOrder_; // 插入序，供 FIFO 淘汰
+    size_t journalRetainedEntries_ = 0;
 
     std::mutex poolMtx_;
     std::condition_variable poolCv_;

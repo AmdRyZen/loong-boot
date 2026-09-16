@@ -607,9 +607,10 @@
         // 每个房间记住「我已经看到哪个序号了」，重连时把它报回服务端补齐缺口。
         // 存 localStorage 而不是内存：刷新页面 / 重开标签页同样算断线。
         //
-        // ⚠️ 序号是【每实例】的。重连落到另一个实例时游标空间对不上，服务端会在
-        //    sync_done 里用 code 206 明确告知，客户端据此提示「可能有消息缺失」——
-        //    不假装补齐成功。
+        // ⚠️ 序号是【每实例】的。所以游标存的是 { instance, seq } —— 光有 seq
+        //    说明不了任何事：带着 A 实例的 500 连到 B 实例（才发到 20），
+        //    服务端只能给一个看不出原因的 206。带上归属实例后，服务端能直接说
+        //    「你的游标来自另一实例，那段补不了」，客户端也不必假装补齐成功。
         const CURSOR_PREFIX = 'loong.chat.cursor.';
         const MAX_SEND_ATTEMPTS = 4;
 
@@ -617,18 +618,23 @@
             return CURSOR_PREFIX + room;
         }
 
+        // 返回 { instance, seq }。兼容旧格式（以前只存了一个裸数字）。
         function loadCursor(room) {
             try {
-                return parseInt(localStorage.getItem(cursorKey(room)) || '0', 10) || 0;
+                const raw = localStorage.getItem(cursorKey(room));
+                if (!raw) return { instance: '', seq: 0 };
+                if (raw[0] !== '{') return { instance: '', seq: parseInt(raw, 10) || 0 };
+                const v = JSON.parse(raw);
+                return { instance: v.instance || '', seq: Number(v.seq) || 0 };
             } catch (e) {
-                return 0; // 隐私模式下 localStorage 可能直接抛
+                return { instance: '', seq: 0 }; // 隐私模式下 localStorage 可能直接抛
             }
         }
 
-        function saveCursor(room, seq) {
+        function saveCursor(room, instance, seq) {
             if (!seq) return;
             try {
-                localStorage.setItem(cursorKey(room), String(seq));
+                localStorage.setItem(cursorKey(room), JSON.stringify({ instance: instance || '', seq }));
             } catch (e) {
                 // 存不下不影响正确性：游标只影响「下次重连能否精确补齐」
             }
@@ -649,6 +655,9 @@
         // 本地游标的内存副本。localStorage 是同步 API，逐条消息都去读它没必要；
         // 这里只在前进时写回。
         let lastSeqSeen = 0;
+        // 当前连着的服务实例（由 sync_done 告知）。游标要和它一起存 ——
+        // 换了实例，之前那个 seq 就不再可比（见上面的说明）。
+        let serverInstance = '';
 
         function handleAck(ack) {
             const p = pendingAcks.get(ack.requestId);
@@ -701,8 +710,10 @@
         function handleSyncDone(done) {
             const room = document.getElementById('roomName').value.trim();
             // 先落游标：它代表「此刻房间里最大的序号」，比缓冲里任何一条都新。
+            // 服务端给的实例标识一并记下 —— 游标只在同一个实例内可比。
+            if (done.instance) serverInstance = done.instance;
             lastSeqSeen = done.seq || lastSeqSeen;
-            saveCursor(room, done.seq);
+            saveCursor(room, serverInstance, done.seq);
             syncing = false;
 
             const buf = syncBuffer;
@@ -813,9 +824,15 @@
                 // 补齐期间到达的帧会被缓冲到 sync_done 再应用（见 handleSyncDone）。
                 syncing = true;
                 syncBuffer = [];
-                lastSeqSeen = loadCursor(room);
+                const cur = loadCursor(room);
+                serverInstance = cur.instance;
+                lastSeqSeen = cur.seq;
                 try {
-                    ws.send(JSON.stringify({ action: 'sync', sinceSeq: loadCursor(room) }));
+                    ws.send(JSON.stringify({
+                        action: 'sync',
+                        sinceSeq: cur.seq,
+                        sinceInstance: cur.instance
+                    }));
                 } catch (e) {
                     syncing = false; // 发不出去就别一直缓冲
                 }
@@ -919,7 +936,7 @@
                 // 推进本地游标：只前进、不后退（补齐回放可能带来较小的 seq）。
                 if (data.seq > lastSeqSeen) {
                     lastSeqSeen = data.seq;
-                    saveCursor(document.getElementById('roomName').value.trim(), data.seq);
+                    saveCursor(document.getElementById('roomName').value.trim(), serverInstance, data.seq);
                 }
 
                 const myName = document.getElementById('userName').value.trim();

@@ -168,7 +168,7 @@ void ChatWebsocket::produceKafkaAsync(std::string_view topicName, std::string_vi
             //
             // 刻意用函数内静态量而不是实例成员：produceKafkaAsync 是 static 成员函数拿不到实例；
             // 且「落库失败」是全局事件，跨 topic 共享一个窗口正是想要的语义。
-            static loong::log::RateLimiter failLogLimiter{1000};
+            static loong::log::RateLimiter failLogLimiter{1000, "kafka.persist_failed"};
 
             // 两条失败路径共用同一个限流器 —— 否则它们各自限流、合起来仍可能被冲垮。
             // 必须在 allow() 返回 true 之后才调 takeSuppressed()（见 RateLimitedLog.h）。
@@ -1144,7 +1144,7 @@ void ChatWebsocket::initClusterBus()
                             // 其他实例的版本不兼容 / 载荷被截断时，本实例
                             // 表现为「莫名收不到消息」，没有任何可查的痕迹。
                             Metrics::PrometheusRegistry::instance().recordClusterPacketDropped();
-                            static loong::log::RateLimiter badPacketLimiter{1000};
+                            static loong::log::RateLimiter badPacketLimiter{1000, "cluster.bad_packet"};
                             if (badPacketLimiter.allow())
                             {
                                 LOG_WARN << "Cluster bus packet parse failed, dropped "
@@ -1191,7 +1191,7 @@ void ChatWebsocket::initClusterBus()
                         // 既无日志也无计数，属于纯盲区。
                         Metrics::PrometheusRegistry::instance().recordClusterPacketDropped();
                         Metrics::PrometheusRegistry::instance().recordWsHandlerException();
-                        static loong::log::RateLimiter inboundErrLimiter{1000};
+                        static loong::log::RateLimiter inboundErrLimiter{1000, "cluster.inbound_error"};
                         if (inboundErrLimiter.allow())
                         {
                             LOG_ERROR << "Cluster bus inbound handling failed: " << e.what()
@@ -1262,7 +1262,7 @@ void ChatWebsocket::checkClusterRoomSeq(Core& core, const std::string& originIns
         // 缺口：中间有 (roomSeq - last - 1) 条从该来源发往该房间的消息没到达本实例。
         const uint64_t lost = roomSeq - last - 1;
         Metrics::PrometheusRegistry::instance().recordClusterSeqGap(lost);
-        static loong::log::RateLimiter gapLimiter{1000};
+        static loong::log::RateLimiter gapLimiter{1000, "cluster.seq_gap"};
         if (gapLimiter.allow())
         {
             LOG_WARN << "Cluster room seq gap from " << originInstId << " room " << room << ": saw "
@@ -1278,7 +1278,7 @@ void ChatWebsocket::checkClusterRoomSeq(Core& core, const std::string& originIns
         // 回退：同一来源的消息乱序到达（或总线重复投递）。重复投递无害（客户端
         // 可凭 msg id 去重），乱序则会让两侧订阅者看到不同顺序 —— 都值得计数。
         Metrics::PrometheusRegistry::instance().recordClusterOutOfOrder();
-        static loong::log::RateLimiter oooLimiter{1000};
+        static loong::log::RateLimiter oooLimiter{1000, "cluster.seq_regression"};
         if (oooLimiter.allow())
         {
             LOG_WARN << "Cluster room seq regression from " << originInstId << " room " << room
@@ -1334,7 +1334,7 @@ void ChatWebsocket::publishToCluster(const Core& core, const std::string& topic,
                 // 问题，只是这次发生在集群路径上。计数不受日志轮转影响，
                 // 是判断「跨实例投递是否在工作」的唯一可靠信号。
                 Metrics::PrometheusRegistry::instance().recordClusterPublishFailed();
-                static loong::log::RateLimiter publishErrLimiter{1000};
+                static loong::log::RateLimiter publishErrLimiter{1000, "cluster.publish_error"};
                 if (publishErrLimiter.allow())
                 {
                     LOG_ERROR << "Redis publish error: " << e.what() << " ("
@@ -1553,7 +1553,15 @@ void ChatWebsocket::handleSync(Core& core, const WebSocketConnectionPtr& wsConn,
 {
     // 语义边界（哪些情况算「补齐了」、哪些算「补不齐」）全部由 RoomRegistry::replay
     // 判定，这里只负责搬运 + 告知。不在这一层重复实现判定逻辑 —— 那是两处真相。
-    const auto rr = core.roomRegistry.replay(room, dto.sinceSeq);
+    //
+    // 先处理「游标不属于本实例」：房间序号是【每实例】的，客户端带着 A 实例的
+    // seq=500 连到 B 实例（B 才发到 20），直接拿去比只会得到一句含糊的
+    // 「游标超出可回放范围」。这里改成按「无游标」回放（不回放，免得拿错序号空间
+    // 乱补），并在 sync_done 里说清原因 —— 仍然是 206，因为那一段确实补不齐。
+    const bool foreignCursor =
+        dto.sinceSeq != 0 && !dto.sinceInstance.empty() && dto.sinceInstance != core.instanceId;
+    const uint64_t cursor = foreignCursor ? 0 : dto.sinceSeq;
+    const auto rr = core.roomRegistry.replay(room, cursor);
 
     size_t sent = 0;
     for (const auto& e : rr.entries)
@@ -1582,17 +1590,52 @@ void ChatWebsocket::handleSync(Core& core, const WebSocketConnectionPtr& wsConn,
     // 那种时候静默回一个 200 会让客户端永远不知道自己缺了消息 —— 这正是
     // 「静默丢失」这一类缺陷里最难查的一种。
     chatMessageVo done{};
-    done.code = rr.reset ? 206 : 200;
+    done.code = (rr.reset || foreignCursor) ? 206 : 200;
     done.name = room;
     done.seq = rr.maxSeq;
     done.type = "sync_done";
-    done.message = rr.reset ? std::format("已补 {} 条；游标 {} 超出可回放范围，中间可能有消息缺失",
-                                          sent, dto.sinceSeq)
-                            : std::format("已补 {} 条", sent);
+    done.instance = core.instanceId;
+    if (foreignCursor)
+    {
+        // 换实例的场景：本实例补齐不了另一实例序号空间里的那一段。
+        // 仍报 206（确实不是完整补齐），但把原因说清楚，并把游标重置到本实例。
+        done.message = std::format("游标来自另一实例（{}），本实例无法补齐那一段；"
+                                   "游标已重置到本实例的 {}",
+                                   dto.sinceInstance, rr.maxSeq);
+    }
+    else if (rr.reset)
+    {
+        done.message = std::format("已补 {} 条；游标 {} 超出可回放范围，中间可能有消息缺失",
+                                   sent, dto.sinceSeq);
+    }
+    else
+    {
+        done.message = std::format("已补 {} 条", sent);
+    }
 
     std::string doneJson{};
     (void)glz::write_json(done, doneJson);
     wsConn->send(doneJson, WebSocketMessageType::Text);
+}
+
+void ChatWebsocket::flushRateLimiterTails()
+{
+    // 限流器把「被压掉的条数」挂在计数器上，等下一次放行时由那一行日志带走。
+    // 但**突发结束之后就没有下一次放行了** —— 尾数会永久留在计数器里，
+    // 既没有日志也没有指标，等于静默丢失（实测 179 次丢弃只留 1 行、且写的是
+    // `1 occurrence(s)`）。这里每 5 秒把非 0 的尾数取出来补成一行。
+    //
+    // 为什么用 LOG_WARN 而不是 LOG_INFO：被限流的都是 ERROR/WARN 级的真错误，
+    // 尾数冲刷是它们的「迟到汇总」，在默认日志级别（WARN）下必须可见 ——
+    // 否则修这个 bug 就白修了。
+    //
+    // 有界性：每个限流器每 5 秒最多补一行，且只在计数非 0 时输出。
+    // 稳态下（限流器一直在放行）尾数早已被正常日志带走，这里什么都不输出。
+    for (const auto& tail : loong::log::takeAllSuppressed())
+    {
+        LOG_WARN << "[ratelimit] " << tail.label << " 被抑制 " << tail.count
+                 << " 次未输出（突发已结束，此处补报；该计数已清零）";
+    }
 }
 
 void ChatWebsocket::sweepDedupTable(Core& core)

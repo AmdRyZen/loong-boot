@@ -51,7 +51,7 @@ std::optional<std::string> checkloginUtils::checklogin(const drogon::HttpRequest
         // 触发频率由客户端决定：乱发 token 就能让每个请求写一行 ERROR。
         // 是真错误（鉴权失败）所以不静默，但必须限流。
         // 函数内 static：inline 函数保证全程序一份实例。
-        static loong::log::RateLimiter limiter{1000};
+        static loong::log::RateLimiter limiter{1000, "auth.checklogin_error"};
         if (limiter.allow())
         {
             LOG_ERROR << "checklogin err = " << e.what() << " login: "

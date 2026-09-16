@@ -62,6 +62,8 @@ public:
             sweepDedupTable(*core);
             // 开关热更新：改 config.json 不必重启进程（见 reloadSwitches 注释）
             reloadSwitches();
+            // 限流日志的尾数冲刷（突发结束后不会再有任何「下一次放行」）
+            flushRateLimiterTails();
         });
 
         // 初始化 Redis 分布式集群网关总线
@@ -365,6 +367,15 @@ private:
         // 仅 action == "sync" 时使用：客户端已见到的最大房间序号。
         // 0 = 没有游标（服务端不回放，见 RoomRegistry::replay 的说明）。
         uint64_t sinceSeq = 0;
+
+        // 上面那个游标【属于哪个实例】。服务端据此判断它还有没有意义。
+        //
+        // 为什么必须有：房间序号是【每实例】的（见 chatMessageVo::seq 的说明）。
+        // 客户端在 A 实例上看到 seq=500，重连落到 B 实例时 B 可能才发到 20 ——
+        // 拿 500 去比只会得到一句看不出原因的 206（「游标超出可回放范围」），
+        // 而真正的原因是「你换了台机器，这两个数没有关系」。
+        // 空 = 老客户端 / 首次连接（此时按 sinceSeq 的语义处理）。
+        std::string sinceInstance;
     };
 
     // 客户端可见的消息 VO。刻意保持最小：落库/回放需要的上下文在下面的
@@ -410,6 +421,16 @@ private:
         // type == "ack" 时才有意义：原样回传客户端请求里的 requestId，
         // 让客户端把回执与本地那条待确认消息对上号。
         std::string requestId;
+
+        // ── B4：实例标识（只出现在 sync_done 里）──────────────────────────────
+        //
+        // 告诉客户端「你现在连的是哪个实例」。客户端把游标与它一起存：
+        // 下次重连若落到别的实例，游标空间就对不上 —— 客户端会连归属实例一起报回来，
+        // 服务端便能给出准确原因而不是含糊的 206。
+        //
+        // 只加在 sync_done 上、不加在每条消息上：它是个长字符串
+        //（inst_PID_纳秒），每条消息都带会把线格式撑胖 —— 同上面的 type 字段。
+        std::string instance;
     };
 
     // ── Kafka 落库信封 ──────────────────────────────────────────────────────
@@ -694,6 +715,13 @@ private:
     // 去重关闭时表恒为空，本函数立即返回。
     static void sweepDedupTable(Core& core);
 
+    // 冲刷所有日志限流器的「尾数」。由 5 秒定时任务驱动。
+    //
+    // 限流器的设计是「被压掉的条数由下一次放行的那一行日志带走」，但突发结束后
+    // 就不会再有下一次放行 —— 尾数会永远留在计数器里，既没日志也没指标，等于
+    // 静默丢失（实测 179 次丢弃只留 1 行）。这里周期性把非 0 的尾数补出来。
+    static void flushRateLimiterTails();
+
     // 全局唯一消息序号。
     //
     // 原实现是 `static std::atomic<uint64_t> seq{0}; fetch_add(1)+1` —— 纯进程内
@@ -721,8 +749,8 @@ private:
     // 它们都是真错误、不能静默，但必须限流。被压掉的次数会在下一次输出里
     // 一并带上（见 RateLimiter::takeSuppressed），信息不丢。
     // 判读总量仍看 counter：ws_messages_dropped_total / ws_json_parse_errors_total。
-    loong::log::RateLimiter overloadLogLimiter_{1000};
-    loong::log::RateLimiter jsonParseErrorLogLimiter_{1000};
+    loong::log::RateLimiter overloadLogLimiter_{1000, "ws.overload_notice"};
+    loong::log::RateLimiter jsonParseErrorLogLimiter_{1000, "ws.json_parse_error"};
 
     // 把 room 内的消息投递到本地房间（+ 集群总线 + Kafka 持久化，后两者按需开启）
     // 返回 false 表示「任一分片积压达上限 → 整条消息未入队」（调用方需计数并告知客户端）

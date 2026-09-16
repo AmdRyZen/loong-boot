@@ -212,6 +212,35 @@ console.log('B4 · 断线补齐');
   const hist = b2.inbox.filter(isMsg);
   ok(hist.length === 0 && done3.code === 200, `sinceSeq=0 → 不回放历史（实际回放 ${hist.length} 条）`);
 
+  // ── #3 游标按实例作用域：换了实例必须给出准确原因 ──
+  //
+  // 房间序号是【每实例】的：带着 A 实例的游标连到 B 实例，这两个数没有关系。
+  // 服务端必须 ① 不回放（免得拿错序号空间乱补）② 如实报 206
+  // ③ 说清是「另一实例」而不是含糊的「超出可回放范围」—— 后者会把人引向
+  // 「日志容量太小」这个错误方向（实际根因是换了台机器）。
+  const myInstance = done.instance;
+  ok(
+    typeof myInstance === 'string' && myInstance.length > 0,
+    `sync_done 告知当前实例标识（${myInstance}）`
+  );
+
+  b2.drain();
+  b2.send({ action: 'sync', sinceSeq: 12345, sinceInstance: 'inst_from_another_box' });
+  const done4 = await b2.wait(isSyncDone, 4000);
+  ok(done4.code === 206, `另一实例的游标 → code=206（实际 ${done4.code}）`);
+  ok(/另一实例/.test(done4.message || ''), `原因写明「另一实例」（实际「${done4.message}」）`);
+  ok(b2.inbox.filter(isMsg).length === 0, '不回放（避免拿错序号空间乱补）');
+
+  // 同一个实例、游标确实超范围 → 仍是 206，但原因不该说「另一实例」
+  b2.drain();
+  b2.send({ action: 'sync', sinceSeq: 999999999, sinceInstance: myInstance });
+  const done5 = await b2.wait(isSyncDone, 4000);
+  ok(done5.code === 206, `本实例的越界游标 → code=206（实际 ${done5.code}）`);
+  ok(
+    !/另一实例/.test(done5.message || ''),
+    `且不会被误报成「另一实例」（实际「${done5.message}」）`
+  );
+
   a.close();
   b2.close();
 }

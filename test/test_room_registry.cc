@@ -1286,6 +1286,8 @@ static void testJournalReplay()
 
         const auto miss = reg.replay("no_such_room", 1);
         CHECK(miss.entries.empty() && miss.maxSeq == 0, "房间不存在 ⇒ 空结果");
+        CHECK(miss.reset,
+              "但带着游标问一个从没见过的房间 ⇒ 必须报「不完整」（无从证明它没缺消息）");
     }
 
     // ---- 14b. 环形缓冲裁掉旧条目 ⇒ 必须报 reset，不能假装补齐 ----
@@ -1368,6 +1370,68 @@ static void testJournalReplay()
         const auto rr = reg.replay("jr5", 1);
         CHECK(rr.entries.size() == 1 && *rr.entries[0].payload == "third",
               "日志里只有被接纳的两条，回放游标 1 之后拿到 third");
+    }
+
+    // ---- 14f. 日志要活过「房间被回收」----
+    //
+    // 场景：客户端是房间里最后一个人，它断线 ⇒ 房间被回收 ⇒ 它立刻重连。
+    // 原实现里日志随 Room 一起销毁，这个最常见的重连场景必然拿到 206 ——
+    // 明明服务端还留着内容。现在回收时把日志搬进暂存区，重建时搬回来。
+    {
+        RegDynamic reg(opt);
+        const auto id = reg.subscribe("jr6", std::make_shared<MockConn>(), DynamicLoopHandle{&loop});
+        for (int i = 1; i <= 4; ++i)
+        {
+            reg.publish("jr6", std::string("m") + std::to_string(i));
+        }
+        drainLoop(loop);
+
+        reg.unsubscribe("jr6", id);
+        CHECK(reg.activeRooms() == 0, "最后一个订阅者离开 ⇒ 房间被回收");
+
+        // ① 房间不存在时（客户端还没重新进房）也要能回放
+        const auto before = reg.replay("jr6", 2);
+        CHECK(before.entries.size() == 2 && before.entries[0].seq == 3 && before.entries[1].seq == 4,
+              "回收后仍能回放（游标 2 ⇒ 补 3、4）—— 修复前这里是空的");
+        CHECK(!before.reset, "且是完整补齐（不是 206）");
+        CHECK(before.maxSeq == 4, "maxSeq 来自序号水位线（4）");
+
+        // ② 重建房间后，日志被搬回来，且序号续上
+        reg.subscribe("jr6", std::make_shared<MockConn>(), DynamicLoopHandle{&loop});
+        const auto after = reg.replay("jr6", 2);
+        CHECK(after.entries.size() == 2, "重建后日志仍在（搬回来了，不是丢在暂存区）");
+        CHECK(after.maxSeq == 4, "重建后 maxSeq 仍是 4");
+
+        uint64_t s5 = 0;
+        reg.publish("jr6", std::string("m5"), {}, &s5);
+        CHECK(s5 == 5, "重建后序号续到 5");
+        drainLoop(loop);
+
+        // ③ 太旧的游标仍然要如实报 206（暂存不改变「补不齐就说补不齐」）
+        const auto stale = reg.replay("jr6", 0);
+        CHECK(stale.entries.empty() && !stale.reset, "sinceSeq = 0 仍然不回放");
+    }
+
+    // ---- 14g. 暂存区也有上限：超了按 FIFO 淘汰，不能变成内存泄漏 ----
+    {
+        RegDynamic::Options tiny = opt;
+        tiny.journalCap = 4;
+        RegDynamic reg(tiny);
+        // 造 5000 个「用完即回收」的房间。上限是 4096 个房间 / 65536 条，
+        // 这里主要是验证「不崩、且最老的会被淘汰」。
+        for (int i = 0; i < 5000; ++i)
+        {
+            const std::string room = "leak_" + std::to_string(i);
+            const auto id = reg.subscribe(room, std::make_shared<MockConn>(), DynamicLoopHandle{&loop});
+            reg.publish(room, std::string("x"));
+            reg.unsubscribe(room, id);
+        }
+        drainLoop(loop);
+        CHECK(reg.activeRooms() == 0, "5000 个房间全部回收");
+        // 最早那个已被 FIFO 淘汰 ⇒ 回放拿不到内容，但必须如实报「不完整」
+        const auto old = reg.replay("leak_0", 1);
+        CHECK(old.entries.empty(), "最老的暂存条目已被淘汰（内存有上限，不是无界增长）");
+        CHECK(old.reset, "淘汰后仍如实报「本次不是完整补齐」，不假装成功");
     }
 }
 

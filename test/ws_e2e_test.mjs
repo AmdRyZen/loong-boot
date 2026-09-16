@@ -241,24 +241,48 @@ async function testCrossLoopOrdering() {
     await sleep(20);
   }
 
+  // ⚠️ 这里刻意把「乱序」和「丢消息」拆成两条断言。
+  //
+  // 原实现只判 seq[i] === seq[i-1] + 1（连续），于是**任何丢消息都会报成「乱序」**：
+  // 实测把 LOONG_WS_BACKLOG_PER_SHARD 压到 64 时丢了 179 条，报出来的是
+  // 「cl_0: 127 之后出现 294」—— 看着像投递顺序坏了，其实是背压丢包。
+  // 两者根因完全不同：乱序要查入队/派发路径，丢消息要查 backlog 与在途额度。
+  // 混在一起报会把人引到错误的方向上（这条误导花过一次排查）。
   let minGot = Infinity;
-  let allOrdered = true;
-  let unorderedSample = '';
+  let allMonotonic = true; // 严格递增 —— 真正的「乱序」判据
+  let allContiguous = true; // 序号连续 —— 真正的「丢消息」判据
+  let disorderSample = '';
+  let gapSample = '';
   for (const s of subs) {
     const seq = seqOf(s);
     minGot = Math.min(minGot, seq.length);
     for (let i = 1; i < seq.length; i++) {
-      if (seq[i] !== seq[i - 1] + 1) {
-        allOrdered = false;
-        if (!unorderedSample) {
-          unorderedSample = `${s.name}: ${seq[i - 1]} 之后出现 ${seq[i]}`;
+      if (seq[i] <= seq[i - 1]) {
+        allMonotonic = false;
+        if (!disorderSample) {
+          disorderSample = `${s.name}: ${seq[i - 1]} 之后出现 ${seq[i]}`;
         }
-        break;
+      } else if (seq[i] !== seq[i - 1] + 1) {
+        allContiguous = false;
+        if (!gapSample) {
+          gapSample = `${s.name}: ${seq[i - 1]} → ${seq[i]}（缺 ${seq[i] - seq[i - 1] - 1} 条）`;
+        }
       }
     }
   }
 
-  ok(allOrdered, `全部 ${N} 个订阅者跨 loop 收包严格递增无乱序${unorderedSample ? `（${unorderedSample}）` : ''}`);
+  ok(
+    allMonotonic,
+    `全部 ${N} 个订阅者跨 loop 收包严格递增（无乱序）${disorderSample ? `（${disorderSample}）` : ''}`,
+  );
+  ok(
+    allContiguous,
+    allContiguous
+      ? `全部 ${N} 个订阅者无丢消息（序号连续）`
+      : `有丢消息、但顺序是对的：${gapSample}` +
+          ` —— 这不是乱序，别去查投递路径；查 ws_messages_dropped_total /` +
+          ` LOONG_WS_BACKLOG_PER_SHARD / LOONG_WS_MAX_INFLIGHT`,
+  );
   ok(minGot === M, `每个订阅者都收满 ${M} 条（最少收到 ${minGot} 条）`);
 
   for (const s of subs) s.ws.close();
