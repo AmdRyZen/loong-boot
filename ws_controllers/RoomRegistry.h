@@ -1312,6 +1312,15 @@ class RoomRegistryT
         // 把上次回收时暂存的日志搬回来（取出即从暂存区移除，避免两份）。
         if (const auto jit = roomJournals_.find(room); jit != roomJournals_.end())
         {
+            // ⚠️ 必须在 std::move 之前取 size：move 之后 deque 处于「有效但未指定」
+            // 的状态，长度不保证为 0，拿它记账会算错。
+            //
+            // 这一行漏掉的后果不是「少算一点」而是【单调上溢】：搬回日志时暂存区
+            // 少减一次，回收时又多加一次，于是每经过一轮「回收 → 重建」净增
+            // 一次房间日志长度。计数器一旦越过 kMaxJournalEntries，
+            // 此后每次 retainJournalLocked 都会进淘汰循环，开始丢【别的房间】的
+            // 暂存日志 —— 表现是「不相关房间的重连突然补不出内容」，极难定位。
+            journalRetainedEntries_ -= jit->second.size();
             r->journal = std::move(jit->second);
             roomJournals_.erase(jit);
             forgetJournalOrderLocked(room);

@@ -1433,6 +1433,61 @@ static void testJournalReplay()
         CHECK(old.entries.empty(), "最老的暂存条目已被淘汰（内存有上限，不是无界增长）");
         CHECK(old.reset, "淘汰后仍如实报「本次不是完整补齐」，不假装成功");
     }
+
+    // ---- 14h. 记账配平：反复「回收 → 重建」不能把暂存区撑成假超限 ----
+    //
+    // 回归的是 journalRetainedEntries_ 的记账泄漏：getOrCreateRoom 把日志从暂存区
+    // 搬回 Room 时若忘了减计数，每轮「回收 → 重建」净增一次日志长度，计数单调上溢。
+    // 越过 kMaxJournalEntries 之后，每次 retainJournalLocked 都会进淘汰循环，
+    // 开始丢【别的房间】的暂存日志 —— 症状是「不相关房间的重连突然补不出内容」。
+    //
+    // 这里刻意让 churn 房间反复回收重建，最后暂存一个无关房间再碰一次 churn：
+    // 记账正确时 victim 完好；记账泄漏时 victim 会被连带淘汰。
+    {
+        RegDynamic::Options tiny = opt;
+        tiny.journalCap = 256; // 每轮泄漏 256 条 ⇒ 300 轮即越过 65536 上限
+        RegDynamic reg(tiny);
+
+        for (int i = 0; i < 300; ++i)
+        {
+            const auto id = reg.subscribe("churn", std::make_shared<MockConn>(), DynamicLoopHandle{&loop});
+            for (int k = 0; k < 256; ++k)
+            {
+                reg.publish("churn", std::string("c"));
+            }
+            reg.unsubscribe("churn", id);
+        }
+        drainLoop(loop);
+
+        // 暂存一个与 churn 完全无关的房间
+        {
+            const auto id = reg.subscribe("victim", std::make_shared<MockConn>(), DynamicLoopHandle{&loop});
+            for (int k = 1; k <= 4; ++k)
+            {
+                reg.publish("victim", std::string("v") + std::to_string(k));
+            }
+            reg.unsubscribe("victim", id);
+        }
+        CHECK(reg.activeRooms() == 0, "victim 已回收并暂存");
+
+        // 再碰一次 churn：这一步会调 retainJournalLocked，正是淘汰循环的入口
+        {
+            const auto id = reg.subscribe("churn", std::make_shared<MockConn>(), DynamicLoopHandle{&loop});
+            reg.publish("churn", std::string("c"));
+            reg.unsubscribe("churn", id);
+        }
+        drainLoop(loop);
+
+        const auto v = reg.replay("victim", 1);
+        CHECK(v.entries.size() == 3, "300 轮回收重建后，无关房间的暂存日志仍在（记账未上溢）");
+        CHECK(v.entries.size() == 3 && v.entries[0].seq == 2 && v.entries[2].seq == 4,
+              "victim 的内容完整：游标 1 ⇒ 补 2、3、4");
+        CHECK(!v.reset, "且是完整补齐 —— 被连带淘汰的话这里会是 206");
+
+        // 顺带确认 churn 自己也没被自己的记账撑坏
+        const auto c = reg.replay("churn", 0);
+        CHECK(c.entries.empty() && !c.reset, "sinceSeq = 0 仍然不回放");
+    }
 }
 
 int main()
