@@ -602,6 +602,122 @@
             return 'm_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
         }
 
+        // ── 可靠投递：本地游标（B3 / B4）─────────────────────────────────────
+        //
+        // 每个房间记住「我已经看到哪个序号了」，重连时把它报回服务端补齐缺口。
+        // 存 localStorage 而不是内存：刷新页面 / 重开标签页同样算断线。
+        //
+        // ⚠️ 序号是【每实例】的。重连落到另一个实例时游标空间对不上，服务端会在
+        //    sync_done 里用 code 206 明确告知，客户端据此提示「可能有消息缺失」——
+        //    不假装补齐成功。
+        const CURSOR_PREFIX = 'loong.chat.cursor.';
+        const MAX_SEND_ATTEMPTS = 4;
+
+        function cursorKey(room) {
+            return CURSOR_PREFIX + room;
+        }
+
+        function loadCursor(room) {
+            try {
+                return parseInt(localStorage.getItem(cursorKey(room)) || '0', 10) || 0;
+            } catch (e) {
+                return 0; // 隐私模式下 localStorage 可能直接抛
+            }
+        }
+
+        function saveCursor(room, seq) {
+            if (!seq) return;
+            try {
+                localStorage.setItem(cursorKey(room), String(seq));
+            } catch (e) {
+                // 存不下不影响正确性：游标只影响「下次重连能否精确补齐」
+            }
+        }
+
+        // 已渲染过的消息 id（本次会话内）。补齐内容与实时投递可能重叠，
+        // 按 id 去重，避免同一条显示两遍。
+        const seenMsgIds = new Set();
+
+        // 等待 ACK 的消息：requestId -> { key, text, toUser, attempts, timer }
+        const pendingAcks = new Map();
+
+        // 补齐期间收到的帧先缓冲，等 sync_done 到了再按到达顺序应用 ——
+        // 否则「入群公告」这类在 sync 之前发出的消息会把游标推得比补齐内容还大，
+        // 看起来像服务端倒着补。
+        let syncing = false;
+        let syncBuffer = [];
+        // 本地游标的内存副本。localStorage 是同步 API，逐条消息都去读它没必要；
+        // 这里只在前进时写回。
+        let lastSeqSeen = 0;
+
+        function handleAck(ack) {
+            const p = pendingAcks.get(ack.requestId);
+            if (!p) return;
+
+            if (ack.code === 200) {
+                pendingAcks.delete(ack.requestId);
+                if (p.attempts > 1) {
+                    appendSystemMessage(`第 ${p.attempts} 次尝试后投递成功`);
+                }
+                return;
+            }
+
+            if (ack.code === 503 && p.attempts < MAX_SEND_ATTEMPTS) {
+                // 背压是【可重试】的：服务端明确说了「未投递」，退避后重发同一条。
+                // key 保持不变 ⇒ 万一第一次其实投出去了，服务端会按重发去重，
+                // 房间里不会出现两条。
+                p.attempts++;
+                const delay = Math.min(500 * Math.pow(2, p.attempts - 1), 8000);
+                p.timer = setTimeout(() => resendPending(ack.requestId, p), delay);
+                appendSystemMessage(`消息未投递（服务端过载），${delay}ms 后第 ${p.attempts} 次重试`);
+                return;
+            }
+
+            // 404 / 400 / 重试耗尽：终态，明确告诉用户「没送出去」。
+            // 这是 B1 的核心价值：旧契约下这些情况客户端只能靠猜。
+            pendingAcks.delete(ack.requestId);
+            appendSystemMessage(
+                ack.code === 404
+                    ? `${ack.message || '对方当前不在线'}（本条未送达）`
+                    : `消息未送达（code=${ack.code}）：${ack.message || ''}`
+            );
+        }
+
+        function resendPending(requestId, p) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                pendingAcks.delete(requestId);
+                appendSystemMessage('重试时连接已断开，本条未送达');
+                return;
+            }
+            ws.send(JSON.stringify({
+                key: p.key,
+                requestId: requestId,
+                action: 'message',
+                msgContent: p.text,
+                toUser: p.toUser
+            }));
+        }
+
+        function handleSyncDone(done) {
+            const room = document.getElementById('roomName').value.trim();
+            // 先落游标：它代表「此刻房间里最大的序号」，比缓冲里任何一条都新。
+            lastSeqSeen = done.seq || lastSeqSeen;
+            saveCursor(room, done.seq);
+            syncing = false;
+
+            const buf = syncBuffer;
+            syncBuffer = [];
+            for (const m of buf) {
+                applyIncoming(m);
+            }
+
+            if (done.code === 206) {
+                appendSystemMessage(`⚠️ ${done.message || '本次不是完整补齐'} —— 本端可能缺了中间的消息`);
+            } else if (done.message && /已补 [1-9]/.test(done.message)) {
+                appendSystemMessage(`断线期间的消息已补齐：${done.message}`);
+            }
+        }
+
         function sendHeartbeat() {
             if (!ws || ws.readyState !== WebSocket.OPEN) return;
             try {
@@ -692,6 +808,17 @@
                 manualClose = false;
                 addSystemMessage(`已进入空间 [${room}]，身份: ${user}`);
                 startHeartbeat();
+
+                // 重连补齐（B4）：把本地游标报回去，让服务端补上断线期间的消息。
+                // 补齐期间到达的帧会被缓冲到 sync_done 再应用（见 handleSyncDone）。
+                syncing = true;
+                syncBuffer = [];
+                lastSeqSeen = loadCursor(room);
+                try {
+                    ws.send(JSON.stringify({ action: 'sync', sinceSeq: loadCursor(room) }));
+                } catch (e) {
+                    syncing = false; // 发不出去就别一直缓冲
+                }
             };
 
             ws.onmessage = (event) => {
@@ -706,6 +833,30 @@
                     return;
                 }
 
+                // ── 逐条 ACK（B1）────────────────────────────────────────────
+                // 必须判在按 code 分类【之前】：ACK 的 code 也是 200，
+                // 否则它会被当成一条聊天消息渲染出来。
+                if (data.type === 'ack') {
+                    handleAck(data);
+                    return;
+                }
+                if (data.type === 'sync_done') {
+                    handleSyncDone(data);
+                    return;
+                }
+
+                // 补齐期间先缓冲，等 sync_done 定序之后再应用（见 handleSyncDone）
+                if (syncing) {
+                    syncBuffer.push(data);
+                    return;
+                }
+
+                applyIncoming(data);
+            };
+
+            // 一条【已经定序】的消息的渲染逻辑。实时到达与补齐回放都走这里，
+            // 保证两条路径的显示行为完全一致。
+            function applyIncoming(data) {
                 // 按 code 分类处理。原先只有 code===200 走聊天气泡、其余
                 // 一律 JSON.stringify 成「系统态势」，于是 503（未投递）和
                 // 404（对方不在线）这两类【需要用户立刻知道】的结果
@@ -751,10 +902,30 @@
                     return;
                 }
 
+                // 去重（B3）：补齐回放与实时投递可能重叠，同一条只渲染一次。
+                // 按 id 而不是按 seq —— id 是全局唯一的 snowflake，跨实例也成立。
+                if (data.id) {
+                    if (seenMsgIds.has(data.id)) return;
+                    seenMsgIds.add(data.id);
+                    // 防内存无界增长：超过上限就丢掉最早的一半
+                    if (seenMsgIds.size > 20000) {
+                        const it = seenMsgIds.values();
+                        for (let i = 0; i < 10000; i++) {
+                            seenMsgIds.delete(it.next().value);
+                        }
+                    }
+                }
+
+                // 推进本地游标：只前进、不后退（补齐回放可能带来较小的 seq）。
+                if (data.seq > lastSeqSeen) {
+                    lastSeqSeen = data.seq;
+                    saveCursor(document.getElementById('roomName').value.trim(), data.seq);
+                }
+
                 const myName = document.getElementById('userName').value.trim();
                 const isSelf = data.name === myName;
                 appendChatMessage(data.name || `User_${data.id}`, data.message, isSelf);
-            };
+            }
 
             ws.onclose = () => {
                 stopHeartbeat();
@@ -794,14 +965,28 @@
 
             const toUser = document.getElementById('toUser').value.trim();
 
-            const payload = JSON.stringify({
-                key: newMsgId(),
+            // key = 幂等键（重发时保持不变，服务端据此去重）；
+            // requestId = 这次投递尝试的标识（服务端在 ACK 里原样回传）。
+            // 这里两者取同一个值：重发的就是同一条消息，服务端也该认成同一次。
+            const msgKey = newMsgId();
+
+            // 登记待确认项：收到 ACK 之前它一直留在这里；
+            // 503（未投递）时靠它退避重发，重试耗尽/404 时才提示用户失败。
+            pendingAcks.set(msgKey, {
+                key: msgKey,
+                text: content,
+                toUser: toUser,
+                attempts: 1,
+                timer: null
+            });
+
+            ws.send(JSON.stringify({
+                key: msgKey,
+                requestId: msgKey,
                 action: "message",
                 msgContent: content,
                 toUser: toUser
-            });
-
-            ws.send(payload);
+            }));
             sentTotal++;
             document.getElementById('sentCount').innerText = sentTotal.toLocaleString();
             input.value = '';

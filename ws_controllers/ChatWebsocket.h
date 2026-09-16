@@ -223,8 +223,11 @@ private:
         //    （chat.html 已改成 crypto.randomUUID()）。两者缺一不可。
         struct DedupEntry
         {
-            uint64_t msgId = 0; // 首次处理时分配的消息 id（重发时用它回显）
-            int64_t atMs = 0;   // 首次处理时刻（TTL 清理用）
+            uint64_t msgId = 0; // 首次投递成功时分配的消息 id（重发时用它回显）
+            int64_t atMs = 0;   // 首次投递成功时刻（TTL 清理用）
+            // 首次投递成功时该消息的房间序号。重发的 ACK 要带上它，
+            // 否则客户端会把重发当成「seq 缺失」而在下一次 sync 里重复拉取。
+            uint64_t seq = 0;
         };
         phmap::flat_hash_map<std::string, DedupEntry> dedupSeen;
         std::mutex dedupMtx;
@@ -344,6 +347,24 @@ private:
         std::string action;
         std::string msgContent;
         std::string toUser;  // 点对点私聊目标用户名 (为空表示房间广播)
+
+        // ── B1：客户端请求标识 ────────────────────────────────────────────────
+        //
+        // 客户端为每条【待确认】的消息生成一个唯一值，服务端在 ACK 里原样回传，
+        // 客户端据此把「这条 ACK 对应哪条本地消息」对上号。
+        //
+        // 与 key 的区别：key 是【幂等键】（同一条消息重发时保持不变，用于去重）；
+        // requestId 是【这次投递尝试的标识】。两者可以相同，语义不同 ——
+        // key 决定「要不要重复投递」，requestId 决定「这个 ACK 是回给哪一次的」。
+        //
+        // 空 = 老客户端，服务端不发 ACK（保持既有行为）。
+        std::string requestId;
+
+        // ── B4：重连补齐游标 ──────────────────────────────────────────────────
+        //
+        // 仅 action == "sync" 时使用：客户端已见到的最大房间序号。
+        // 0 = 没有游标（服务端不回放，见 RoomRegistry::replay 的说明）。
+        uint64_t sinceSeq = 0;
     };
 
     // 客户端可见的消息 VO。刻意保持最小：落库/回放需要的上下文在下面的
@@ -368,6 +389,27 @@ private:
         //
         // 加字段对老客户端是安全的：JSON 多一个键会被忽略。
         std::string type;
+
+        // ── B3/B4：房间级序号 ─────────────────────────────────────────────────
+        //
+        // 本条消息在该房间内的单调序号（见 RoomRegistry::publishShared 的分配点）。
+        // 0 = 不适用（私聊 / 未分配 / 被背拒）。
+        //
+        // 为什么允许它进线格式：它是【客户端做重连补齐的必要条件】——
+        // 客户端得先知道自己看到哪儿了，才能在重连时把游标报回来（action:"sync"）。
+        // 顺带也让客户端能做「按 seq 去重」与「发现缺口」，比按 id 去重更准
+        //（id 是全局 snowflake，不能用来判断房间内是否漏了一条）。
+        //
+        // ⚠️ 它是【每实例】单调的，跨实例不可比较（见 ClusterPacket::roomSeq）。
+        //    客户端重连到另一个实例时，游标空间对不上 —— 服务端会在 sync_done
+        //    里用 code 206 明确告知「本次不是完整补齐」。
+        uint64_t seq = 0;
+
+        // ── B1：ACK 回执 ──────────────────────────────────────────────────────
+        //
+        // type == "ack" 时才有意义：原样回传客户端请求里的 requestId，
+        // 让客户端把回执与本地那条待确认消息对上号。
+        std::string requestId;
     };
 
     // ── Kafka 落库信封 ──────────────────────────────────────────────────────
@@ -480,6 +522,24 @@ private:
     // 的既有客户端静默丢消息，方向性的错误不能靠默认值兜。
     static std::atomic<bool>& messageDedupEnabled() noexcept;
 
+    // ── 去重的两阶段接口 ──────────────────────────────────────────────────────
+    //
+    // 早期实现把「判重」和「登记」合成一步（查到没有就立刻插入），于是：
+    //   首投被背压拒绝（503，既没广播也没落库）→ 客户端按约定重发
+    //   → 重发查到了那条【从未投递成功】的登记 → 判为重发 → 静默吞掉 + 回 200。
+    // 结果是消息永久丢失，而客户端收到的是「成功」。登记必须与「投递被接受」对齐。
+    //
+    // 现在拆开：lookupDedupEntry 只查不登记（判重时调用）；registerDedupEntry 在
+    // 投递真的被接受之后调用（房间：fanOutRoom 返回 true；私聊：过了 503 与 404 两道闸）。
+    //
+    // 取舍：这样放弃了「同一 key 并发重入」那一小段窗口的原子性 —— 两个同 key 的
+    // 请求可能都通过 lookup 而各投一次（at-least-once）。这是刻意选的失败方向：
+    // 重复投递对使用者可见、可容忍；静默丢失不可见、不可恢复。
+    // 何况同一连接的消息在同一个 IO loop 上串行处理，同一客户端无法与自己竞争。
+    // 返回首次投递成功时分配的消息 id（0 = 没查到）。outSeq 非空时写回它的房间序号。
+    static uint64_t lookupDedupEntry(Core& core, const std::string& key, uint64_t* outSeq = nullptr);
+    static void registerDedupEntry(Core& core, const std::string& key, uint64_t msgId, uint64_t seq);
+
     // 重读配置里的各个运行期开关。由构造函数与 5 秒定时任务调用。
     // 只覆盖【可以安全热更新】的开关；enable_cluster_bus 不在此列（见下）。
     static void reloadSwitches();
@@ -574,6 +634,8 @@ private:
         readEnvSize("LOONG_WS_DRAIN_BATCH", opt.drainBatch);
         readEnvSize("LOONG_WS_MAX_INFLIGHT", opt.maxInFlightDeliveries);
         readEnvSize("LOONG_WS_WORKER_SPIN_ROUNDS", opt.workerSpinRounds);
+        // 房间消息日志容量（回放用；0 = 关闭回放）。
+        readEnvSize("LOONG_WS_JOURNAL_CAP", opt.journalCap);
         // 端到端延迟直方图的采样掩码（必须是 2^n - 1；0 = 关闭采样）。
         // 用局部 size_t 中转：readEnvSize 的形参是 size_t&，而这里刻意用
         // uint64_t 存掩码，直接传引用在 LP64 上能编过、但换平台就是隐患。
@@ -593,6 +655,24 @@ private:
     // 由 5 秒定时任务驱动：/metrics 抓取时就不必再去加房间表的锁，
     // 代价是最多 5 秒的滞后（gauge 类指标可以接受；counter 看增量也不受影响）。
     static void publishRoomMetrics(Core& core);
+
+    // ── B4：重连补齐 ──────────────────────────────────────────────────────────
+    //
+    // 处理 action == "sync"：按客户端游标从房间日志回放缺口，再回一条 sync_done
+    // 把房间当前的最大序号告诉它。语义边界见 RoomRegistry::replay。
+    static void handleSync(Core& core, const WebSocketConnectionPtr& wsConn, const chatMessageDto& dto,
+                           const std::string& room);
+
+    // ── B1：逐条 ACK ──────────────────────────────────────────────────────────
+    //
+    // 把「这条消息到底投出去了没有」变成一个显式、可对号入座的回执，
+    // 取代原先「回显即成功」的隐式约定（回显只说明服务端看到了这条消息，
+    // 不说明它被广播出去了 —— 背压丢弃时两者一致，因为那时只回 notice）。
+    //
+    // requestId 为空 ⇒ 什么都不发：老客户端拿到的行为与改动前逐字节相同。
+    // 失败原因写进 message 字段，客户端可以直接展示，不必再解析 code 猜文案。
+    static void sendAck(const WebSocketConnectionPtr& wsConn, const std::string& requestId, int code,
+                        uint64_t id, uint64_t seq, std::string_view reason);
 
     // 把 KafkaManager 的投递失败 / 日志抑制计数拉进 Prometheus registry。
     //
@@ -655,7 +735,12 @@ private:
     // hint：发布者自己缓存的房间句柄（Subscriber::room_）。传进来即可跳过全局
     //   房间表锁；为空或不匹配房间名时 publish 会自动回退查表，因此传错不会崩，
     //   但会投错房间 —— 调用方必须保证 hint 与 topic 是同一个订阅者的成对字段。
-    bool fanOutRoom(Core& core, const std::string& topic, const std::string& json,
+    // build(序号) 返回本条的线格式负载。序号【必须】由 build 写进负载 ——
+    // 客户端拿它做重连游标（见 chatMessageVo::seq），而它只能在注册表确定
+    // 「这条消息会被接受」之后才分配，所以「构造负载」必须挪进注册表的临界区。
+    // 无订阅者时 build 不会被调用（默认配置下不白付序列化开销）。
+    template <typename BuildFn>
+    bool fanOutRoom(Core& core, const std::string& topic, BuildFn&& build,
                     bool broadcastToCluster = true,
                     const RoomRegistry::RoomHandle& hint = {},
                     uint64_t* outRoomSeq = nullptr)
@@ -664,7 +749,13 @@ private:
         // 拿到它才能让接收端判断「总线链路上有没有丢/乱序」，
         // 也才能把它写进 Kafka 落库信封供回放端还原顺序。
         uint64_t roomSeq = 0;
-        const bool ok = core.roomRegistry.publish(topic, json, hint, &roomSeq);
+        std::shared_ptr<const std::string> built;
+        const bool ok = core.roomRegistry.publishWithSeq(topic, hint, &roomSeq,
+                                                         [&](uint64_t seq) {
+                                                             built = std::make_shared<const std::string>(
+                                                                 build(seq));
+                                                             return built;
+                                                         });
         if (!ok)
         {
             // ⚠️ 本地入队被拒（背压）时【不能】再广播集群、也不能落库。
@@ -679,9 +770,11 @@ private:
             // 所有 return false 之后），所以 roomSeq 保持 0，接收端不会误报缺口。
             return false;
         }
-        if (broadcastToCluster)
+        if (broadcastToCluster && built)
         {
-            publishToCluster(core, topic, json, /*toUser=*/{}, roomSeq);
+            // 广播出去的是【带序号的那一份】—— 别的实例的订阅者也要靠它做游标，
+            // 拿未带序号的原文会导致跨实例的客户端游标永远停在 0。
+            publishToCluster(core, topic, *built, /*toUser=*/{}, roomSeq);
         }
         // ⚠️ Kafka 落库【不在这里】做：落库信封需要「这条消息是谁发的、是聊天
         //    还是入群/退群公告」这类上下文，而 fanOutRoom 只拿到已序列化好的

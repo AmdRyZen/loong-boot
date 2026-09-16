@@ -1242,6 +1242,135 @@ static void testRoomSeq()
     }
 }
 
+static void testJournalReplay()
+{
+    std::printf("\ntest: 房间消息日志与回放\n");
+    LoopState loop;
+    loop.id = 0;
+
+    RegDynamic::Options opt;
+    opt.maxShards = 1;
+    opt.fanoutThreads = 0;
+    opt.backlogPerShard = 1 << 20;
+    opt.maxInFlightDeliveries = 1 << 20;
+    opt.journalCap = 512;
+
+    // ---- 14a. 基本回放：只回 seq > sinceSeq 的条目，且按升序 ----
+    {
+        RegDynamic reg(opt);
+        auto c = std::make_shared<MockConn>();
+        reg.subscribe("jr", c, DynamicLoopHandle{&loop});
+
+        for (int i = 1; i <= 5; ++i)
+        {
+            reg.publish("jr", std::string("m") + std::to_string(i));
+        }
+
+        const auto rr = reg.replay("jr", 2);
+        CHECK(rr.entries.size() == 3, "游标 2 ⇒ 回放 3 条（3,4,5）");
+        CHECK(rr.entries.size() == 3 && rr.entries[0].seq == 3 && rr.entries[2].seq == 5,
+              "回放条目按 seq 升序且首尾正确");
+        CHECK(rr.maxSeq == 5, "maxSeq = 房间当前最大序号（5）");
+        CHECK(rr.oldestSeq == 1, "oldestSeq = 日志里最老的一条（1）");
+        CHECK(!rr.reset, "游标在可回放范围内 ⇒ reset = false");
+        CHECK(rr.entries[0].payload && *rr.entries[0].payload == "m3",
+              "回放负载就是当初投出去的那一份（m3）");
+
+        const auto up = reg.replay("jr", 5);
+        CHECK(up.entries.empty() && !up.reset, "游标已追平 ⇒ 空回放且 reset = false");
+
+        // sinceSeq = 0 刻意定义为「没有游标 ⇒ 不回放」，而不是「从头回放」
+        const auto none = reg.replay("jr", 0);
+        CHECK(none.entries.empty() && !none.reset,
+              "sinceSeq = 0 ⇒ 不回放历史（新客户端不该突然收到几百条旧消息）");
+
+        const auto miss = reg.replay("no_such_room", 1);
+        CHECK(miss.entries.empty() && miss.maxSeq == 0, "房间不存在 ⇒ 空结果");
+    }
+
+    // ---- 14b. 环形缓冲裁掉旧条目 ⇒ 必须报 reset，不能假装补齐 ----
+    {
+        RegDynamic::Options small = opt;
+        small.journalCap = 3;
+        RegDynamic reg(small);
+        auto c = std::make_shared<MockConn>();
+        reg.subscribe("jr2", c, DynamicLoopHandle{&loop});
+
+        for (int i = 1; i <= 5; ++i)
+        {
+            reg.publish("jr2", std::string("m") + std::to_string(i));
+        }
+
+        const auto rr = reg.replay("jr2", 1);
+        CHECK(rr.oldestSeq == 3, "容量 3 ⇒ 最老的只剩 3（1、2 被裁掉）");
+        CHECK(rr.reset, "游标 1 之后接不上（需要 2）⇒ reset = true");
+        CHECK(rr.entries.size() == 3, "仍然把手上有的 3 条都回放出去");
+
+        // 恰好停在 oldestSeq - 1 ⇒ 是完整补齐，不该误报
+        const auto exact = reg.replay("jr2", 2);
+        CHECK(!exact.reset, "游标恰好停在 oldestSeq-1 ⇒ 完整补齐（不误报 reset）");
+    }
+
+    // ---- 14c. 游标大于当前最大序号 ⇒ 序号空间对不上 ----
+    {
+        RegDynamic reg(opt);
+        auto c = std::make_shared<MockConn>();
+        reg.subscribe("jr3", c, DynamicLoopHandle{&loop});
+        reg.publish("jr3", std::string("m1"));
+
+        const auto rr = reg.replay("jr3", 999);
+        CHECK(rr.reset, "游标 999 > maxSeq 1 ⇒ reset = true（另一实例的序号空间 / 房间重建过）");
+        CHECK(rr.entries.empty(), "此时不该回放任何条目");
+    }
+
+    // ---- 14d. 关掉回放（journalCap = 0）时对落后的游标必须诚实 ----
+    {
+        RegDynamic::Options noJournal = opt;
+        noJournal.journalCap = 0;
+        RegDynamic reg(noJournal);
+        auto c = std::make_shared<MockConn>();
+        reg.subscribe("jr4", c, DynamicLoopHandle{&loop});
+        for (int i = 1; i <= 3; ++i)
+        {
+            reg.publish("jr4", std::string("m"));
+        }
+
+        const auto behind = reg.replay("jr4", 1);
+        CHECK(behind.entries.empty(), "关闭回放 ⇒ 没有条目可回");
+        CHECK(behind.reset, "但游标落后 ⇒ reset = true（绝不能回一个「补齐成功」的假结果）");
+
+        const auto caught = reg.replay("jr4", 3);
+        CHECK(!caught.reset, "游标已追平 ⇒ reset = false（这种情况确实是完整的）");
+    }
+
+    // ---- 14e. 被背压拒绝的消息不进日志、也不占号 ----
+    {
+        RegDynamic::Options capped = opt;
+        // 用「在途投递上限」制造确定性拒绝：目标 loop 不抽干 ⇒ 在途恒为 1。
+        //（不用分片积压，那需要真起线程池，时序不确定。）
+        capped.maxInFlightDeliveries = 1;
+        RegDynamic reg(capped);
+        auto c = std::make_shared<MockConn>();
+        reg.subscribe("jr5", c, DynamicLoopHandle{&loop});
+
+        const bool first = reg.publish("jr5", std::string("kept"));
+        const bool second = reg.publish("jr5", std::string("rejected"));
+        CHECK(first && !second, "在途额度用满后第二条被拒");
+
+        CHECK(reg.replay("jr5", 0).maxSeq == 1, "被拒的消息不占号（maxSeq 停在 1）");
+
+        // 抽干之后第三条应拿到序号 2（若被拒的那条占了号，这里会是 3）
+        drainLoop(loop);
+        uint64_t s3 = 0;
+        CHECK(reg.publish("jr5", std::string("third"), {}, &s3), "抽干后第三条被接纳");
+        CHECK(s3 == 2, "序号连续（被拒的那条没有占号，第三条是 2 而不是 3）");
+
+        const auto rr = reg.replay("jr5", 1);
+        CHECK(rr.entries.size() == 1 && *rr.entries[0].payload == "third",
+              "日志里只有被接纳的两条，回放游标 1 之后拿到 third");
+    }
+}
+
 int main()
 {    testStrictOrdering(0, "线程池并行扇出");
     testStrictOrdering(1000000, "内联扇出");
@@ -1257,6 +1386,7 @@ int main()
     testSubscriberIdNotReused();
     testInFlightCap();
     testRoomSeq();
+    testJournalReplay();
 
     std::printf("\n%s (failures=%d)\n", g_failures == 0 ? "ALL PASSED" : "FAILED", g_failures);
     return g_failures == 0 ? 0 : 1;

@@ -183,6 +183,34 @@ class RoomRegistryT
     // 「量到了多少纳秒」，怎么上报是宿主的事。
     using LatencySink = std::function<void(uint64_t nanos)>;
 
+    // ── 房间消息日志（回放源）────────────────────────────────────────────────
+    //
+    // 存的是【已投递出去的原始负载】（房间广播的客户端 VO JSON）以及它的房间级序号。
+    // payload 用 shared_ptr 存而不拷贝：发布路径上本来就持有同一个 shared_ptr，
+    // 日志只多一次引用计数，不产生一次字符串拷贝。
+    //
+    // 刻意不在这里解析/改写 JSON：本模板要能被不链接 glaze / 不认识 chatMessageVo
+    // 的单测实例化（同 LatencySink 的理由）。「把 seq 塞进线格式」是宿主的事 ——
+    // 见 ChatWebsocket::handleSync。
+    struct JournalEntry
+    {
+        uint64_t seq = 0;
+        std::shared_ptr<const std::string> payload;
+    };
+
+    struct ReplayResult
+    {
+        // 本次实际能补的条目，已按 seq 升序。
+        std::vector<JournalEntry> entries;
+        // 房间当前的最大序号（客户端补齐后应把游标设成它）。0 = 该房间没有日志。
+        uint64_t maxSeq = 0;
+        // 日志里现存最老的序号。0 = 空。
+        uint64_t oldestSeq = 0;
+        // true = 客户端游标太旧（中间那段已滚出日志）或来自另一个实例的序号空间，
+        // 本次【不是】完整补齐，客户端应当提示「可能有消息缺失」。
+        bool reset = false;
+    };
+
     struct Options
     {
         // 单房间最大分片槽位数 = 单房间最大并行扇出度。
@@ -252,6 +280,21 @@ class RoomRegistryT
         // 默认开（1/64）：这是唯一能回答「消息到底慢在哪一段」的指标，默认关闭
         // 等于永远没人打开。要 A/B 掉这 0.2% 就用 LOONG_WS_LATENCY_SAMPLE=0。
         uint64_t latencySampleMask = 63;
+
+        // ── 房间消息日志容量（回放用）─────────────────────────────────────────
+        //
+        // 每个房间在内存里保留最近这么多条【已投递】消息，供客户端重连时按
+        // (房间, 序号) 回拉补齐。0 = 关闭回放（不保留日志）。
+        //
+        // 为什么用内存环形缓冲而不是 Redis/Kafka：回放的消费者是「刚刚重连的
+        // 客户端」，它要的是【秒级】的断线窗口，不是历史归档 —— 而归档那件事
+        // 已经由 Kafka 落库在做（且默认关闭）。为它引入「聊天必须依赖 Redis 才
+        // 能补齐」这条硬依赖，代价远大于收益。日志随房间回收而消失（空房间没有
+        // 订阅者，也就没有人需要补），这一点在 ReplayResult 的语义里是明确的。
+        //
+        // 容量 × 平均消息大小就是每个活跃房间的常驻内存。512 × ~120B ≈ 60KB/房间。
+        // 可用 LOONG_WS_JOURNAL_CAP 覆盖。
+        size_t journalCap = 512;
     };
 
     explicit RoomRegistryT(Options opt = Options{}) : opt_(opt)
@@ -577,8 +620,41 @@ class RoomRegistryT
     //
     // 序号从 1 开始（0 保留给「未分配」），被背压拒绝的消息【不占号】——
     // 否则接收端会把「本地根本没发出去的那条」误报成「传输中丢了一条」。
+    //
+    // ── 负载构造式发布（序号要进线格式时用这个）───────────────────────────────
+    //
+    // 为什么需要它：客户端要用房间序号做重连游标，所以序号必须【在线格式里】；
+    // 而序号又必须在 pubMtx 内、所有背压判定【之后】才分配（被拒的消息不占号）。
+    // 两条约束叠加只剩一条路：把「构造负载」挪进临界区，由注册表把刚分配的
+    // 序号交给调用方去序列化。
+    //
+    // ⚠️ 代价：负载构造（JSON 序列化，实测约 150ns）现在发生在发布路径的临界区内。
+    //    单分片快路径里它落在分片锁内 —— 那把锁的使用者只有发布方与抽干者，
+    //    多持 150ns 远比「为规避而多一次锁往返」（约 20~40ns，且每次都付）划算。
+    //    多分片路径里它在两阶段之间完成，完全不持分片锁。
+    //
+    // build 只在【确定这条消息会被接受】之后、入队之前被调用一次，入参是刚分配
+    // 的序号。无订阅者时不会被调用 —— 保住「默认配置下不白付序列化开销」这条优化。
+    template <typename BuildFn>
+    bool publishWithSeq(const std::string& room, const RoomHandle& hint, uint64_t* outSeq,
+                        BuildFn&& build)
+    {
+        return publishSharedImpl(room, hint, outSeq, std::forward<BuildFn>(build));
+    }
+
     bool publishShared(const std::string& room, std::shared_ptr<const std::string> payload,
                        const RoomHandle& hint = {}, uint64_t* outSeq = nullptr)
+    {
+        if (!payload)
+        {
+            return true;
+        }
+        return publishSharedImpl(room, hint, outSeq, [&payload](uint64_t) { return payload; });
+    }
+
+    template <typename BuildFn>
+    bool publishSharedImpl(const std::string& room, const RoomHandle& hint, uint64_t* outSeq,
+                           BuildFn&& build)
     {
         if (outSeq != nullptr)
         {
@@ -638,10 +714,13 @@ class RoomRegistryT
                 r = it->second;
             }
         }
-        if (!r || !payload)
+        if (!r)
         {
-            return true; // 无订阅者：与 drogon 旧行为一致，直接丢弃
+            return true; // 无订阅者：与 drogon 旧行为一致，直接丢弃（也不构造负载）
         }
+
+        // 实际入队的负载。由 build(序号) 在确定会被接受之后填充。
+        std::shared_ptr<const std::string> payload;
 
         // 小房间 / 未启用线程池：内联扇出，不惊动线程池
         const bool inlineMode =
@@ -685,6 +764,11 @@ class RoomRegistryT
                             dropped_.fetch_add(1, std::memory_order_relaxed);
                             return false;
                         }
+                        // 检查已通过 ⇒ 此刻才分配序号、构造负载（被拒的消息不占号）。
+                        // 构造放在分片锁内：单分片是常态路径，锁的使用者只有发布方
+                        // 与抽干者，多持一次序列化远比多一次锁往返划算（见 publishWithSeq）。
+                        assignedSeq = ++r->seq;
+                        payload = build(assignedSeq);
                         sh->queue.push_back(QueuedMessage{payload, t0ns});
                         // 门铃：仅在「空闲 → 忙」跳变时入池，热点分片不会每条消息都惊动线程池。
                         // exchange 与 drain 的 busy=false 都在分片锁内完成，不会丢唤醒。
@@ -725,6 +809,11 @@ class RoomRegistryT
                     }
                 }
 
+                // 预检查全过 ⇒ 此刻才分配序号、构造负载（被拒的消息不占号）。
+                // 这一步不持任何分片锁：序列化不进临界区，多分片之间也不会互相等。
+                assignedSeq = ++r->seq;
+                payload = build(assignedSeq);
+
                 // ── 第二阶段：整条消息入队 ────────────────────────────────────
                 for (size_t i = 0; i < r->dist.size(); ++i)
                 {
@@ -754,14 +843,30 @@ class RoomRegistryT
                 }
             }
 
-            // ── 提交点：分配房间级序号 ──────────────────────────────────────────
+            // ── 提交点 ──────────────────────────────────────────────────────────
             //
-            // 位置是刻意选在这里（所有 return false 之后、同一把 pubMtx 之内）：
-            //   ① 同一把锁 ⇒ 序号大小顺序 == 入队顺序，接收端才能拿它做缺口检测；
-            //   ② 被背压拒绝的消息不占号 ⇒ 不会把「本地没发出去」误报成「传输丢了」。
-            // r->seq 是普通 uint64_t（不是原子量）：唯一写入点就在这里，且恒在
-            // pubMtx 内；读取点（退订时存水位线）同样持 pubMtx。
-            assignedSeq = ++r->seq;
+            // 序号已经在上面两个分支各自的「背压判定通过之后、入队之前」分配掉了
+            //（见 publishWithSeq 的说明）。这里只剩两件事：记账，以及把负载记进
+            // 房间消息日志。
+            //
+            // 不变量（必须保持）：
+            //   ① 分配发生在同一把 pubMtx 内、且早于入队 ⇒ 序号大小顺序 == 入队顺序；
+            //   ② 分配发生在所有 return false 之后 ⇒ 被拒的消息不占号，
+            //      接收端不会把「本地没发出去」误报成「传输中丢了一条」。
+            // r->seq 是普通 uint64_t（不是原子量）：写入点恒在 pubMtx 内；
+            // 读取点（退订时存水位线、replay）同样持 pubMtx。
+
+            // 记进房间消息日志（回放源）。被背压拒绝的消息在上面就已经 return false，
+            // 永远不会进日志 —— 否则重连的客户端会把「服务端根本没接受的消息」
+            // 当成历史补回来。
+            if (opt_.journalCap != 0)
+            {
+                r->journal.push_back(JournalEntry{assignedSeq, payload});
+                while (r->journal.size() > opt_.journalCap)
+                {
+                    r->journal.pop_front();
+                }
+            }
         }
 
         if (outSeq != nullptr)
@@ -784,6 +889,83 @@ class RoomRegistryT
             }
         }
         return true;
+    }
+
+    // ── 按 (房间, 序号) 回拉（重连补偿用）────────────────────────────────────
+    //
+    // sinceSeq = 客户端已见到的最大房间序号。
+    //   0 = 【没有游标，不回放】。刻意把 0 定义为「不回放」而不是「从头回放」：
+    //       新客户端首次进房间不该突然收到几百条历史（那是另一个产品决策），
+    //       而重连补偿的场景下客户端必然带着游标。
+    // 返回的 entries 已按 seq 升序，且只含 seq > sinceSeq 的条目。
+    //
+    // reset = true 表示「本次不是完整补齐」，两种成因：
+    //   ① 游标太旧：中间那段已滚出 journalCap 的环形缓冲；
+    //   ② 游标大于当前最大序号：客户端来自另一个实例的序号空间（本工程的房间
+    //      序号是【每实例独立】的，见 ClusterPacket::roomSeq），或房间被回收重建过。
+    // 两种情况都必须如实上报，不能让客户端以为补齐成功了。
+    ReplayResult replay(const std::string& room, uint64_t sinceSeq) const
+    {
+        ReplayResult out;
+
+        // 先拿房间句柄、释放全局锁，再取 pubMtx —— 不做嵌套持锁。
+        // 句柄是 shared_ptr：即使房间并发被回收，对象也活到本函数结束。
+        std::shared_ptr<Room> r;
+        {
+            std::shared_lock lock(roomsMtx_);
+            const auto it = rooms_.find(room);
+            if (it == rooms_.end())
+            {
+                return out; // 房间不存在（或已因无人订阅而回收）⇒ 无日志可回放
+            }
+            r = it->second;
+        }
+
+        std::lock_guard pubLock(r->pubMtx);
+        out.maxSeq = r->seq;
+        if (sinceSeq == 0)
+        {
+            return out; // 没有游标：不回放（见函数头的说明）
+        }
+        if (r->journal.empty())
+        {
+            // 没有日志可查：可能是关掉了回放（journalCap = 0），也可能是房间刚建、
+            // 还没发过任何消息。
+            //
+            // ⚠️ 这里必须区分「客户端本来就没落后」与「落后了但补不了」：
+            //    前者是完整的（reset=false），后者如果也回一个「补齐成功」的空结果，
+            //    就成了【假成功】—— 客户端永远不会知道自己缺了消息。
+            //    判据只有一条：游标是否已经追平房间当前序号。
+            out.reset = (sinceSeq < out.maxSeq);
+            return out;
+        }
+
+        out.oldestSeq = r->journal.front().seq;
+
+        // 游标比日志最老的一条还早一条以上 ⇒ 中间那段已滚出缓冲，补不齐。
+        // 注意是 `sinceSeq + 1 < oldestSeq` 而不是 `<=`：客户端恰好停在
+        // oldestSeq - 1 时，日志第一条正好接得上，属于完整补齐。
+        if (sinceSeq + 1 < out.oldestSeq)
+        {
+            out.reset = true;
+        }
+        // 游标大于当前最大序号 ⇒ 序号空间对不上（另一个实例 / 房间重建过）。
+        // 此时按 seq 过滤会一条都取不到，必须显式标记而不是假装补齐了。
+        if (sinceSeq > out.maxSeq)
+        {
+            out.reset = true;
+            return out;
+        }
+
+        out.entries.reserve(r->journal.size());
+        for (const auto& e : r->journal)
+        {
+            if (e.seq > sinceSeq)
+            {
+                out.entries.push_back(e);
+            }
+        }
+        return out;
     }
 
     // ---- 观测 ----
@@ -1008,6 +1190,13 @@ class RoomRegistryT
         // 房间被回收时它的当前值会被记进 roomSeqWatermark_，同名房间重建时从这里
         // 续上 —— 否则重建后序号从 1 重来，接收端会把它当成「大规模乱序/回退」误报。
         uint64_t seq{0};
+
+        // 房间消息日志（回放源，见 Options::journalCap）。
+        //
+        // 与 seq 同一把 pubMtx 保护 ⇒ 「日志里的先后」与「序号的先后」恒一致。
+        // 房间被回收（最后一个订阅者离开）时日志随之销毁 —— 空房间没有订阅者，
+        // 也就没有客户端需要补齐。
+        std::deque<JournalEntry> journal;
     };
 
     // 把「分片成员表」编成「按 loop 分组的投递计划」。
