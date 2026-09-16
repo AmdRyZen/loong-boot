@@ -710,14 +710,19 @@
                     return;
                 }
 
-                // 入群 / 离群公告：服务端以 code=200 + name=房间名 下发。
-                // 直接按聊天气泡渲染会显示成「房间名发的一条消息」，
-                // 与真实用户发言混淆 —— 识别出来走系统提示样式。
+                // 系统提示 / 入群 / 离群公告：服务端现在会下发 type 字段
+                //（"notice" = 公告或系统提示，"message" = 真人发言）。
+                //
+                // 老实现只能靠猜：name 等于当前房间名、或文案里出现「加入我们 / 已离开」
+                // —— 改一句公告文案就失效。现在优先信 type，只有在服务端还是旧版本
+                //（帧里没有 type）时才回退到那套启发式，保证滚动升级期间客户端不倒退。
                 const room = document.getElementById('roomName').value.trim();
                 const isNotice =
-                    data.name === room ||
-                    /加入我们/.test(data.message || '') ||
-                    /已离开/.test(data.message || '');
+                    data.type !== undefined
+                        ? data.type === 'notice'
+                        : (data.name === room ||
+                           /加入我们/.test(data.message || '') ||
+                           /已离开/.test(data.message || ''));
                 if (isNotice) {
                     appendSystemMessage(data.message || '');
                     return;

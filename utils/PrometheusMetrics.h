@@ -268,7 +268,11 @@ public:
         ss << "# HELP tbb_coroutine_pool_active_tasks In-flight task count in TBB pool.\n"
            << "# TYPE tbb_coroutine_pool_active_tasks gauge\n"
            << "tbb_coroutine_pool_active_tasks " << activeTbb << "\n"
-           << "tbb_coroutine_pool_capacity 32768\n\n";
+           << "tbb_coroutine_pool_capacity 32768\n"
+           << "# HELP tbb_coroutine_pool_task_exceptions_total Task exceptions swallowed by the pool's catch(...). Non-zero means some task is failing silently.\n"
+           << "# TYPE tbb_coroutine_pool_task_exceptions_total counter\n"
+           << "tbb_coroutine_pool_task_exceptions_total "
+           << TbbCoroutinePool::instance().getTaskExceptions() << "\n\n";
 
         // WebSocket 实时度量
         ss << "# HELP ws_connections_current Number of current active WebSocket connections.\n"

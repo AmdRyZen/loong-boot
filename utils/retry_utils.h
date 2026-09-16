@@ -53,6 +53,17 @@ Task<> retryWithDelayAsync(Func&& func,
 }
 
 
+// ⚠️ 阻塞式重试：内部用 std::this_thread::sleep_for 占着当前线程。
+//
+// 【不要在 TBB worker 或 drogon IO 线程上调用】。本工程的 TBB 并行度被
+// aop/Application.h 的 tbb::global_control(max_allowed_parallelism, 核数) 锁死，
+// 几个 worker 在 sleep 就等于池少几个执行槽；broker/下游抖动时所有 worker
+// 一起进重试 ⇒ 池停止抽干 ⇒ activeTasks_ 涨过 32768 ⇒ submit 返回 false。
+// 本工程曾因此在 Kafka 落库路径上踩过这个坑（见 ChatWebsocket.cc 里
+// produceKafkaAsync 的说明，现已改为单次投递 + 失败即记终态）。
+//
+// 需要「等待后再试」请用上面的 retryWithDelayAsync（协程版，不占线程），
+// 或把退避交给队列/定时器。
 template<typename Func>
 void retryWithSleep(Func&& func,
                     const int maxRetries = 3,

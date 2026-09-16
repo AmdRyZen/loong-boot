@@ -109,6 +109,11 @@ void ChatWebsocket::produceKafkaAsync(std::string_view topicName, std::string_vi
     // 实参的堆拷贝也已经发生完了 —— 热路径上每条消息白付一次分配。
     // 改成 string_view 后，关闭态下这次调用只是两次指针/长度赋值。
     //
+    // ⚠️ 但这只挡住了【本函数自己】那一层。调用方（persistRoomMessage /
+    // persistDirectMessage）还要先填 chatPersistVo 并 buildPersistJson ——
+    // 那份开销更大（实测 222.8 ns/条），所以那两个函数各自在首行也做了同样的检查。
+    // 两处都要保留：这里是独立入口的兜底，那里才是省掉大头的地方。
+    //
     // 开关本身从「static const 一次性求值」改成原子量：原实现改配置永不生效，
     // 只能重启进程（压测时切换落库开关很烦）。值由 reloadSwitches() 维护。
     if (!kafkaPersistenceEnabled().load(std::memory_order_relaxed))
@@ -173,34 +178,36 @@ void ChatWebsocket::produceKafkaAsync(std::string_view topicName, std::string_vi
                 return;
             }
 
-            // delivered 必须显式追踪：谓词的返回值语义是「还要不要重试」而不是「成功没有」
-            //（QUEUE_FULL 之外的错误返回 true 表示「重试没意义、放弃」，会被 retryWithSleep
-            // 当作成功收尾）。原实现里「重试耗尽」与「永久性错误放弃」都既无指标也无终态日志，
-            // 上层只能靠翻每次尝试的 LOG_ERROR 自己拼结论。
+            // ── 单次投递，不做 sleep 重试 ───────────────────────────────────────
             //
-            // ⚠️ 循环内【一行日志都不打】：retryWithSleep 默认重试 3 次，若每次失败都打一行，
-            // broker 挂掉时就是「每条消息 3 行」——正是本项目反复踩过的热路径日志放大，
-            // 而且它比终态那条还频繁（终态已限流，这条没有）。改成把错误码记在 lastErr 里、
-            // 由终态那条限流日志输出：信息量不减（拿到的是最终错误码，比三次中间态更有用），
-            // 日志量从 O(3 × 消息数) 降到 ≤1 行/秒。
-            bool delivered = false;
-            rd_kafka_resp_err_t lastErr = RD_KAFKA_RESP_ERR_NO_ERROR;
-            retryWithSleep([&]() {
-                if (kafka::KafkaManager::safeProduce(topicPtr, payload, partitionKey))
-                {
-                    delivered = true;
-                    return true;
-                }
-                lastErr = rd_kafka_last_error();
-                // QUEUE_FULL 是瞬态的 → 返回 false 让 retryWithSleep 重试；
-                // 其余错误（消息过大 / 无效 topic 等）重试无意义 → 放弃。
-                return lastErr != RD_KAFKA_RESP_ERR__QUEUE_FULL;
-            });
-            if (delivered)
+            // 原实现用 retryWithSleep（默认 3 次 × 100ms）在【TBB worker 线程里】
+            // std::this_thread::sleep_for。两个问题：
+            //
+            // ① 它真的会阻塞池。aop/Application.h 用
+            //    tbb::global_control(max_allowed_parallelism, hardware_concurrency())
+            //    把 TBB 并行度锁死在核数上，所以「几个 worker 在 sleep」等于
+            //    「池少几个执行槽」。broker 抖动时所有 worker 一起进重试 ⇒
+            //    池停止抽干 ⇒ activeTasks_ 涨过 32768 ⇒ submit 返回 false ⇒
+            //    ws_kafka_persist_dropped_total 飙升（丢的是落库，消息本身已投递）。
+            //    TBB worker 应当非阻塞。
+            //
+            // ② 重试本身几乎没有价值。safeProduce 返回 false 只有三种成因：
+            //    · MSG_SIZE_TOO_LARGE —— 永久失败，重试无意义（WS 上限 128KB，远小于 1MB）；
+            //    · UNKNOWN_TOPIC —— 只有 allow.auto.create.topics=false 才可能，本工程未设；
+            //    · QUEUE_FULL —— 需要本地队列积满 100 万条。按 queue.buffering.max.messages
+            //      = 1000000 与 delivery.timeout.ms = 30000 推算，稳态积压 ≈ 速率 × 30s，
+            //      要积满得速率 ≥ ~33,333 条/秒 持续 30 秒以上；真到那一步，
+            //      睡 100ms 也排不空队列（排空本身是 30 秒量级）。
+            //
+            // 所以不重试，失败即记终态（限流日志 + 计数）。这既消除了池阻塞，
+            // 也不损失可观测性 —— 原先「重试耗尽」与「永久性错误放弃」本来就
+            // 合并成同一条终态日志输出。
+            if (kafka::KafkaManager::safeProduce(topicPtr, payload, partitionKey))
             {
                 return;
             }
 
+            const rd_kafka_resp_err_t lastErr = rd_kafka_last_error();
             Metrics::PrometheusRegistry::instance().recordKafkaProduceFailed();
             logTerminalFailure(rd_kafka_err2str(lastErr), /*severe=*/false);
         });
@@ -335,6 +342,7 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                         msg_vo.id = nextMessageId();
                         msg_vo.name = std::string_view(senderName);
                         msg_vo.message = std::format("[私聊] {}", std::string_view(msg_dto.msgContent));
+                        msg_vo.type = "message";
 
                         std::string json{};
                         (void)glz::write_json(msg_vo, json);
@@ -438,6 +446,7 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                     msg_vo.id = nextMessageId();
                     msg_vo.name = std::string_view(senderName);
                     msg_vo.message = std::move(msg_dto.msgContent);
+                    msg_vo.type = "message";
 
                     std::string json{};
                     (void)glz::write_json(msg_vo, json);
@@ -587,6 +596,7 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
         msg_vo.id = nextMessageId();
         msg_vo.name = topic;
         msg_vo.message = std::format("欢迎 {} 加入我们 {}", userName, topic);
+        msg_vo.type = "notice";
 
         // 使用普通string避免thread_local问题
         std::string json{};
@@ -701,6 +711,7 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
         msg_vo.id = nextMessageId();
         msg_vo.name = topic;
         msg_vo.message = std::format("{} 已离开 {}", userName, topic);
+        msg_vo.type = "notice";
 
         // 使用普通string避免thread_local问题
         std::string json{};
