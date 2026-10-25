@@ -263,6 +263,15 @@ public:
         wsJournalEvicted_.fetch_add(count, std::memory_order_relaxed);
     }
 
+    // 因【房间人数已满】被拒绝的连接数。
+    //
+    // 为什么要单独计：这是一个「用户被挡在门外」的事件，从服务端其他指标完全看不出来
+    // （连接数没涨、消息量没涨、也没有任何错误）。没有这个数，产品侧问
+    // 「有没有人进不来」就只能靠猜。
+    void recordWsRoomFullRejected(uint64_t count = 1) {
+        wsRoomFullRejected_.fetch_add(count, std::memory_order_relaxed);
+    }
+
     // 端到端扇出延迟的一个样本（纳秒）。
     //
     // 由 RoomRegistry 通过注入的回调在【目标 IO loop 上】调用，因此：
@@ -552,7 +561,10 @@ public:
            << "ws_journal_active_cap " << wsJournalActiveCap_.load(std::memory_order_relaxed) << "\n"
            << "# HELP ws_journal_evicted_total Journal entries dropped because the global budget was exceeded. Non-zero means some reconnecting clients will get a 206 (partial replay) instead of a full catch-up - the deliberate price of a bounded memory footprint.\n"
            << "# TYPE ws_journal_evicted_total counter\n"
-           << "ws_journal_evicted_total " << wsJournalEvicted_.load(std::memory_order_relaxed) << "\n\n";
+           << "ws_journal_evicted_total " << wsJournalEvicted_.load(std::memory_order_relaxed) << "\n"
+           << "# HELP ws_room_full_rejected_total Connections refused because the target room was at its subscriber cap (LOONG_WS_MAX_SUBS_PER_ROOM, 0 = no cap). These users never appear in ws_connections_current - the only place this is visible.\n"
+           << "# TYPE ws_room_full_rejected_total counter\n"
+           << "ws_room_full_rejected_total " << wsRoomFullRejected_.load(std::memory_order_relaxed) << "\n\n";
 
         // 扇出分组效果（A1）。两个都是 counter：看增量，不看绝对值。
         // 健康形态：crossthread_batches 增量 ≈ 消息数 × IO线程数，远小于
@@ -716,6 +728,7 @@ private:
     std::atomic<uint64_t> wsJournalEntries_{0};
     std::atomic<uint64_t> wsJournalActiveCap_{0};
     std::atomic<uint64_t> wsJournalEvicted_{0};
+    std::atomic<uint64_t> wsRoomFullRejected_{0};
     std::atomic<uint64_t> wsFanoutInLoop_{0};
     std::atomic<uint64_t> wsFanoutCrossThread_{0};
     std::atomic<uint64_t> wsFanoutCrossThreadDeliveries_{0};

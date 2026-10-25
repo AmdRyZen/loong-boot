@@ -312,6 +312,23 @@ class RoomRegistryT
         // 的量级。设 0 = 关闭该预算（退回旧行为：只受单房间上限约束）。
         // 可用 LOONG_WS_JOURNAL_ACTIVE_CAP 覆盖。
         size_t journalActiveCap = 1 << 20;
+
+        // ── 单房间订阅者上限（0 = 不限）──────────────────────────────────────────
+        //
+        // 为什么需要：扇出成本是 O(房间人数)，而人数此前只受全局连接上限约束
+        // （20000）—— 也就是说一个房间可以被堆到 2 万人，一条消息就要扇 2 万次。
+        // 现有的 backlogPerShard / maxInFlightDeliveries 会在过载时回 503 兜住，
+        // 不会把进程打崩，但没有任何机制阻止单个房间无限膨胀。
+        //
+        // 默认 500：与微信群人数上限一致。这是产品语义上的「一个群」的规模，
+        // 而不是内存计算的结果 —— 需要万人直播间时把它调大或设 0（不限）即可。
+        //
+        // ⚠️ 拒绝发生在 subscribe()，返回 id 0。调用方（handleNewConnection）必须
+        // 把它当成「连接不可用」处理：回一条可读通知后优雅关闭，且【不能】继续
+        // 发入群公告、不能登记房间句柄 —— 否则会往一个满房间塞一个幽灵订阅者。
+        //
+        // 可用 LOONG_WS_MAX_SUBS_PER_ROOM 覆盖。
+        size_t maxSubscribersPerRoom = 500;
     };
 
     explicit RoomRegistryT(Options opt = Options{}) : opt_(opt)
@@ -423,6 +440,23 @@ class RoomRegistryT
             }
 
             const size_t after = r->subCount.load(std::memory_order_relaxed) + 1;
+
+            // ── 单房间人数上限 ───────────────────────────────────────────────
+            //
+            // 位置：retired 检查之后、任何状态变更之前，且整段都在 pubMtx 内。
+            // subCount 的全部写入（下面的 store、unsubscribe 的 fetch_sub）
+            // 同样在这把锁内，所以「读-比较-加一」是原子的：
+            // 并发 subscribe 不可能一起越过上限。
+            //
+            // 返回 0 表示拒绝（合法 id 从 1 开始，0 天然是「无效」）。
+            // ⚠️ 这里【已经】调过 getOrCreateRoom：房间通常本来就存在（满了嘛），
+            //    所以不会凭空多建房间；真多建了也只是个 subCount==0 的空房间，
+            //    不会有人往里发消息，随下次回收流程消失。
+            if (opt_.maxSubscribersPerRoom != 0 && after > opt_.maxSubscribersPerRoom)
+            {
+                return 0;
+            }
+
             const size_t want = shardsFor(after);
 
             if (want != r->shards.size())

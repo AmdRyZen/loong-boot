@@ -901,6 +901,38 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
             topic, wsConn, TrantorLoopHandle{trantor::EventLoop::getEventLoopOfCurrentThread()},
             subscriber->gate);
 
+        // ── 房间人数已满：订阅被拒（id 0）────────────────────────────────────
+        //
+        // 必须在这里就收手，不能继续往下走：
+        //   · 不能发入群公告 —— 人根本没进来，公告会骗房间里的所有人；
+        //   · 不能登记 room_ 句柄 —— 那会让后续 publish 以为自己是房间成员；
+        //   · 不能继续占用连接 —— 它既不收也不发，只是白占一个 fd 与 Subscriber。
+        //
+        // 关闭方式用 shutdown(kViolation) 而不是 forceClose：
+        //   forceClose 直接断 TCP，可能把刚 send 出去的那条通知丢掉（客户端只看到
+        //   1006 异常断开，完全不知道为什么）。shutdown 会先发一个 1008 Close 帧、
+        //   再走优雅关闭，两帧都能刷出去。
+        //
+        // ⚠️ 客户端会按自己的退避策略重试若干次（chat.html 有 MAX_RECONNECT_ATTEMPTS），
+        //    不是死循环；房间腾出位置后重试就会成功。
+        //
+        // 清理无需手动做：这条连接已登记进 userNameToConn（见上），
+        // shutdown → 断开 → handleConnectionClosed 会按 conn 精确摘除，
+        // 且 unsubscribe(topic, 0) 是幂等的。
+        if (subscriber->id_ == 0)
+        {
+            const size_t cap = core_->roomRegistry.options().maxSubscribersPerRoom;
+            Metrics::PrometheusRegistry::instance().recordWsRoomFullRejected();
+            LOG_DEBUG << "Rejected connection for user " << userName << ": room '" << topic
+                      << "' is full (cap " << cap << ")";
+            const std::string fullMsg =
+                std::format("房间 {} 人数已满（上限 {}），请稍后再试", topic, cap);
+            wsConn->send(buildNoticeJson(503, "系统通知", fullMsg.c_str()),
+                         WebSocketMessageType::Text);
+            wsConn->shutdown(CloseCode::kViolation, "room full");
+            return;
+        }
+
         // 同一个 loop 句柄再缓存到 Subscriber 上：房间扇出已经按它分组，
         // 私聊直投也要用（见 Subscriber::loop_ 与 deliverDirectLocally）。
         // 只取一次，终身复用 —— 连接所属 loop 在生命周期内不会改变。

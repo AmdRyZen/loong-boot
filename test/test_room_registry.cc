@@ -1565,6 +1565,114 @@ static void testJournalReplay()
     }
 }
 
+// ── 16. 单房间订阅者上限（LOONG_WS_MAX_SUBS_PER_ROOM，默认 500）────────────────
+//
+// 覆盖的是「一个房间能被堆到多大」：此前只受全局连接上限约束，
+// 一个房间可以堆到 2 万人，一条消息就要扇 2 万次。
+static void testRoomSubscriberCap()
+{
+    LoopState loop;
+    loop.id = 0;
+
+    std::printf("test: 单房间订阅者上限\n");
+
+    RegDynamic::Options opt;
+    opt.maxShards = 1;
+    opt.fanoutThreads = 0;
+    opt.backlogPerShard = 1 << 20;
+    opt.maxInFlightDeliveries = 1 << 20;
+    opt.journalCap = 0;
+    opt.maxSubscribersPerRoom = 3;
+
+    // ---- 16a. 超过上限的订阅被拒（返回 0），且房间人数不涨 ----
+    {
+        RegDynamic reg(opt);
+        std::vector<RegDynamic::SubscriberID> ids;
+        for (int i = 0; i < 3; ++i)
+        {
+            ids.push_back(reg.subscribe("cap", std::make_shared<MockConn>(), DynamicLoopHandle{&loop}));
+        }
+        CHECK(ids[0] != 0 && ids[1] != 0 && ids[2] != 0, "上限内的 3 次订阅都成功（id 非 0）");
+        CHECK(reg.subscribersIn("cap") == 3, "房间人数 = 3");
+
+        const auto rejected =
+            reg.subscribe("cap", std::make_shared<MockConn>(), DynamicLoopHandle{&loop});
+        CHECK(rejected == 0, "第 4 次订阅被拒，返回 id 0");
+        CHECK(reg.subscribersIn("cap") == 3, "被拒的订阅没有把人数顶过上限");
+
+        // 合法 id 从 1 开始 ⇒ 0 是天然的空闲值，不会与真实 id 撞
+        CHECK(ids[0] != 0 && ids[2] != 0, "合法 id 恒非 0（0 专用于表示拒绝）");
+
+        // 有人离开后应立刻能再进
+        reg.unsubscribe("cap", ids[0]);
+        drainLoop(loop);
+        CHECK(reg.subscribersIn("cap") == 2, "退订后人数降到 2");
+        const auto again = reg.subscribe("cap", std::make_shared<MockConn>(), DynamicLoopHandle{&loop});
+        CHECK(again != 0, "腾出位置后，新订阅立刻成功");
+        CHECK(reg.subscribersIn("cap") == 3, "人数回到上限");
+
+        reg.unsubscribe("cap", ids[1]);
+        reg.unsubscribe("cap", ids[2]);
+        reg.unsubscribe("cap", again);
+        drainLoop(loop);
+    }
+
+    // ---- 16b. cap = 0 ⇒ 不限（退回旧行为）----
+    {
+        RegDynamic::Options unlimited = opt;
+        unlimited.maxSubscribersPerRoom = 0;
+        RegDynamic reg(unlimited);
+        size_t ok = 0;
+        for (int i = 0; i < 10; ++i)
+        {
+            if (reg.subscribe("nolimit", std::make_shared<MockConn>(), DynamicLoopHandle{&loop}) != 0)
+            {
+                ++ok;
+            }
+        }
+        CHECK(ok == 10, "cap = 0 ⇒ 10 次订阅全部成功（不限）");
+        CHECK(reg.subscribersIn("nolimit") == 10, "人数 = 10");
+    }
+
+    // ---- 16c. 并发订阅不会一起越过上限 ----
+    //
+    // 这条是核心：若「读人数 → 比较 → 加一」不是原子的，8 个线程各抢 10 次
+    // 就会顶穿上限。上限检查与 subCount 的写入必须在同一把 pubMtx 内。
+    {
+        RegDynamic::Options small = opt;
+        small.maxSubscribersPerRoom = 20;
+        RegDynamic reg(small);
+
+        constexpr int kThreads = 8;
+        constexpr int kPerThread = 10;
+        std::atomic<int> succeeded{0};
+        std::vector<std::thread> ts;
+        ts.reserve(kThreads);
+        for (int t = 0; t < kThreads; ++t)
+        {
+            ts.emplace_back([&reg, &succeeded, &loop] {
+                for (int i = 0; i < kPerThread; ++i)
+                {
+                    if (reg.subscribe("race", std::make_shared<MockConn>(),
+                                      DynamicLoopHandle{&loop}) != 0)
+                    {
+                        succeeded.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            });
+        }
+        for (auto& th : ts)
+        {
+            th.join();
+        }
+        drainLoop(loop);
+
+        CHECK(succeeded.load() == 20,
+              "8 线程 × 10 次抢 20 个名额 ⇒ 恰好 20 次成功（检查与加一是原子的）");
+        CHECK(reg.subscribersIn("race") == 20, "房间人数恰好停在上限，没有被顶穿");
+    }
+}
+
 // ── 15. 连接级投递闸门（拥塞跳过）──────────────────────────────────────────────
 //
 // 回归的是「每连接输出缓冲无界」这个缺陷的【服务端侧对策】：
@@ -1679,6 +1787,7 @@ int main()
     testInFlightCap();
     testRoomSeq();
     testJournalReplay();
+    testRoomSubscriberCap();
     testConnectionGate();
 
     std::printf("\n%s (failures=%d)\n", g_failures == 0 ? "ALL PASSED" : "FAILED", g_failures);
