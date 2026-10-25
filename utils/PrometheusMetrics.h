@@ -184,6 +184,23 @@ public:
         wsDirectBackpressured_.fetch_add(count, std::memory_order_relaxed);
     }
 
+    // 私聊因【目标连接输出拥塞闸门关着】而整批未投的会话份数。
+    // 与 backpressured 区分：那个是全局在途额度，这个是单个慢连接。
+    // 计入后调用方应回 503，让发送者在接收方恢复后重试，而不是静默丢失。
+    void recordWsDirectGatedDrops(uint64_t count = 1) {
+        wsDirectGatedDrops_.fetch_add(count, std::memory_order_relaxed);
+    }
+
+    // 因每连接消息速率超过 token bucket 而被拒的消息数。
+    // 持续增长说明该连接在刷消息；配合 ws_rate_limit_closed_total 看是否已踢掉。
+    void recordWsRateLimited(uint64_t count = 1) {
+        wsRateLimited_.fetch_add(count, std::memory_order_relaxed);
+    }
+
+    void recordWsRateLimitClosed(uint64_t count = 1) {
+        wsRateLimitClosed_.fetch_add(count, std::memory_order_relaxed);
+    }
+
     // 房间侧快照（由 ChatWebsocket 的 5 秒定时任务推送）。
     // 这里存的是上一次采样的值：/metrics 抓取时无需再去加房间表的锁，
     // 代价是最多 5 秒的滞后 —— 对 gauge 类指标完全够用。
@@ -299,6 +316,24 @@ public:
         wsConnPeakPending_.store(bytes, std::memory_order_relaxed);
     }
 
+    // ── 集群总线存活 ────────────────────────────────────────────────────────
+    //
+    // ready 是 gauge：1 = 本实例认为跨实例投递可用。它直接决定私聊在
+    //   「本实例查无此人」时回 200（可能在对端）还是 404（确定不在线）——
+    //   所以这个数错了，客户端拿到的回执就是错的，必须能一眼看到。
+    //
+    // probe_age 是 gauge（秒）：距离上一次收到自己探针回环多久。这是判断
+    //   「ready 还可信吗」的唯一依据：ready=1 但 probe_age 已经涨到 10 秒，
+    //   说明链路正在恶化，再过几秒就会被判死。用 -1 表示「从未收到过回环」，
+    //   与「刚收到（0 秒）」区分开 —— 混在一起会把启动期误读成健康。
+    void setClusterBusReady(bool ready) {
+        wsClusterBusReady_.store(ready ? 1 : 0, std::memory_order_relaxed);
+    }
+
+    void setClusterBusProbeAge(int64_t seconds) {
+        wsClusterBusProbeAge_.store(seconds, std::memory_order_relaxed);
+    }
+
     // 高水位保护没能装上的连接数（getConnectionPtr() 拿不到底层 TcpConnection）。
     // 非 0 说明这些连接退化为「无上限缓冲」的老行为，值得查 drogon 版本。
     void recordWsHwmInstallFailed(uint64_t count = 1) {
@@ -390,6 +425,15 @@ public:
            << "# HELP ws_direct_backpressured_total Private-chat delivery slots skipped because the in-flight cap was reached (reason breakdown of ws_messages_dropped_total).\n"
            << "# TYPE ws_direct_backpressured_total counter\n"
            << "ws_direct_backpressured_total " << wsDirectBackpressured_.load(std::memory_order_relaxed) << "\n\n"
+           << "# HELP ws_direct_gated_drops_total Private-chat recipient sessions skipped because their connection output gate was closed.\n"
+           << "# TYPE ws_direct_gated_drops_total counter\n"
+           << "ws_direct_gated_drops_total " << wsDirectGatedDrops_.load(std::memory_order_relaxed) << "\n\n"
+           << "# HELP ws_rate_limited_total WebSocket messages rejected by the per-connection token bucket.\n"
+           << "# TYPE ws_rate_limited_total counter\n"
+           << "ws_rate_limited_total " << wsRateLimited_.load(std::memory_order_relaxed) << "\n\n"
+           << "# HELP ws_rate_limit_closed_total Connections force-closed after sustained per-connection rate violations.\n"
+           << "# TYPE ws_rate_limit_closed_total counter\n"
+           << "ws_rate_limit_closed_total " << wsRateLimitClosed_.load(std::memory_order_relaxed) << "\n\n"
            << "# HELP ws_kafka_persist_dropped_total Kafka persistence skipped because the TBB pool was saturated (message was still delivered live).\n"
            << "# TYPE ws_kafka_persist_dropped_total counter\n"
            << "ws_kafka_persist_dropped_total " << wsKafkaPersistDropped_.load(std::memory_order_relaxed) << "\n\n"
@@ -489,6 +533,12 @@ public:
            << "# HELP ws_hwm_install_failed_total Connections that could not be given output-buffer protection (getConnectionPtr() returned nothing). They fall back to unbounded buffering, i.e. the pre-fix behaviour.\n"
            << "# TYPE ws_hwm_install_failed_total counter\n"
            << "ws_hwm_install_failed_total " << wsHwmInstallFailed_.load(std::memory_order_relaxed) << "\n\n"
+           << "# HELP ws_cluster_bus_ready Whether cross-instance delivery is currently believed to work (1 = yes). 0 while the cluster bus is disabled, failed to start, or its liveness probe stopped getting echoes.\n"
+           << "# TYPE ws_cluster_bus_ready gauge\n"
+           << "ws_cluster_bus_ready " << wsClusterBusReady_.load(std::memory_order_relaxed) << "\n"
+           << "# HELP ws_cluster_bus_probe_age_seconds Seconds since the last self-echo of the liveness probe packet. -1 means no echo has ever been seen (just started, or the bus has never worked). Growing past 15 means cross-instance delivery is about to be / has been marked unavailable.\n"
+           << "# TYPE ws_cluster_bus_probe_age_seconds gauge\n"
+           << "ws_cluster_bus_probe_age_seconds " << static_cast<int64_t>(wsClusterBusProbeAge_.load(std::memory_order_relaxed)) << "\n"
            << "# HELP ws_fanout_inflight_deliveries Deliveries dispatched into target IO-loop queues but not yet executed (gauge).\n"
            << "# TYPE ws_fanout_inflight_deliveries gauge\n"
            << "ws_fanout_inflight_deliveries " << wsFanoutInflight_.load(std::memory_order_relaxed) << "\n"
@@ -579,6 +629,9 @@ private:
     std::atomic<uint64_t> wsMessagesDeduped_{0};
     std::atomic<uint64_t> wsMessageDedupEnabled_{0};
     std::atomic<uint64_t> wsDirectBackpressured_{0};
+    std::atomic<uint64_t> wsDirectGatedDrops_{0};
+    std::atomic<uint64_t> wsRateLimited_{0};
+    std::atomic<uint64_t> wsRateLimitClosed_{0};
     std::atomic<uint64_t> wsKafkaPersistDropped_{0};
     std::atomic<uint64_t> wsKafkaProduceFailed_{0};
     std::atomic<uint64_t> wsKafkaDeliveryFailed_{0};
@@ -609,6 +662,9 @@ private:
     std::atomic<uint64_t> wsConnHwmHits_{0};
     std::atomic<uint64_t> wsConnPeakPending_{0};
     std::atomic<uint64_t> wsConnsCongested_{0};
+    std::atomic<uint64_t> wsClusterBusReady_{0};
+    // 有符号：-1 = 从未收到过探针回环。
+    std::atomic<int64_t> wsClusterBusProbeAge_{-1};
     std::atomic<uint64_t> wsConnCongestionCleared_{0};
     std::atomic<uint64_t> wsHwmInstallFailed_{0};
 

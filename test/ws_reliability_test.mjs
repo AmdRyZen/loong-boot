@@ -18,6 +18,13 @@
 
 const BASE = process.argv[2] || 'ws://127.0.0.1:19096/chat';
 const ROOM = `rel_${Date.now()}`;
+// 幂等键在服务端按 (发送者昵称, 房间, key) 记账。新协议客户端
+// （带 requestId）现在【恒定去重】—— 这是「ACK 丢失后同 key 重发」能安全
+// 工作的前提。因此同一进程里重复跑本脚本时，key 必须每次不同，否则
+// 第二遍会被正确地判成重发：不广播、只回显，房间消息类断言全挂。
+// （注：房间名每次也带 Date.now()，所以「键含房间」本身已能隔离两轮；
+//   RUN 仍然保留，避免房间名被复用时又撞上。）
+const RUN = Date.now().toString(36);
 
 let failures = 0;
 const ok = (cond, msg) => {
@@ -98,7 +105,7 @@ console.log('B1 · 逐条 ACK');
   a.drain();
 
   // ① 成功路径
-  a.send({ key: 'k1', requestId: 'r1', action: 'message', msgContent: 'hello', toUser: '' });
+  a.send({ key: `k1_${RUN}`, requestId: 'r1', action: 'message', msgContent: 'hello', toUser: '' });
   const ack1 = await a.wait(isAck('r1'));
   ok(ack1.code === 200, `成功投递 → ACK code=200（实际 ${ack1.code}）`);
   ok(ack1.id > 0, `ACK 带回消息 id（实际 ${ack1.id}）`);
@@ -106,7 +113,7 @@ console.log('B1 · 逐条 ACK');
 
   // ② 私聊目标离线 → 404（终态，客户端应停止重试）
   a.send({
-    key: 'k2',
+    key: `k2_${RUN}`,
     requestId: 'r2',
     action: 'message',
     msgContent: 'to-ghost',
@@ -117,13 +124,13 @@ console.log('B1 · 逐条 ACK');
   ok(typeof ack2.message === 'string' && ack2.message.length > 0, 'ACK 带可读失败原因');
 
   // ③ 空内容 → 400
-  a.send({ key: 'k3', requestId: 'r3', action: 'message', msgContent: '', toUser: '' });
+  a.send({ key: `k3_${RUN}`, requestId: 'r3', action: 'message', msgContent: '', toUser: '' });
   const ack3 = await a.wait(isAck('r3'));
   ok(ack3.code === 400, `空内容 → ACK code=400（实际 ${ack3.code}）`);
 
   // ④ 老客户端（不发 requestId）不应收到任何 ACK
   const before = a.inbox.length;
-  a.send({ key: 'k4', action: 'message', msgContent: 'legacy', toUser: '' });
+  a.send({ key: `k4_${RUN}`, action: 'message', msgContent: 'legacy', toUser: '' });
   await sleep(800);
   const acks = a.inbox.filter((m) => m.type === 'ack');
   ok(acks.length === 0, `不发 requestId 则收不到 ACK（inbox 从 ${before} 变 ${a.inbox.length}，ACK 数 ${acks.length}）`);
@@ -142,7 +149,7 @@ let bobLastSeq = 0;
   b.drain();
 
   for (let i = 0; i < 5; i++) {
-    a.send({ key: `s${i}`, requestId: `sr${i}`, action: 'message', msgContent: `seq_${i}`, toUser: '' });
+    a.send({ key: `s${i}_${RUN}`, requestId: `sr${i}`, action: 'message', msgContent: `seq_${i}`, toUser: '' });
   }
   await sleep(1200);
 
@@ -169,7 +176,7 @@ console.log('B4 · 断线补齐');
   a.drain();
   b1.drain();
 
-  a.send({ key: 'p1', requestId: 'pr1', action: 'message', msgContent: 'before_cut', toUser: '' });
+  a.send({ key: `p1_${RUN}`, requestId: 'pr1', action: 'message', msgContent: 'before_cut', toUser: '' });
   await sleep(800);
   const before = b1.inbox.filter(isMsg).find((m) => m.message === 'before_cut');
   ok(!!before, '断线前 bob 收到了 before_cut');
@@ -179,7 +186,7 @@ console.log('B4 · 断线补齐');
 
   // bob 不在的时候，alice 发 3 条
   for (let i = 0; i < 3; i++) {
-    a.send({ key: `g${i}`, requestId: `gr${i}`, action: 'message', msgContent: `missed_${i}`, toUser: '' });
+    a.send({ key: `g${i}_${RUN}`, requestId: `gr${i}`, action: 'message', msgContent: `missed_${i}`, toUser: '' });
   }
   await sleep(1000);
 
@@ -199,16 +206,22 @@ console.log('B4 · 断线补齐');
   ok(done.code === 200, `游标在可回放范围内 → sync_done code=200（实际 ${done.code}）`);
   ok(done.seq >= cursor + 3, `sync_done 报出房间当前最大序号（${cursor} + 3 ≤ ${done.seq}）`);
 
+  // 服务端对 sync 有【每连接 1 秒 1 次】的限频：一次 sync 最多回放 journalCap 条，
+  // 连发就是「用小请求换大响应」的放大面。测试必须按真实节奏发，不能连发 ——
+  // 连发会被正确地拒成 503，那不是补齐失败。
+  const syncAfter = async (payload) => {
+    await sleep(1100);
+    b2.drain();
+    b2.send(payload);
+    return b2.wait(isSyncDone, 4000);
+  };
+
   // 游标超范围 → 明确回 206，不假装补齐
-  b2.drain();
-  b2.send({ action: 'sync', sinceSeq: 999999999 });
-  const done2 = await b2.wait(isSyncDone, 4000);
+  const done2 = await syncAfter({ action: 'sync', sinceSeq: 999999999 });
   ok(done2.code === 206, `游标超出可回放范围 → sync_done code=206（实际 ${done2.code}）`);
 
   // 没有游标（0）→ 不回放任何历史
-  b2.drain();
-  b2.send({ action: 'sync', sinceSeq: 0 });
-  const done3 = await b2.wait(isSyncDone, 4000);
+  const done3 = await syncAfter({ action: 'sync', sinceSeq: 0 });
   const hist = b2.inbox.filter(isMsg);
   ok(hist.length === 0 && done3.code === 200, `sinceSeq=0 → 不回放历史（实际回放 ${hist.length} 条）`);
 
@@ -224,22 +237,38 @@ console.log('B4 · 断线补齐');
     `sync_done 告知当前实例标识（${myInstance}）`
   );
 
-  b2.drain();
-  b2.send({ action: 'sync', sinceSeq: 12345, sinceInstance: 'inst_from_another_box' });
-  const done4 = await b2.wait(isSyncDone, 4000);
+  const done4 = await syncAfter({
+    action: 'sync',
+    sinceSeq: 12345,
+    sinceInstance: 'inst_from_another_box',
+  });
   ok(done4.code === 206, `另一实例的游标 → code=206（实际 ${done4.code}）`);
   ok(/另一实例/.test(done4.message || ''), `原因写明「另一实例」（实际「${done4.message}」）`);
   ok(b2.inbox.filter(isMsg).length === 0, '不回放（避免拿错序号空间乱补）');
 
   // 同一个实例、游标确实超范围 → 仍是 206，但原因不该说「另一实例」
-  b2.drain();
-  b2.send({ action: 'sync', sinceSeq: 999999999, sinceInstance: myInstance });
-  const done5 = await b2.wait(isSyncDone, 4000);
+  const done5 = await syncAfter({
+    action: 'sync',
+    sinceSeq: 999999999,
+    sinceInstance: myInstance,
+  });
   ok(done5.code === 206, `本实例的越界游标 → code=206（实际 ${done5.code}）`);
   ok(
     !/另一实例/.test(done5.message || ''),
     `且不会被误报成「另一实例」（实际「${done5.message}」）`
   );
+
+  // ── sync 限频：反放大 ──────────────────────────────────────────────────
+  // 窗口外受理、窗口内拒绝，且拒绝必须是【可重试的 503】——
+  // 客户端据此退避重发，而不是把「没补上」当成终态。
+  await sleep(1100);
+  b2.drain();
+  b2.send({ action: 'sync', sinceSeq: 0 });
+  const rl1 = await b2.wait(isSyncDone, 4000);
+  b2.send({ action: 'sync', sinceSeq: 0 }); // 紧接着第二次
+  const rl2 = await b2.wait(isSyncDone, 4000);
+  ok(rl1.code !== 503, `限频窗口外正常受理（实际 ${rl1.code}）`);
+  ok(rl2.code === 503, `1 秒内第二次 sync 被限流且可重试（实际 ${rl2.code}）`);
 
   a.close();
   b2.close();

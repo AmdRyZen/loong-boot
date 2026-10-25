@@ -168,6 +168,11 @@ void KafkaManager::rdKafkaLogCallback(const rd_kafka_t* rk, int level, const cha
         rd_kafka_conf_set(producer_conf_, "retries", "3", errStr, sizeof(errStr)); // 增加生产者重试机制
         rd_kafka_conf_set(producer_conf_, "delivery.timeout.ms", "30000", errStr, sizeof(errStr)); // 增加发送超时
         rd_kafka_conf_set(producer_conf_, "max.in.flight.requests.per.connection", "5", errStr, sizeof(errStr)); // 增加控制乱序问题
+        // 幂等生产：重试不会在分区内制造重复或重排。仅靠 max.in.flight=5 不足，
+        // 因为重试批次可能插到新批次之前。归档链路已经在应用层按 key 串行提交，
+        // 这一层负责封住 broker 重试造成的最后一段乱序。
+        rd_kafka_conf_set(producer_conf_, "enable.idempotence", "true", errStr, sizeof(errStr));
+        rd_kafka_conf_set(producer_conf_, "acks", "all", errStr, sizeof(errStr));
 
         rd_kafka_conf_set_dr_msg_cb(producer_conf_, KafkaManager::deliveryReportCallback);
 

@@ -1,7 +1,7 @@
 #include "ChatWebsocket.h"
 #include "utils/redisUtils.h"
 #include "utils/ConfigPath.h"
-#include "coroutinePool/TbbCoroutinePool.h"
+#include "utils/OrderedTaskQueue.h"
 #include "utils/PrometheusMetrics.h"
 //#include "user.pb.h"
 #include <glaze/glaze.hpp>
@@ -126,6 +126,21 @@ void ChatWebsocket::reloadSwitches()
     Metrics::PrometheusRegistry::instance().setSwitchStates(kafka, dedup);
 }
 
+namespace
+{
+// Kafka 归档专用的按 key 保序队列。
+//
+// 必须是函数内静态量：首次投递时才构造，晚于 Application 构造函数里的
+// KafkaManager::initialize；静态析构按逆序执行，因此它一定先排空并 join，
+// 再轮到 KafkaManager 销毁。若做成 ChatWebsocket 成员，控制器析构时机与
+// Kafka 全局单例没有明确先后关系，退出阶段会出现 produce-after-destroy。
+OrderedTaskQueue& kafkaOrderedQueue()
+{
+    static OrderedTaskQueue queue(/*stripes=*/8, /*maxPending=*/1 << 15);
+    return queue;
+}
+} // namespace
+
 void ChatWebsocket::produceKafkaAsync(std::string_view topicName, std::string_view payload,
                                       std::string_view key)
 {
@@ -147,16 +162,20 @@ void ChatWebsocket::produceKafkaAsync(std::string_view topicName, std::string_vi
         return; // 开发或压测模式下跳过 Kafka 写入，保持极致 CPU 吞吐
     }
 
-    // 只有在真正要投递时才把视图落成所有权字符串（TBB worker 会活过调用方栈帧）。
+    // 只有在真正要投递时才把视图落成所有权字符串（后台 worker 会活过调用方栈帧）。
     // 原实现另有一个 `const std::string topicForLog = topicName;` 的无条件拷贝，
     // 仅仅为了失败日志 —— 现在日志直接打视图，拷贝彻底消失。
     //
-    // 背压：TBB 池积压超过上限时 submit 会返回 false。
+    // 背压：按 key 保序队列积压超过上限时 submit 会返回 false。
     // 原实现忽略返回值 → 消息被静默丢弃，无日志无指标，上层误以为已落库。
-    const bool accepted = TbbCoroutinePool::instance().submit(
+    //
+    // key 为空时退化为 topic：至少保证同一主题内的相对顺序；房间/私聊正常
+    // 都会传 key（房间名 / 排序后的双方昵称）。
+    const bool accepted = kafkaOrderedQueue().submit(
+        key.empty() ? topicName : key,
         [topic = std::string(topicName), payload = std::string(payload),
          partitionKey = std::string(key)] {
-            // ⚠️ TbbCoroutinePool 内部对任务包了 catch(...)，lambda 里抛出的任何异常
+            // ⚠️ 后台 worker 对任务包了 catch(...)，lambda 里抛出的任何异常
             // 都会被【静默吞掉】（无日志无指标）。KafkaManager::getTopic 在未初始化 /
             // topic 句柄创建失败时抛 runtime_error —— 不在这里自己接住的话，
             // 消息就是无声消失。所以本 lambda 内的一切工作都必须自己兜异常。
@@ -206,16 +225,13 @@ void ChatWebsocket::produceKafkaAsync(std::string_view topicName, std::string_vi
 
             // ── 单次投递，不做 sleep 重试 ───────────────────────────────────────
             //
-            // 原实现用 retryWithSleep（默认 3 次 × 100ms）在【TBB worker 线程里】
+            // 原实现用 retryWithSleep（默认 3 次 × 100ms）在【后台 worker 线程里】
             // std::this_thread::sleep_for。两个问题：
             //
-            // ① 它真的会阻塞池。aop/Application.h 用
-            //    tbb::global_control(max_allowed_parallelism, hardware_concurrency())
-            //    把 TBB 并行度锁死在核数上，所以「几个 worker 在 sleep」等于
-            //    「池少几个执行槽」。broker 抖动时所有 worker 一起进重试 ⇒
-            //    池停止抽干 ⇒ activeTasks_ 涨过 32768 ⇒ submit 返回 false ⇒
-            //    ws_kafka_persist_dropped_total 飙升（丢的是落库，消息本身已投递）。
-            //    TBB worker 应当非阻塞。
+            // ① 它真的会阻塞执行槽。broker 抖动时所有 worker 一起进重试，
+            //    归档队列停止排空 ⇒ 很快触达上限并开始丢弃落库
+            //    （ws_kafka_persist_dropped_total 飙升，消息本身已投递）。
+            //    归档 worker 应当非阻塞。
             //
             // ② 重试本身几乎没有价值。safeProduce 返回 false 只有三种成因：
             //    · MSG_SIZE_TOO_LARGE —— 永久失败，重试无意义（WS 上限 128KB，远小于 1MB）；
@@ -245,7 +261,18 @@ void ChatWebsocket::produceKafkaAsync(std::string_view topicName, std::string_vi
         // 混进 ws_messages_dropped_total 会让「实时消息没投出去」和
         // 「投出去了但没落库」这两类完全不同的事故变成一个数。
         Metrics::PrometheusRegistry::instance().recordKafkaPersistDropped();
-        LOG_WARN << "TBB pool saturated, dropped Kafka persistence for topic: " << topicName;
+
+        // ⚠️ 这条日志在【房间 pubMtx 内】执行（persistAccepted 由 fanOutRoom 在
+        // 持锁期间回调）。饱和时它会被每条消息触发一次，而 LOG_WARN 是同步写
+        // 文件 —— 在房间锁里做无上限的文件 I/O，会把整个房间的发布链一起拖死，
+        // 正好在「已经过载」的时刻放大事故。必须限流，且限流器本身是零分配的。
+        static loong::log::RateLimiter persistDropLimiter{1000, "kafka.persist_drop"};
+        if (persistDropLimiter.allow())
+        {
+            LOG_WARN << "Kafka ordered queue saturated, dropped persistence for topic: " << topicName
+                     << " (" << (1 + persistDropLimiter.takeSuppressed())
+                     << " occurrence(s) since last log, total: ws_kafka_persist_dropped_total)";
+        }
     }
 }
 
@@ -301,8 +328,19 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                 // 回一个可读的错误。原先回的是默认构造的空 VO，客户端只能收到
                 // {"code":-1,"id":0,"name":"","message":""} —— 既不知道原因，
                 // 也没法对应到具体请求（与 503/404 的 code 体系也不一致）。
-                wsConn->send(buildNoticeJson(-1, "系统通知", "消息格式错误：无法解析 JSON"),
-                             WebSocketMessageType::Text);
+                //
+                // ⚠️ 这条 send 必须在闸门与限流之下：解析失败的触发成本几乎为零
+                //（客户端狂发非法负载即可无限刷），而每次都会往连接里写一帧。
+                // 慢连接 + 非法负载 = 输出缓冲无界增长，正是闸门要防的事。
+                //
+                // 限流用 shouldSendErrorNotice（每连接每秒一条）：这条通知的
+                // 内容对同一客户端是恒定的，重复发送没有任何信息增量。
+                if (wsConn->hasContext() &&
+                    wsConn->getContextRef<Subscriber>().shouldSendErrorNotice())
+                {
+                    wsConn->send(buildNoticeJson(-1, "系统通知", "消息格式错误：无法解析 JSON"),
+                                 WebSocketMessageType::Text);
+                }
 
                 // 触发频率完全由客户端决定（狂发非法负载即可无限刷），必须限流。
                 // 是真错误所以不静默。行内给出「本次覆盖多少条」；
@@ -358,9 +396,42 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                 // 排障只能靠猜。这里明确回一个可读错误。
                 if (action != "message")
                 {
-                    wsConn->send(
-                        buildNoticeJson(-1, "系统通知", "未知的 action，仅支持 message / ping / sync"),
-                        WebSocketMessageType::Text);
+                    // 同样是「客户端一句话就能触发一次 send」的放大路径：
+                    // 内容恒定 ⇒ 限流到每连接每秒一条，且受闸门约束。
+                    if (subscriber.shouldSendErrorNotice())
+                    {
+                        wsConn->send(
+                            buildNoticeJson(-1, "系统通知",
+                                            "未知的 action，仅支持 message / ping / sync"),
+                            WebSocketMessageType::Text);
+                    }
+                    return;
+                }
+
+                // ── 每连接消息速率准入 ────────────────────────────────────────────
+                //
+                // 放在所有实际工作之前：解析已经发生（无法避免），但至少不再继续
+                // 分配消息 id、判重、扇出、落库和写日志。默认额度很高，正常客户端
+                // 不会触发；持续超限的连接直接关闭，避免「每条都回 429」本身成为
+                // 新的放大路径。
+                if (!subscriber.allowMessage(core_->maxMsgsPerSec, core_->msgBurst))
+                {
+                    Metrics::PrometheusRegistry::instance().recordWsRateLimited();
+                    if (subscriber.consecutiveRateViolations_ >= 256)
+                    {
+                        Metrics::PrometheusRegistry::instance().recordWsRateLimitClosed();
+                        LOG_WARN << "Closing connection for sustained message rate abuse, user: "
+                                 << senderName;
+                        wsConn->forceClose();
+                        return;
+                    }
+                    sendAck(wsConn, msg_dto.requestId, 429, 0, 0,
+                            "消息发送过快，本条未投递");
+                    if (subscriber.shouldSendOverloadNotice())
+                    {
+                        wsConn->send(buildNoticeJson(429, "系统通知", "消息发送过快，请降低发送频率"),
+                                     WebSocketMessageType::Text);
+                    }
                     return;
                 }
 
@@ -368,9 +439,14 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                 // 广播给全房间（还占用一个消息 id），属于无效流量放大。
                 if (msg_dto.msgContent.empty())
                 {
+                    // ACK 必须逐条回（它是这条请求的机器可读回执），
+                    // 但 notice 是「给用户看的同一句话」，限流即可。
                     sendAck(wsConn, msg_dto.requestId, 400, 0, 0, "消息内容不能为空");
-                    wsConn->send(buildNoticeJson(-1, "系统通知", "消息内容不能为空"),
-                                 WebSocketMessageType::Text);
+                    if (subscriber.shouldSendErrorNotice())
+                    {
+                        wsConn->send(buildNoticeJson(-1, "系统通知", "消息内容不能为空"),
+                                     WebSocketMessageType::Text);
+                    }
                     return;
                 }
 
@@ -395,16 +471,30 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                     //    客户端按约定重发时会查到一条从未投递成功的登记而被静默吞掉
                     //    —— 消息永久丢失，客户端却收到 200。详见头文件里的说明。
                     std::string dedupKey;
+                    // 新协议客户端（带 requestId）声明了自己能为每条消息生成唯一 key，
+                    // 因此即使全局 enable_message_dedup=false 也要对它开启去重。
+                    //
+                    // 这是「ACK 丢失后重连重发」能安全工作的前提：服务端已经接受、
+                    // 只是 ACK 没回来时，客户端必须用同一个 key 重发；若不去重，
+                    // 房间里的其他人会看到两条。老客户端（无 requestId）保持原行为，
+                    // 不会因为把 key 填成房间名而静默丢消息。
                     const bool dedupActive =
-                        messageDedupEnabled().load(std::memory_order_relaxed) && !msg_dto.key.empty();
+                        !msg_dto.key.empty() &&
+                        (messageDedupEnabled().load(std::memory_order_relaxed) ||
+                         !msg_dto.requestId.empty());
                     if (dedupActive)
                     {
-                        // 键 = (发送者昵称, 客户端 dto.key)。必须带上发送者：
+                        // 键 = (发送者昵称, 房间, 客户端 dto.key)。必须带上发送者：
                         // key 由客户端提供，两个客户端撞上同一个值是完全可能的。
-                        // 分隔符用 \x1f（US，单元分隔符）—— 昵称里出现它的概率远低于
-                        // '|' 之类可打印字符，且无需转义。
-                        dedupKey.reserve(senderName.size() + msg_dto.key.size() + 1);
+                        // 也必须带上房间：同一昵称在两个房间各开一个窗口时，
+                        // chat.html 的 key 是按「房间内序号」生成的（或用户自定义），
+                        // 不含房间就会让两个房间的第一条消息撞成同一条 ——
+                        // 后发的那个房间会收到「重复」回执，而消息根本没广播。
+                        // 分隔符用 \x1f（US，单元分隔符）—— 昵称/房间名里出现它的
+                        // 概率远低于 '|' 之类可打印字符，且无需转义。
+                        dedupKey.reserve(senderName.size() + topic.size() + msg_dto.key.size() + 2);
                         dedupKey.append(senderName).push_back('\x1f');
+                        dedupKey.append(topic).push_back('\x1f');
                         dedupKey.append(msg_dto.key);
 
                         uint64_t dupSeq = 0;
@@ -463,9 +553,10 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                         // ① 本实例本地投递（多端登录：该昵称的所有在线会话都收到）
                         bool echoedToSender = false;
                         size_t backpressured = 0;
+                        size_t gatedTargets = 0;
                         const size_t localDelivered =
                             deliverDirectLocally(*core_, targetUser, json, wsConn, &echoedToSender,
-                                                 &backpressured);
+                                                 &backpressured, &gatedTargets);
 
                         // ①' 背压：本实例的在途投递额度已满 ⇒ 整条消息【不投、不广播、
                         //     不落库】，明确回 503。
@@ -474,6 +565,23 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                         // 若这里仍继续广播集群 + 落库，发送者收到 503 而别的实例
                         // 已经投出去了 —— 客户端按 503 重发就会在那边产生重复。
                         //
+                        // ①'' 接收方连接输出拥塞：整条私聊未投，明确回 503。
+                        //
+                        // 私聊没有回放日志，不能像房间扇出那样「跳过慢连接」——
+                        // 跳过就是永久丢失。返回 503 让发送者退避重试；去重登记
+                        // 还没发生，重试不会被误判成重复。
+                        if (gatedTargets > 0)
+                        {
+                            sendAck(wsConn, msg_dto.requestId, 503, 0, 0,
+                                    "接收方连接拥塞，私聊未投递，请重试");
+                            Metrics::PrometheusRegistry::instance().recordWsMessageDropped();
+                            if (subscriber.shouldSendOverloadNotice())
+                            {
+                                sendOverloadNotice(wsConn);
+                            }
+                            return;
+                        }
+
                         // ⚠️ 必须先于 404 判定：两者都是 localDelivered == 0，
                         //    但「本实例有这个人、只是额度满了」和「本实例没这个人」
                         //    是两件完全不同的事。报 404 会让客户端以为对方不在线。
@@ -520,8 +628,14 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                             // 与 503 的区别就在这里 —— 503 要重试，404 不要。
                             sendAck(wsConn, msg_dto.requestId, 404, 0, 0,
                                     std::format("用户 {} 当前不在线", targetUser));
-                            wsConn->send(buildNoticeJson(
-                                404, "系统通知", std::format("用户 {} 当前不在线", targetUser).c_str()));
+                            // notice 只是「人话版本」，内容对同一目标恒定 ⇒ 限流。
+                            // ACK 才是逐条回执，不受限流影响（客户端据它停重试）。
+                            if (subscriber.shouldSendErrorNotice())
+                            {
+                                wsConn->send(buildNoticeJson(
+                                    404, "系统通知",
+                                    std::format("用户 {} 当前不在线", targetUser).c_str()));
+                            }
                             return;
                         }
 
@@ -537,7 +651,13 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                         }
 
                         // 逐条 ACK（B1）：私聊的 seq 恒为 0（见上）。
-                        sendAck(wsConn, msg_dto.requestId, 200, msgId, 0, {});
+                        //
+                        // ⚠️ ACK 放在集群广播【之后】发。原实现放在广播之前：
+                        // 客户端收到 200 就可能立刻断开/关闭页面，而 publishToCluster
+                        // 是异步的（execCommandAsync 只是把命令塞进 Redis 连接），
+                        // 若此时进程恰好退出或连接被回收，这条消息就【从未】离开本实例
+                        // —— 发送者却已经拿到了「成功」。先广播再回执，能把「回执为真」
+                        // 的窗口收到最窄（仍然不是端到端确认，见 ClusterPacket 的说明）。
 
                         // ② 回显给发送者：他本人不在目标会话列表里（没收到自己那一份）才补。
                         //    注意条件是「没回显过」而不是「本地投递成功过」——
@@ -568,6 +688,9 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                         // originInstance/ts，回放端才能还原「谁发给谁」。分区键取
                         // 「排序后的双方昵称」，保证同一会话两个方向落同一分区。
                         persistDirectMessage(*core_, senderName, targetUser, msg_vo, msg_dto.key);
+
+                        // ④ 最后才回 ACK：见上面关于顺序的说明。
+                        sendAck(wsConn, msg_dto.requestId, 200, msgId, 0, {});
                         return;
                     }
 
@@ -589,6 +712,14 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                     // 带上本连接缓存的房间句柄：hint 与 topic 同源（都是本订阅者的字段），
                     // 因此 publish 可以安全地跳过全局房间表锁。
                     uint64_t roomSeq = 0;
+                    // 归档提交必须在房间 pubMtx 内完成：否则两个 IO 线程可能
+                    // 在 fanOutRoom 返回后反超，Kafka 分区内顺序与 roomSeq 不一致。
+                    const auto persistAccepted =
+                        [&core = *core_, &topic, &senderName, &msg_vo, &msg_dto](
+                            uint64_t seq, const std::shared_ptr<const std::string>&) {
+                            persistRoomMessage(core, topic, senderName, msg_vo, seq, "room",
+                                               msg_dto.key);
+                        };
                     if (!fanOutRoom(*core_, topic,
                                     [&msg_vo](uint64_t seq) {
                                         // 序号必须进线格式：客户端靠它做重连游标
@@ -598,7 +729,8 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                                         (void)glz::write_json(msg_vo, s);
                                         return s;
                                     },
-                                    /*broadcastToCluster=*/true, subscriber.room_, &roomSeq))
+                                    /*broadcastToCluster=*/true, subscriber.room_, &roomSeq,
+                                    persistAccepted))
                     {
                         auto& metrics = Metrics::PrometheusRegistry::instance();
                         metrics.recordWsMessageDropped();
@@ -653,9 +785,14 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
                     // 客户端据此确认「这条真的投出去了」并推进本地游标。
                     sendAck(wsConn, msg_dto.requestId, 200, msgId, roomSeq, {});
 
-                    // 落库放在投递成功之后：被背压拒绝的消息不落库（见上）。
-                    persistRoomMessage(*core_, topic, senderName, msg_vo, roomSeq, "room",
-                                       msg_dto.key);
+                    // 有订阅者时落库已在 persistAccepted 里、房间锁内完成。
+                    // 无订阅者时 build 不会被调用（roomSeq 仍为 0），但历史仍应
+                    // 保留这条消息，因此在这里补一次；此时没有房间定序可言。
+                    if (roomSeq == 0)
+                    {
+                        persistRoomMessage(*core_, topic, senderName, msg_vo, 0, "room",
+                                           msg_dto.key);
+                    }
                 }
             }
         }
@@ -665,6 +802,15 @@ void ChatWebsocket::handleNewMessage(const WebSocketConnectionPtr& wsConn, std::
         // 只打日志的话，线上没有任何可累加的信号（日志可能被级别过滤或轮转掉）。
         Metrics::PrometheusRegistry::instance().recordWsHandlerException();
         LOG_ERROR << "Error in handleNewMessage: " << e.what();
+    }
+    catch (...)
+    {
+        // 兜底：drogon 的 IO 线程里抛出的非 std::exception 异常若逃出本函数，
+        // 会直接触发 std::terminate（整个进程退出）。glaze 的 write_json 在
+        // 极端情况下、以及 std::bad_alloc 之外的实现定义异常都可能走到这里。
+        // 单个连接的坏消息不该能杀死进程。
+        Metrics::PrometheusRegistry::instance().recordWsHandlerException();
+        LOG_ERROR << "Error in handleNewMessage: unknown exception type";
     }
 }
 
@@ -781,6 +927,11 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
         // broadcastToCluster = false：在线状态是本实例的本地事实。广播给其他实例后，
         // 那边的同名用户会收到与自己无关的「XX 已加入」；退群公告同理（见下）。
         uint64_t roomSeq = 0;
+        const auto persistAccepted =
+            [&core = *core_, &topic, &userName, &msg_vo](
+                uint64_t seq, const std::shared_ptr<const std::string>&) {
+                persistRoomMessage(core, topic, userName, msg_vo, seq, "notice");
+            };
         if (!fanOutRoom(*core_, topic,
                         [&msg_vo](uint64_t seq) {
                             // 公告也带序号：客户端游标靠它推进，否则重连时会把
@@ -791,7 +942,8 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
                             (void)glz::write_json(msg_vo, s);
                             return s;
                         },
-                        /*broadcastToCluster=*/false, subscriber->room_, &roomSeq))
+                        /*broadcastToCluster=*/false, subscriber->room_, &roomSeq,
+                        persistAccepted))
         {
             Metrics::PrometheusRegistry::instance().recordWsMessageDropped();
             // 与消息丢弃共用同一个限流器：同属「房间积压」这一种过载现象。
@@ -803,11 +955,12 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
                          << " occurrence(s) since last log (total: ws_messages_dropped_total)";
             }
         }
-        else
+        else if (roomSeq == 0)
         {
             // 公告也落库（type = "notice"），否则历史回放里会出现「有人说话但
             // 没人在房间里」的断裂。注意公告不跨实例广播，所以只有本实例写一条。
-            persistRoomMessage(*core_, topic, userName, msg_vo, roomSeq, "notice");
+            // 有订阅者时已由 persistAccepted 在房间锁内提交，不能重复落库。
+            persistRoomMessage(*core_, topic, userName, msg_vo, 0, "notice");
         }
     }
     catch (const std::exception& e)
@@ -899,6 +1052,11 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
         // 与聊天消息共用同一房间的发布锁，保证「离群公告」与其他消息的相对顺序稳定。
         // 同样不跨实例广播（理由见 handleNewConnection 的入群公告）。
         uint64_t roomSeq = 0;
+        const auto persistAccepted =
+            [&core = *core_, &topic, &userName, &msg_vo](
+                uint64_t seq, const std::shared_ptr<const std::string>&) {
+                persistRoomMessage(core, topic, userName, msg_vo, seq, "notice");
+            };
         if (!fanOutRoom(*core_, topic,
                         [&msg_vo](uint64_t seq) {
                             // 与入群公告同理：序号要进线格式，客户端游标才推得动。
@@ -907,7 +1065,8 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
                             (void)glz::write_json(msg_vo, s);
                             return s;
                         },
-                        /*broadcastToCluster=*/false, subscriber.room_, &roomSeq))
+                        /*broadcastToCluster=*/false, subscriber.room_, &roomSeq,
+                        persistAccepted))
         {
             Metrics::PrometheusRegistry::instance().recordWsMessageDropped();
             // 同上：与消息丢弃共用限流器。
@@ -918,9 +1077,9 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
                          << " occurrence(s) since last log (total: ws_messages_dropped_total)";
             }
         }
-        else
+        else if (roomSeq == 0)
         {
-            persistRoomMessage(*core_, topic, userName, msg_vo, roomSeq, "notice");
+            persistRoomMessage(*core_, topic, userName, msg_vo, 0, "notice");
         }
     }
     catch (const std::exception& e)
@@ -935,11 +1094,16 @@ size_t ChatWebsocket::deliverDirectLocally(Core& core,
                                           const std::string& json,
                                           const WebSocketConnectionPtr& sender,
                                           bool* echoedToSender,
-                                          size_t* backpressured)
+                                          size_t* backpressured,
+                                          size_t* gated)
 {
     if (backpressured != nullptr)
     {
         *backpressured = 0;
+    }
+    if (gated != nullptr)
+    {
+        *gated = 0;
     }
 
     // 先在锁内拷出目标会话列表，投递放在锁外 —— 不持锁做 IO。
@@ -963,6 +1127,32 @@ size_t ChatWebsocket::deliverDirectLocally(Core& core,
     }
     if (total == 0)
     {
+        return 0;
+    }
+
+    // ── 连接级拥塞预检：全有或全无 ────────────────────────────────────────────
+    //
+    // 私聊没有 journal 可以回放，一旦某条目标会话因 gate 被跳过，那条消息
+    // 就永久丢了。因此不能像房间扇出那样「只跳过这一个订阅者」：只要目标里
+    // 有任意一个会话正在拥塞，就整条拒绝并回 503，让发送者稍后重试。
+    //
+    // 这里在派发前做一次快照判定；真正执行时还会再判一次（gate 可能在这段
+    // 窗口内被高水位回调关上），后者只作为最后防线并计入 gated 指标。
+    size_t gatedCount = 0;
+    for (const auto& s : targets)
+    {
+        if (s.conn && s.sub && s.sub->isCongested())
+        {
+            ++gatedCount;
+        }
+    }
+    if (gatedCount != 0)
+    {
+        if (gated != nullptr)
+        {
+            *gated = gatedCount;
+        }
+        Metrics::PrometheusRegistry::instance().recordWsDirectGatedDrops(gatedCount);
         return 0;
     }
 
@@ -1014,7 +1204,9 @@ size_t ChatWebsocket::deliverDirectLocally(Core& core,
     // payload 用 shared_ptr 持有：派发出去的批次会活过本函数的栈帧（它要等
     // 目标 loop 执行到），形参 json 是引用，直接捕获就是悬垂引用。
     std::shared_ptr<const std::string> payload;
-    std::vector<std::pair<TrantorLoopHandle, std::vector<WebSocketConnectionPtr>>> groups;
+    // 携带 Session 而不只是连接：执行批次时还要读 Subscriber::gate，
+    // 这样即使 gate 在预检之后才关上，也不会继续往拥塞连接里写。
+    std::vector<std::pair<TrantorLoopHandle, std::vector<Session>>> groups;
     groups.reserve(4);
 
     size_t dispatched = 0;
@@ -1036,6 +1228,17 @@ size_t ChatWebsocket::deliverDirectLocally(Core& core,
             // 取不到 loop（未登记 / 单测路径）：无处排队，退化为直投。
             // 语义与优化前一致，只是这一份不参与在途计数 —— 立刻归还额度。
             // ⚠️ 仍不判 connected()（跨线程读非原子成员是 data race）。
+            if (s.sub && s.sub->isCongested())
+            {
+                // 预检之后才关上的极窄窗口：不能写，也不能假装投递成功。
+                inFlight->fetch_sub(1, std::memory_order_relaxed);
+                if (gated != nullptr)
+                {
+                    ++*gated;
+                }
+                Metrics::PrometheusRegistry::instance().recordWsDirectGatedDrops();
+                continue;
+            }
             s.conn->send(json);
             inFlight->fetch_sub(1, std::memory_order_relaxed);
             ++dispatched;
@@ -1046,10 +1249,10 @@ size_t ChatWebsocket::deliverDirectLocally(Core& core,
                                [&loop](const auto& p) { return p.first == loop; });
         if (it == groups.end())
         {
-            groups.emplace_back(loop, std::vector<WebSocketConnectionPtr>{});
+            groups.emplace_back(loop, std::vector<Session>{});
             it = std::prev(groups.end());
         }
-        it->second.push_back(s.conn);
+        it->second.push_back(s);
     }
 
     if (!groups.empty())
@@ -1057,27 +1260,49 @@ size_t ChatWebsocket::deliverDirectLocally(Core& core,
         payload = std::make_shared<const std::string>(json);
     }
 
-    for (auto& [loop, conns] : groups)
+    for (auto& [loop, sessions] : groups)
     {
-        const size_t batch = conns.size();
-        auto batchConns = std::make_shared<const std::vector<WebSocketConnectionPtr>>(
-            std::move(conns));
+        const size_t batch = sessions.size();
+        auto batchSessions = std::make_shared<const std::vector<Session>>(std::move(sessions));
         try
         {
-            loop.dispatch([payload, batchConns, inFlight, batch] {
+            loop.dispatch([payload, batchSessions, inFlight, batch] {
                 const std::string_view view(*payload);
-                for (const auto& c : *batchConns)
+                for (const auto& s : *batchSessions)
                 {
-                    c->send(view);
+                    if (!s.conn)
+                    {
+                        continue;
+                    }
+                    // ⚠️ 这里【不再】按 gate 跳过，与房间扇出刻意不同。
+                    //
+                    // 原因：调用方（handleNewMessage）在 deliverDirectLocally 返回后
+                    // 已经给发送者回了 200 —— 那是同步发生的，而本批次是异步执行的。
+                    // 若这里因为「预检之后、执行之前 gate 被关上」就静默跳过，
+                    // 那条私聊就永久丢失了，而发送者手里的回执是成功。
+                    //
+                    // 私聊没有 journal 可以回放，所以「跳过」等于「撒谎 + 丢消息」。
+                    // 唯一的正确选择是兑现承诺：把这一条写出去（只多一条消息的缓冲，
+                    // 目标连接本来就是拥塞的，多这一条不改变量级），下一条消息的
+                    // 预检会看到 gate 已关而整条回 503，让发送者退避重试。
+                    //
+                    // 换句话说：gate 的决策点只有【预检】一处，这里只负责执行。
+                    s.conn->send(view);
                 }
+                // 额度必须整批归还（含 conn 为空的份）——它们已经不会再写 socket。
                 inFlight->fetch_sub(batch, std::memory_order_relaxed);
             });
         }
         catch (...)
         {
-            // 派发失败 ⇒ 这批永远不会被执行，必须立刻把额度还回去。
-            // 否则在途计数只增不减，最终把整条私聊路径钉死在上限上。
-            inFlight->fetch_sub(batch, std::memory_order_relaxed);
+            // 派发失败 ⇒ 这批【以及后面所有批】都永远不会被执行，必须立刻把额度还回去。
+            //
+            // ⚠️ 只还本批（batch）是不够的：在途额度是在上面【一次性】按 total 扣的，
+            //    此刻后面那些批也已经计入在途，却因为这里抛出而永远不会执行 ——
+            //    少还一次就永久泄漏一份额度，最终把整条私聊路径钉死在上限上。
+            //    total - dispatched 正好等于「已扣但未派出去」的剩余份数。
+            const size_t remaining = total - dispatched;
+            inFlight->fetch_sub(remaining, std::memory_order_relaxed);
             throw;
         }
         dispatched += batch;
@@ -1172,6 +1397,32 @@ void ChatWebsocket::initClusterBus()
                         // 避免本实例回环消费自己刚发出的消息
                         if (packet.instId == core->instanceId)
                         {
+                            // 但探针包的回环正是我们要的证据：Redis pub/sub 会把
+                            // 消息投给包括发布者在内的所有订阅者，所以「自己的探针
+                            // 回来了」就证明「订阅链路 + 发布链路都是通的」。
+                            // 这个判断必须在上面那条「解析失败就 return」之后、
+                            // 在投递逻辑之前 —— 探针包不该被当成聊天消息。
+                            if (packet.topic == Core::kBusProbeTopic)
+                            {
+                                core->lastBusEchoNanos.store(Subscriber::nowNanos(),
+                                                             std::memory_order_relaxed);
+                                // 曾经判死过的总线，一旦回环恢复就立刻复活：
+                                // 否则要等下一轮 15 秒的判活窗口，私聊会白多报
+                                // 十几秒的 404。
+                                if (!core->clusterBusReady.load(std::memory_order_acquire))
+                                {
+                                    core->clusterBusReady.store(true, std::memory_order_release);
+                                    LOG_WARN << "Cluster bus probe: echo received again — "
+                                                "cross-instance delivery RESTORED";
+                                }
+                            }
+                            return;
+                        }
+
+                        // 其他实例的探针包：只证明链路通（对端会各自处理自己的回环），
+                        // 本实例不做任何投递，也不当解析错误计数。
+                        if (packet.topic == Core::kBusProbeTopic)
+                        {
                             return;
                         }
 
@@ -1197,8 +1448,48 @@ void ChatWebsocket::initClusterBus()
                             return;
                         }
 
-                        // 房间广播：推给本实例房间内的所有客户端（同样分片并行扇出）
-                        core->roomRegistry.publish(packet.topic, packet.json);
+                        // 房间广播：推给本实例房间内的所有客户端（同样分片并行扇出）。
+                        //
+                        // ⚠️ 不能直接把 packet.json 交给 publish()：那份负载里的 seq
+                        // 属于【发送实例】的序号空间，而本实例的 journal 会另分配一个
+                        // 本地 seq。原实现导致实时帧带来源 seq、回放却改成本地 seq，
+                        // 客户端用同一个游标混合推进，可能漏补且收到假的 200。
+                        //
+                        // 这里让注册表在分配本地 seq 后重建负载：实时投递与 journal
+                        // 使用同一份、同一个 seq，客户端看到的序号空间始终是「当前
+                        // 连接实例」的，sync 的游标语义才自洽。
+                        chatMessageVo inboundVo{};
+                        if (glz::read<glz::opts{.error_on_unknown_keys = false}>(
+                                inboundVo, packet.json))
+                        {
+                            Metrics::PrometheusRegistry::instance().recordClusterPacketDropped();
+                            static loong::log::RateLimiter inboundParseLimiter{
+                                1000, "cluster.inbound_parse"};
+                            if (inboundParseLimiter.allow())
+                            {
+                                LOG_WARN << "Cluster room payload parse failed, dropped "
+                                         << (1 + inboundParseLimiter.takeSuppressed())
+                                         << " occurrence(s) (total: ws_cluster_packet_dropped_total)";
+                            }
+                            return;
+                        }
+
+                        const bool accepted = core->roomRegistry.publishWithSeq(
+                            packet.topic, {}, nullptr,
+                            [&inboundVo](uint64_t seq)
+                            {
+                                inboundVo.seq = seq;
+                                std::string rewritten{};
+                                (void)glz::write_json(inboundVo, rewritten);
+                                return rewritten;
+                            });
+                        if (!accepted)
+                        {
+                            // 本实例房间背压拒绝：整条消息没有本地投递，也没有进 journal。
+                            // 源实例的 ACK 语义只代表「源实例已接受」，跨实例链路本身
+                            // 没有端到端确认；这里至少让丢弃在指标上可见。
+                            Metrics::PrometheusRegistry::instance().recordWsMessageDropped();
+                        }
                     }
                     catch (const std::exception& e)
                     {
@@ -1369,6 +1660,65 @@ void ChatWebsocket::publishToCluster(const Core& core, const std::string& topic,
         Metrics::PrometheusRegistry::instance().recordWsHandlerException();
         LOG_ERROR << "publishToCluster exception: " << e.what();
     }
+}
+
+void ChatWebsocket::probeClusterBus(Core& core)
+{
+    // 只在配置层面启用总线时才探（未启用时 clusterBusReady 本来就恒为 false，
+    // 没有「撒谎」的风险，也不需要花这次 PUBLISH）。
+    if (!clusterBusEnabled())
+    {
+        auto& metrics = Metrics::PrometheusRegistry::instance();
+        metrics.setClusterBusReady(false);
+        metrics.setClusterBusProbeAge(-1);
+        return;
+    }
+
+    // ── 先判死，再发探针 ────────────────────────────────────────────────────
+    //
+    // 顺序不能反：如果先发探针再判死，本周期刚发出的包还没回环（Redis 往返
+    // 是异步的），lastBusEchoNanos 仍可能是上一周期的值，判定用的时间基准
+    // 就会整体前移一个周期。先判后发，每个周期看到的都是「上一周期结束时的
+    // 真实状态」，语义干净。
+    constexpr int64_t kPeriodNanos = 5'000'000'000LL;   // 5 秒
+    constexpr int64_t kDeadNanos = 3 * kPeriodNanos;    // 连续 3 个周期无回环 ⇒ 判死
+
+    const int64_t now = Subscriber::nowNanos();
+    const int64_t lastEcho = core.lastBusEchoNanos.load(std::memory_order_relaxed);
+    const int64_t ageNanos = lastEcho == 0 ? -1 : now - lastEcho;
+
+    // lastEcho == 0 表示「刚启动，还没收到过任何回环包」。此时不判死 ——
+    // 启动到第一轮探针之间本来就不该有回环，直接判死会让每个实例刚起来时
+    // 都先进入 15 秒的「总线不可用」状态，白白把私聊打成 404。
+    // 只在【曾经通过、现在不通】时才算失效。
+    if (lastEcho != 0 && now - lastEcho > kDeadNanos)
+    {
+        const bool wasReady = core.clusterBusReady.exchange(false, std::memory_order_acq_rel);
+        if (wasReady)
+        {
+            // 只在「true → false」这一瞬间打一条。之后每 5 秒都会走到这里，
+            // 但 exchange 返回 false 就不再输出 —— 否则 Redis 长时间挂掉时
+            // 这个定时任务本身会变成刷屏源。
+            LOG_WARN << "Cluster bus probe: no echo for " << (ageNanos / 1'000'000'000LL)
+                     << "s — cross-instance delivery marked UNAVAILABLE "
+                        "(private messages will answer 404 instead of a fake 200)";
+        }
+        // ⚠️ 判死之后【仍然要继续发探针】。否则 lastBusEchoNanos 永远停在旧值，
+        //    恢复后也永远等不到下一次刷新 —— 总线一旦被判死就再也活不过来。
+        //    （恢复由入站回调负责置回 true，见 kBusProbeTopic 分支。）
+    }
+
+    // 判定之后再导出指标：这样「这一轮刚判死」和「gauge 显示 0」发生在
+    // 同一个采样里，不会出现「ready 还是 1、但其实已经不可用」的 5 秒窗口。
+    {
+        auto& metrics = Metrics::PrometheusRegistry::instance();
+        metrics.setClusterBusProbeAge(ageNanos < 0 ? -1 : ageNanos / 1'000'000'000LL);
+        metrics.setClusterBusReady(core.clusterBusReady.load(std::memory_order_relaxed));
+    }
+
+    // 探针包：topic 用哨兵值，接收侧见到它只记「链路通」、绝不投递。
+    // json 给一个最小的合法对象（不是空串），避免任何「空载荷」路径的特殊处理。
+    publishToCluster(core, std::string(Core::kBusProbeTopic), "{}", {});
 }
 
 void ChatWebsocket::checkAndEvictIdleConnections(Core& core)
@@ -1705,14 +2055,59 @@ void ChatWebsocket::handleSync(Core& core, const WebSocketConnectionPtr& wsConn,
     // seq=500 连到 B 实例（B 才发到 20），直接拿去比只会得到一句含糊的
     // 「游标超出可回放范围」。这里改成按「无游标」回放（不回放，免得拿错序号空间
     // 乱补），并在 sync_done 里说清原因 —— 仍然是 206，因为那一段确实补不齐。
+    auto& subscriber = wsConn->getContextRef<Subscriber>();
+
+    // 拥塞连接不回放：sync 的响应本身可以很大，闸门已经关着还继续写，
+    // 等于绕过连接级输出保护。503 让客户端退避后重试，且不推进游标。
+    if (subscriber.isCongested())
+    {
+        chatMessageVo busy{};
+        busy.code = 503;
+        busy.name = room;
+        busy.seq = dto.sinceSeq;
+        busy.type = "sync_done";
+        busy.instance = core.instanceId;
+        busy.message = "连接拥塞，暂缓补齐，请稍后重试";
+        std::string json{};
+        (void)glz::write_json(busy, json);
+        wsConn->send(json, WebSocketMessageType::Text);
+        return;
+    }
+
+    // 同一连接每秒最多一次 sync。没有这道闸时，一个很小的请求可以反复
+    // 触发最多 journalCap 条回放，形成 CPU/带宽放大。
+    if (!subscriber.tryAcquireSync())
+    {
+        chatMessageVo busy{};
+        busy.code = 503;
+        busy.name = room;
+        busy.seq = dto.sinceSeq;
+        busy.type = "sync_done";
+        busy.instance = core.instanceId;
+        busy.message = "sync 请求过于频繁，请稍后重试";
+        std::string json{};
+        (void)glz::write_json(busy, json);
+        wsConn->send(json, WebSocketMessageType::Text);
+        return;
+    }
+
     const bool foreignCursor =
         dto.sinceSeq != 0 && !dto.sinceInstance.empty() && dto.sinceInstance != core.instanceId;
     const uint64_t cursor = foreignCursor ? 0 : dto.sinceSeq;
     const auto rr = core.roomRegistry.replay(room, cursor);
 
     size_t sent = 0;
+    uint64_t lastSentSeq = cursor;
+    bool congested = false;
     for (const auto& e : rr.entries)
     {
+        // 回放途中也可能触发高水位（尤其一次补几百条时）：继续写只会让
+        // outputBuffer_ 继续上涨。停在最后一条已发送的位置，交给客户端重试。
+        if (subscriber.isCongested())
+        {
+            congested = true;
+            break;
+        }
         // 日志里存的是我们自己写出去的 VO，理论上解析不会失败；但「不会失败」不是
         // 可以拿来解引用空值的理由 —— 失败就跳过这一条，绝不中断整段补齐。
         chatMessageVo vo{};
@@ -1726,6 +2121,7 @@ void ChatWebsocket::handleSync(Core& core, const WebSocketConnectionPtr& wsConn,
         (void)glz::write_json(vo, json);
         wsConn->send(json, WebSocketMessageType::Text);
         ++sent;
+        lastSentSeq = e.seq;
     }
 
     // sync_done：把「补到哪儿了」明确告诉客户端，它据此更新本地游标。
@@ -1737,12 +2133,19 @@ void ChatWebsocket::handleSync(Core& core, const WebSocketConnectionPtr& wsConn,
     // 那种时候静默回一个 200 会让客户端永远不知道自己缺了消息 —— 这正是
     // 「静默丢失」这一类缺陷里最难查的一种。
     chatMessageVo done{};
-    done.code = (rr.reset || foreignCursor) ? 206 : 200;
+    done.code = congested ? 503 : ((rr.reset || foreignCursor) ? 206 : 200);
     done.name = room;
-    done.seq = rr.maxSeq;
+    // 中途拥塞时只能把游标推进到【真正发出去的最后一条】。若仍写 rr.maxSeq，
+    // 客户端会跳过还没发送的中间段，把一次可重试的拥塞变成永久缺口。
+    done.seq = congested ? lastSentSeq : rr.maxSeq;
     done.type = "sync_done";
     done.instance = core.instanceId;
-    if (foreignCursor)
+    if (congested)
+    {
+        done.message = std::format("连接拥塞，已补 {} 条；游标停在 {}，请稍后重试",
+                                   sent, lastSentSeq);
+    }
+    else if (foreignCursor)
     {
         // 换实例的场景：本实例补齐不了另一实例序号空间里的那一段。
         // 仍报 206（确实不是完整补齐），但把原因说清楚，并把游标重置到本实例。

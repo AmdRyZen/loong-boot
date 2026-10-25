@@ -75,6 +75,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -664,6 +665,24 @@ class RoomRegistryT
         return publishSharedImpl(room, hint, outSeq, [&payload](uint64_t) { return payload; });
     }
 
+    // build(seq) 有两种合法返回：已序列化好的 std::string（publishWithSeq 路径），
+    // 或现成的 shared_ptr<const std::string>（publishShared 路径，本来就要共享）。
+    // 统一收敛成 shared_ptr，避免两处调用点各写一遍 if constexpr。
+    template <typename BuildFn>
+    static std::shared_ptr<const std::string> materializePayload(BuildFn& build, uint64_t seq)
+    {
+        auto built = build(seq);
+        if constexpr (std::is_same_v<std::decay_t<decltype(built)>,
+                                     std::shared_ptr<const std::string>>)
+        {
+            return built;
+        }
+        else
+        {
+            return std::make_shared<const std::string>(std::move(built));
+        }
+    }
+
     template <typename BuildFn>
     bool publishSharedImpl(const std::string& room, const RoomHandle& hint, uint64_t* outSeq,
                            BuildFn&& build)
@@ -780,7 +799,24 @@ class RoomRegistryT
                         // 构造放在分片锁内：单分片是常态路径，锁的使用者只有发布方
                         // 与抽干者，多持一次序列化远比多一次锁往返划算（见 publishWithSeq）。
                         assignedSeq = ++r->seq;
-                        payload = build(assignedSeq);
+                        try
+                        {
+                            payload = materializePayload(build, assignedSeq);
+                        }
+                        catch (...)
+                        {
+                            // 序列化抛异常（JSON 序列化 bad_alloc 等）：序号已经被消耗，
+                            // 但消息既没入队也没进 journal。若不回滚，客户端按
+                            // seq > sinceSeq 回放时【看不见这个缺口】，sync_done 仍回
+                            // 200，于是永久缺一条却以为补齐成功。
+                            // 回滚安全性：序号分配与回滚都在同一把 pubMtx 内完成，
+                            // 其他发布者不可能在这中间拿到更大的号，所以 --seq 不会
+                            // 与别人冲突（也不会与已入队的更大号撞车）。
+                            // outSeq 保持 0：函数开头已置 0，这里不再写值。
+                            --r->seq;
+                            dropped_.fetch_add(1, std::memory_order_relaxed);
+                            return false;
+                        }
                         sh->queue.push_back(QueuedMessage{payload, t0ns});
                         // 门铃：仅在「空闲 → 忙」跳变时入池，热点分片不会每条消息都惊动线程池。
                         // exchange 与 drain 的 busy=false 都在分片锁内完成，不会丢唤醒。
@@ -824,7 +860,23 @@ class RoomRegistryT
                 // 预检查全过 ⇒ 此刻才分配序号、构造负载（被拒的消息不占号）。
                 // 这一步不持任何分片锁：序列化不进临界区，多分片之间也不会互相等。
                 assignedSeq = ++r->seq;
-                payload = build(assignedSeq);
+                try
+                {
+                    payload = materializePayload(build, assignedSeq);
+                }
+                catch (...)
+                {
+                    // 同单分片快路径：序号已消耗但消息没有入队、也没进 journal。
+                    // 不回滚就会在客户端侧留下一个「永远看不见的缺口」（回放按
+                    // seq > sinceSeq 过滤，缺口本身不产生任何条目），重连看似成功
+                    // 却永久缺一条。
+                    // 回滚安全性：分配与回滚都在同一把 pubMtx 内，其他发布者不可能
+                    // 在这中间拿到更大的号，因此 --seq 不会与已入队的号冲突。
+                    // outSeq 保持 0：函数开头已置 0，这里不再写值。
+                    --r->seq;
+                    dropped_.fetch_add(1, std::memory_order_relaxed);
+                    return false;
+                }
 
                 // ── 第二阶段：整条消息入队 ────────────────────────────────────
                 for (size_t i = 0; i < r->dist.size(); ++i)
@@ -1020,9 +1072,10 @@ class RoomRegistryT
         return opt_;
     }
 
-    // 一次性快照（单锁单遍），供周期性指标采集使用。
+    // 一次性快照，供周期性指标采集使用。
     // 分开调 activeRooms()/activeShards()/totalSubscribers() 会各加一次锁、
     // 且几次读数之间房间集合可能已变，得到的是一组自相矛盾的数。
+    // 实现上分两阶段（房间表快照 + 逐房间读分片），原因见 stats() 内部说明。
     struct Stats
     {
         size_t rooms = 0;              // 活跃房间数
@@ -1036,19 +1089,45 @@ class RoomRegistryT
 
     Stats stats() const
     {
-        std::shared_lock lock(roomsMtx_);
+        // ── 为什么分两阶段：先拷房间表，出锁后再逐房间读 shards ─────────────────
+        //
+        // r->shards 的【容器本身】由 r->pubMtx 保护，而不是 roomsMtx_：
+        // reshapeLocked 在只持 pubMtx 时就执行 r.shards.assign(newK, nullptr)，
+        // unsubscribe 也会替换某个槽位。若本函数持 roomsMtx_ 直接遍历 r->shards，
+        // 撞上 vector 重建就是迭代器悬垂（UAF）—— 本函数是 5 秒一次的定时任务，
+        // 撞上必崩。
+        //
+        // 反过来「持 roomsMtx_ 再取 pubMtx」同样不行：unsubscribe 末尾已经存在
+        // pubMtx → roomsMtx_ 的方向（先锁 pubMtx 再取 roomsMtx_ 独占），反序获取
+        // 就是经典 ABBA 死锁。所以只有一条安全路径：
+        //   ① 在 roomsMtx_ 内只做「拷房间表 + 读不依赖 shards 的统计」；
+        //   ② 立刻释放 roomsMtx_；
+        //   ③ 再逐个房间持 pubMtx 读 shards 算积压。
+        // 代价是每个房间多一次 shared_ptr 拷贝；5 秒一次，可以忽略。
+        std::vector<std::pair<std::string, std::shared_ptr<Room>>> snapshot;
         Stats s;
-        s.rooms = rooms_.size();
-        for (const auto& [name, r] : rooms_)
         {
-            s.shards += r->nonEmptyShards.load(std::memory_order_relaxed);
-            const size_t n = r->subCount.load(std::memory_order_relaxed);
-            s.subscribers += n;
-            if (n > s.maxRoomSubscribers)
+            std::shared_lock lock(roomsMtx_);
+            s.rooms = rooms_.size();
+            snapshot.reserve(rooms_.size());
+            for (const auto& [name, r] : rooms_)
             {
-                s.maxRoomSubscribers = n;
+                s.shards += r->nonEmptyShards.load(std::memory_order_relaxed);
+                const size_t n = r->subCount.load(std::memory_order_relaxed);
+                s.subscribers += n;
+                if (n > s.maxRoomSubscribers)
+                {
+                    s.maxRoomSubscribers = n;
+                }
+                // 只拷句柄（shared_ptr 保证 Room 在快照存活期内不会被析构），
+                // 不在这里碰 shards。
+                snapshot.emplace_back(name, r);
             }
+        }
 
+        // ── 第二阶段：roomsMtx_ 已释放，逐房间持 pubMtx 读分片队列深度 ─────────
+        for (const auto& [name, r] : snapshot)
+        {
             // ── 积压深度（C2「慢消费者 / 慢房间」定位）─────────────────────────
             //
             // 为什么必须看这个数：分片队列的深度是【服务端唯一能自己观察到的】
@@ -1057,21 +1136,25 @@ class RoomRegistryT
             // 「某个连接的发包缓冲区满了」这件事在服务端是看不到的 ——
             // 能看到的只有「它所在的 loop / 分片开始积压」。
             //
-            // 代价：逐分片加一次锁。本函数 5 秒才跑一次，且分片数 = 活跃房间数
-            // 量级，完全可忽略。
+            // 代价：逐房间加一次 pubMtx、逐分片加一次分片锁。本函数 5 秒才跑一次，
+            // 且分片数 = 活跃房间数量级，完全可忽略。
             //
-            // 锁序安全性：本函数已持有 roomsMtx_（共享）再取分片锁，而代码里
-            // 没有任何路径「持有分片锁再去取 roomsMtx_」（publish 是
-            // pubMtx → 分片锁；drainShard 只取分片锁），故不成环。
+            // 锁序安全性：此处【已释放 roomsMtx_】，只按 pubMtx → 分片锁的顺序取，
+            // 与 publish 热路径同向；代码里不存在「持分片锁再取 pubMtx」的路径
+            //（drainShard 只取分片锁），故不成环。
+            // pubMtx 是必须的：它才是 r->shards 容器的保护者（见函数开头的说明）。
             size_t backlog = 0;
-            for (const auto& sh : r->shards)
             {
-                if (!sh)
+                std::lock_guard pubLock(r->pubMtx);
+                for (const auto& sh : r->shards)
                 {
-                    continue; // 空槽位（惰性创建，见 Room::shards 注释）
+                    if (!sh)
+                    {
+                        continue; // 空槽位（惰性创建，见 Room::shards 注释）
+                    }
+                    std::lock_guard shardLock(sh->mtx);
+                    backlog += sh->queue.size();
                 }
-                std::lock_guard shardLock(sh->mtx);
-                backlog += sh->queue.size();
             }
             s.queuedMessages += backlog;
             if (backlog > s.maxRoomBacklog)
@@ -1680,20 +1763,30 @@ class RoomRegistryT
                 // 本条已出队的消息无法重投（payload 已从队列取走），计一次异常；
                 // 队列里剩下的消息在 busy 复位后由下面这段重新唤醒继续投递。
                 fanoutExceptions_.fetch_add(1, std::memory_order_relaxed);
-                bool more = false;
+                bool requeueAfterException = false;
                 {
                     std::lock_guard lock(sh->mtx);
-                    sh->busy.store(false, std::memory_order_release);
-                    more = !sh->queue.empty();
-                }
-                if (more && yielding)
-                {
-                    // 池化模式：立刻重新占住 busy 并送回池中。否则剩余消息要等到
-                    // 下一次 publish 才会被唤醒（延迟不可控）。
+                    // ⚠️ busy 的复位与重新占用必须在【同一把分片锁】内一次决定。
+                    //
+                    // 原实现先 busy=false 放锁，再重新加锁 busy=true 并入池。中间
+                    // 的窗口里发布者可以 push 队列并 exchange(true) 成功、自己把
+                    // 该分片入池；随后这里又入池一次 —— 同一个分片出现两个 drainer，
+                    // 并发扇出破坏 FIFO。池化模式下没有「空闲窗口」可留：有剩余
+                    // 消息就保持 busy=true，直接送回池；没有才置 false。
+                    if (yielding && !sh->queue.empty())
                     {
-                        std::lock_guard lock(sh->mtx);
                         sh->busy.store(true, std::memory_order_release);
+                        requeueAfterException = true;
                     }
+                    else
+                    {
+                        sh->busy.store(false, std::memory_order_release);
+                    }
+                }
+                if (requeueAfterException)
+                {
+                    // busy 从锁内保持 true 到入池完成，发布者在这段时间里不会
+                    // 重复 exchange 成功，因此不会出现第二个 drainer。
                     enqueueReady(sh);
                 }
                 return;

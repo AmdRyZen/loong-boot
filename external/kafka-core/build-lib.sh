@@ -1,6 +1,22 @@
 #!/bin/bash
 set -e
 
+# ⚠️ 不要用 sudo 跑整个脚本！
+#   编译阶段一旦以 root 身份跑，build/ 里所有产物都会变成 root 所有，
+#   之后不带 sudo 的增量构建就再也删不掉/改不动它们（只能 sudo rm -rf 收拾）。
+#   只有最后一步 `cmake --install`（往 /usr/local 写）需要 root，脚本自己会 sudo。
+if [ "$(id -u)" -eq 0 ]; then
+    echo "错误：请以普通用户运行本脚本（不要 sudo）。"
+    echo "      脚本最后一步会用 sudo 安装到 /usr/local，届时输入密码即可。"
+    exit 1
+fi
+
+# build/ 若属于其他用户（历史上用 sudo 跑过），当前用户删不动 —— 先用 sudo 清掉。
+if [ -d build ] && [ ! -w build ]; then
+    echo "build/ 不属于当前用户（多半是之前用 sudo 跑过整个脚本），正在清理…"
+    sudo rm -rf build
+fi
+
 # ─────────────────────────────────────────────────────────────────────────────
 # kafka-core 本地静态库的构建与安装。
 #
@@ -43,12 +59,33 @@ set -e
 CXX_BIN="$(command -v g++-16 || command -v g++-15 || command -v g++)"
 CC_BIN="$(command -v gcc-16 || command -v gcc-15 || command -v gcc)"
 
+# ── OpenSSL：优先 openssl@4，其次 openssl@3 ──────────────────────────────────
+#
+# ⚠️ 这里必须让「头文件」和「库」来自同一个 OpenSSL，否则 librdkafka 链接必炸：
+#      Undefined symbols: _BIO_eof / _OPENSSL_sk_set_thunks
+#    原因：CMake 的 find_package 认 OPENSSL_ROOT_DIR，但 librdkafka 还会把
+#    pkg-config 的 _OPENSSL_CFLAGS 拼进 include 路径。只钉 OPENSSL_ROOT_DIR 时，
+#    find_package 拿的是 @3 的库，pkg-config 却按 /opt/homebrew 默认（现为 @4）
+#    给头文件 ⇒ 用 4.x 头编译、链 3.x 库 ⇒ 4.x 才成为真实函数的 BIO_eof /
+#    OPENSSL_sk_set_thunks 找不到定义。
+#    所以：OPENSSL_ROOT_DIR 与 PKG_CONFIG_PATH 必须一起指到同一个前缀。
 OPENSSL_ROOT=""
 if command -v brew >/dev/null 2>&1; then
-    OPENSSL_ROOT="$(brew --prefix openssl@3 2>/dev/null || true)"
+    for cand in openssl@4 openssl@3; do
+        p="$(brew --prefix "${cand}" 2>/dev/null || true)"
+        if [ -n "${p}" ] && [ -d "${p}" ]; then
+            OPENSSL_ROOT="${p}"
+            break
+        fi
+    done
 fi
-if [ -z "${OPENSSL_ROOT}" ] && [ -d /opt/homebrew/opt/openssl@3 ]; then
-    OPENSSL_ROOT=/opt/homebrew/opt/openssl@3
+if [ -z "${OPENSSL_ROOT}" ]; then
+    for cand in /opt/homebrew/opt/openssl@4 /opt/homebrew/opt/openssl@3; do
+        if [ -d "${cand}" ]; then OPENSSL_ROOT="${cand}"; break; fi
+    done
+fi
+if [ -n "${OPENSSL_ROOT}" ] && [ -d "${OPENSSL_ROOT}/lib/pkgconfig" ]; then
+    export PKG_CONFIG_PATH="${OPENSSL_ROOT}/lib/pkgconfig:${PKG_CONFIG_PATH}"
 fi
 
 # 显式解析 SDK sysroot（不依赖 SDKROOT 环境变量，也不依赖 CMake 是否认识编译器）

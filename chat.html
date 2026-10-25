@@ -613,6 +613,21 @@
         //    「你的游标来自另一实例，那段补不了」，客户端也不必假装补齐成功。
         const CURSOR_PREFIX = 'loong.chat.cursor.';
         const MAX_SEND_ATTEMPTS = 4;
+        // ACK 超时：服务端已接受但 ACK 随断线丢失时，不能无限等下去。
+        // 超时后用同一个 key/requestId 重发，服务端按新协议去重。
+        const ACK_TIMEOUT_MS = 8000;
+        // sync 的兜底超时：sync_done 丢失时不能永远把实时帧缓冲在内存里。
+        const SYNC_TIMEOUT_MS = 5000;
+        // 补齐期间最多缓冲多少帧。达到上限就结束本次 sync、按已到帧继续，
+        // 下次重连再补剩余缺口，绝不无界占用浏览器内存。
+        const MAX_SYNC_BUFFER = 2000;
+        const SYNC_RETRY_DELAY_MS = 1000;
+        // 连续被 503 拒掉的补齐次数上限。超过就放弃本次补齐（否则重试永不终止，
+        // 而断线时 pending 的 timer 已被清掉，它们只能靠 flushPendingAcks 复活）。
+        const MAX_SYNC_RETRIES = 5;
+        // 实时 seq 缺口的补齐最小间隔。缺口由服务端拥塞闸门主动跳过造成，
+        // 高频帧下会连续出现；限频保证它最多每 3 秒触发一次补齐，不会自激。
+        const GAP_SYNC_MIN_INTERVAL_MS = 3000;
 
         function cursorKey(room) {
             return CURSOR_PREFIX + room;
@@ -652,16 +667,57 @@
         // 看起来像服务端倒着补。
         let syncing = false;
         let syncBuffer = [];
+        let syncTimer = null;
+        let syncRetryTimer = null;
+        // 上一次因「实时 seq 缺口」触发补齐的时间戳，用于限频（见 applyIncoming）。
+        let lastGapSyncAt = 0;
         // 本地游标的内存副本。localStorage 是同步 API，逐条消息都去读它没必要；
         // 这里只在前进时写回。
         let lastSeqSeen = 0;
         // 当前连着的服务实例（由 sync_done 告知）。游标要和它一起存 ——
         // 换了实例，之前那个 seq 就不再可比（见上面的说明）。
         let serverInstance = '';
+        // 当前连接真正对应的房间（连接时捕获）。游标必须按它读写：
+        // 输入框在连接期间可被改动，用实时值会把 A 房间的 seq 写进 B 的键。
+        let connectedRoom = '';
+        // 连续被 503 拒绝的补齐次数（见 handleSyncDone）。
+        let syncRetryCount = 0;
+
+        function clearPendingTimer(p) {
+            if (p.timer !== null) {
+                clearTimeout(p.timer);
+                p.timer = null;
+            }
+        }
+
+        function failPending(requestId, p, message) {
+            clearPendingTimer(p);
+            pendingAcks.delete(requestId);
+            appendSystemMessage(message);
+        }
+
+        // 每条已发送消息都挂一个 ACK 超时。没有它时，ACK 随断线丢失会让
+        // pendingAcks 永久悬置：既不知道成功，也不会重试。
+        function scheduleAckTimeout(requestId, p) {
+            clearPendingTimer(p);
+            p.timer = setTimeout(() => {
+                if (!pendingAcks.has(requestId)) return;
+                if (p.attempts >= MAX_SEND_ATTEMPTS) {
+                    failPending(requestId, p,
+                        `等待投递确认超时，已重试 ${p.attempts} 次，本条未送达`);
+                    return;
+                }
+                p.attempts++;
+                appendSystemMessage(`等待投递确认超时，正在第 ${p.attempts} 次重试`);
+                resendPending(requestId, p);
+            }, ACK_TIMEOUT_MS);
+        }
 
         function handleAck(ack) {
             const p = pendingAcks.get(ack.requestId);
             if (!p) return;
+
+            clearPendingTimer(p);
 
             if (ack.code === 200) {
                 pendingAcks.delete(ack.requestId);
@@ -682,10 +738,16 @@
                 return;
             }
 
+            if (ack.code === 429) {
+                // 速率限制不自动重试：否则重试本身就是新一波流量。
+                failPending(ack.requestId, p,
+                    `${ack.message || '消息发送过快'}（本条未送达，请降低发送频率）`);
+                return;
+            }
+
             // 404 / 400 / 重试耗尽：终态，明确告诉用户「没送出去」。
             // 这是 B1 的核心价值：旧契约下这些情况客户端只能靠猜。
-            pendingAcks.delete(ack.requestId);
-            appendSystemMessage(
+            failPending(ack.requestId, p,
                 ack.code === 404
                     ? `${ack.message || '对方当前不在线'}（本条未送达）`
                     : `消息未送达（code=${ack.code}）：${ack.message || ''}`
@@ -694,32 +756,132 @@
 
         function resendPending(requestId, p) {
             if (!ws || ws.readyState !== WebSocket.OPEN) {
-                pendingAcks.delete(requestId);
-                appendSystemMessage('重试时连接已断开，本条未送达');
+                // 断线不是终态：保留 pending，重连并补齐后统一重发。
+                // 服务端按 (发送者, key) 去重，即使首投其实成功也不会产生第二条。
+                clearPendingTimer(p);
+                appendSystemMessage('连接已断开，本条将在重连后重试');
                 return;
             }
-            ws.send(JSON.stringify({
-                key: p.key,
-                requestId: requestId,
-                action: 'message',
-                msgContent: p.text,
-                toUser: p.toUser
-            }));
+            try {
+                ws.send(JSON.stringify({
+                    key: p.key,
+                    requestId: requestId,
+                    action: 'message',
+                    msgContent: p.text,
+                    toUser: p.toUser
+                }));
+                scheduleAckTimeout(requestId, p);
+            } catch (e) {
+                failPending(requestId, p, `重发失败：${e.message || e}`);
+            }
+        }
+
+        function flushPendingAcks() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            for (const [requestId, p] of Array.from(pendingAcks.entries())) {
+                if (p.attempts >= MAX_SEND_ATTEMPTS) {
+                    failPending(requestId, p,
+                        `等待投递确认超时，已重试 ${p.attempts} 次，本条未送达`);
+                } else {
+                    p.attempts++;
+                    resendPending(requestId, p);
+                }
+            }
+        }
+
+        function clearSyncTimer() {
+            if (syncTimer !== null) {
+                clearTimeout(syncTimer);
+                syncTimer = null;
+            }
+        }
+
+        function armSyncTimeout() {
+            clearSyncTimer();
+            syncTimer = setTimeout(() => {
+                if (!syncing) return;
+                syncing = false;
+                const buf = syncBuffer;
+                syncBuffer = [];
+                // checkGap=false：这批帧来自被中断的补齐，序号天然不连续。
+                for (const m of buf) applyIncoming(m, false);
+                appendSystemMessage('⚠️ 补齐响应超时，本次可能不完整；下次重连会再次尝试');
+                flushPendingAcks();
+            }, SYNC_TIMEOUT_MS);
+        }
+
+        function beginSync(reason) {
+            if (syncing || !ws || ws.readyState !== WebSocket.OPEN) return;
+            if (syncRetryTimer !== null) {
+                clearTimeout(syncRetryTimer);
+                syncRetryTimer = null;
+            }
+            const room = connectedRoom;
+            const cur = loadCursor(room);
+            serverInstance = cur.instance;
+            lastSeqSeen = cur.seq;
+            syncing = true;
+            syncBuffer = [];
+            try {
+                ws.send(JSON.stringify({
+                    action: 'sync',
+                    sinceSeq: cur.seq,
+                    sinceInstance: cur.instance
+                }));
+                armSyncTimeout();
+            } catch (e) {
+                syncing = false;
+                clearSyncTimer();
+                appendSystemMessage(`发起补齐失败：${e.message || e}（实时消息继续）`);
+                flushPendingAcks();
+            }
+        }
+
+        function scheduleSyncRetry() {
+            if (syncRetryTimer !== null) return;
+            syncRetryTimer = setTimeout(() => {
+                syncRetryTimer = null;
+                beginSync('retry');
+            }, SYNC_RETRY_DELAY_MS);
         }
 
         function handleSyncDone(done) {
-            const room = document.getElementById('roomName').value.trim();
-            // 先落游标：它代表「此刻房间里最大的序号」，比缓冲里任何一条都新。
-            // 服务端给的实例标识一并记下 —— 游标只在同一个实例内可比。
-            if (done.instance) serverInstance = done.instance;
-            lastSeqSeen = done.seq || lastSeqSeen;
-            saveCursor(room, serverInstance, done.seq);
+            const room = connectedRoom;
+            clearSyncTimer();
             syncing = false;
+
+            if (done.instance) serverInstance = done.instance;
+
+            // 503 = 服务端拥塞/限流，明确可重试。此时绝不能把 done.seq
+            // 当成功游标保存，否则会把没补上的区间永久跳过。
+            const retryable = done.code === 503;
+            if (!retryable) {
+                // 拿到一次正常结果就清零连续失败计数。
+                syncRetryCount = 0;
+                // 先落游标：它代表「此刻房间里最大的序号」，比缓冲里任何一条都新。
+                lastSeqSeen = Math.max(lastSeqSeen, done.seq || 0);
+                saveCursor(room, serverInstance, done.seq);
+            }
 
             const buf = syncBuffer;
             syncBuffer = [];
+            // checkGap=false：补齐回放本身就是从游标开始的一段，不能二次触发补齐。
             for (const m of buf) {
-                applyIncoming(m);
+                applyIncoming(m, false);
+            }
+
+            if (retryable) {
+                syncRetryCount++;
+                if (syncRetryCount < MAX_SYNC_RETRIES) {
+                    appendSystemMessage(`补齐暂缓：${done.message || '服务端拥塞'}`);
+                    scheduleSyncRetry();
+                    return;
+                }
+                // 连续被拒到上限：放弃本次补齐，但必须把待确认消息放出去 ——
+                // 断线时它们的 timer 已被清掉，这里不 flush 就永远发不出去。
+                appendSystemMessage('补齐多次被拒，实时消息继续，下次重连再补');
+                flushPendingAcks();
+                return;
             }
 
             if (done.code === 206) {
@@ -727,6 +889,9 @@
             } else if (done.message && /已补 [1-9]/.test(done.message)) {
                 appendSystemMessage(`断线期间的消息已补齐：${done.message}`);
             }
+
+            // 只有 sync 收尾后才重发待确认消息，避免它们插到补齐帧之前。
+            flushPendingAcks();
         }
 
         function sendHeartbeat() {
@@ -797,15 +962,21 @@
             const msgInput = document.getElementById('msgInput');
             const btnSend = document.getElementById('btnSend');
 
+            let myWs = null;
             try {
                 const wsFullUrl = `${url}?room_name=${encodeURIComponent(room)}&name=${encodeURIComponent(user)}`;
                 ws = new WebSocket(wsFullUrl);
+                // 连接与房间绑定：URL 用哪个房间，游标就按哪个房间读写。
+                myWs = ws;
+                connectedRoom = room;
             } catch (e) {
                 alert('连接构造失败: ' + e.message);
                 return;
             }
 
             ws.onopen = () => {
+                // 已被新连接顶替的旧 socket 不许再动 UI / 心跳 / 补齐状态。
+                if (myWs !== ws) return;
                 dot.classList.add('online');
                 statusText.innerText = '在线';
                 statusText.style.color = 'var(--hm-teal)';
@@ -816,29 +987,20 @@
                 msgInput.focus();
                 // 连上了就清零退避计数，下次断开从 1 秒重新开始
                 reconnectAttempts = 0;
+                // 新连接 = 新的补齐重试预算，别让上一条连接的连续 503 拖累本次。
+                syncRetryCount = 0;
                 manualClose = false;
                 addSystemMessage(`已进入空间 [${room}]，身份: ${user}`);
                 startHeartbeat();
 
                 // 重连补齐（B4）：把本地游标报回去，让服务端补上断线期间的消息。
                 // 补齐期间到达的帧会被缓冲到 sync_done 再应用（见 handleSyncDone）。
-                syncing = true;
-                syncBuffer = [];
-                const cur = loadCursor(room);
-                serverInstance = cur.instance;
-                lastSeqSeen = cur.seq;
-                try {
-                    ws.send(JSON.stringify({
-                        action: 'sync',
-                        sinceSeq: cur.seq,
-                        sinceInstance: cur.instance
-                    }));
-                } catch (e) {
-                    syncing = false; // 发不出去就别一直缓冲
-                }
+                // 统一走 beginSync：它带超时与限频，裸 send 一旦丢响应就会永久缓冲。
+                beginSync('open');
             };
 
             ws.onmessage = (event) => {
+                if (myWs !== ws) return;
                 recvTotal++;
                 document.getElementById('recvCount').innerText = recvTotal.toLocaleString();
 
@@ -862,8 +1024,22 @@
                     return;
                 }
 
-                // 补齐期间先缓冲，等 sync_done 定序之后再应用（见 handleSyncDone）
+                // 补齐期间先缓冲，等 sync_done 定序之后再应用（见 handleSyncDone）。
+                // 缓冲必须有上限：服务端 503 或响应丢失时，实时流会一直往里堆，
+                // 长时间卡在 syncing 就等于把整段内存交给对端决定。
                 if (syncing) {
+                    if (syncBuffer.length >= MAX_SYNC_BUFFER) {
+                        syncing = false;
+                        clearSyncTimer();
+                        const buf = syncBuffer;
+                        syncBuffer = [];
+                        for (const m of buf) applyIncoming(m, false);
+                        appendSystemMessage(
+                            `⚠️ 补齐缓冲达到上限（${MAX_SYNC_BUFFER} 条），本次补齐中止；下次重连会继续`);
+                        flushPendingAcks();
+                        applyIncoming(data);
+                        return;
+                    }
                     syncBuffer.push(data);
                     return;
                 }
@@ -873,7 +1049,10 @@
 
             // 一条【已经定序】的消息的渲染逻辑。实时到达与补齐回放都走这里，
             // 保证两条路径的显示行为完全一致。
-            function applyIncoming(data) {
+            //
+            // checkGap=false 用于「批量应用缓冲」：那批帧本来就是被中断的补齐
+            // 的一部分，序号必然不连续，不能拿它当缺口信号（否则会自我触发重连补齐）。
+            function applyIncoming(data, checkGap = true) {
                 // 按 code 分类处理。原先只有 code===200 走聊天气泡、其余
                 // 一律 JSON.stringify 成「系统态势」，于是 503（未投递）和
                 // 404（对方不在线）这两类【需要用户立刻知道】的结果
@@ -893,6 +1072,31 @@
                 if (data.code !== 200) {
                     appendSystemMessage(`服务端返回 code=${data.code}：${data.message || ''}`);
                     return;
+                }
+
+                // ── 实时缺口检测（B5）────────────────────────────────────────
+                // 连接级拥塞闸门会「跳过」某个慢订阅者的部分帧（服务端明确设计），
+                // 于是实时流里会出现 seq 断层。只靠「重连才补齐」意味着这条消息
+                // 要等到下次断线才可能看到 —— 这里发现缺口就主动补一次。
+                // 补齐本身有 1 秒限频与 503 重试，不会被高频帧打成风暴。
+                if (checkGap && !syncing && data.seq) {
+                    const expected = lastSeqSeen + 1;
+                    if (lastSeqSeen > 0 && data.seq > expected) {
+                        const now = Date.now();
+                        if (now - lastGapSyncAt > GAP_SYNC_MIN_INTERVAL_MS) {
+                            lastGapSyncAt = now;
+                            beginSync('gap');
+                        }
+                    }
+                }
+
+                // 推进本地游标：只前进、不后退（补齐回放可能带来较小的 seq）。
+                // 放在「公告/暂停渲染」这些提前 return 之前 —— 游标表示的是
+                // 「这一条已经到手」，与是否渲染成气泡无关。否则公告会把游标卡住，
+                // 后面的每条消息都被误判成 seq 缺口。
+                if (data.seq > lastSeqSeen) {
+                    lastSeqSeen = data.seq;
+                    saveCursor(connectedRoom, serverInstance, data.seq);
                 }
 
                 // 系统提示 / 入群 / 离群公告：服务端现在会下发 type 字段
@@ -921,9 +1125,15 @@
 
                 // 去重（B3）：补齐回放与实时投递可能重叠，同一条只渲染一次。
                 // 按 id 而不是按 seq —— id 是全局唯一的 snowflake，跨实例也成立。
-                if (data.id) {
-                    if (seenMsgIds.has(data.id)) return;
-                    seenMsgIds.add(data.id);
+                // 但 id ≈3.7e17 已超出 JS 安全整数，JSON.parse 后相邻 id 会塌成同一个
+                // double（实测差 33/60 也算相等），按 id 去重会误杀同一毫秒的第 2 条。
+                // 故房间消息改用「实例作用域 + seq」；seq 为 0（私聊/旧服务端）才回退 id。
+                const dedupKey = (data.seq > 0)
+                    ? `${serverInstance}:${data.seq}`
+                    : (data.id != null ? `id:${data.id}` : '');
+                if (dedupKey) {
+                    if (seenMsgIds.has(dedupKey)) return;
+                    seenMsgIds.add(dedupKey);
                     // 防内存无界增长：超过上限就丢掉最早的一半
                     if (seenMsgIds.size > 20000) {
                         const it = seenMsgIds.values();
@@ -933,19 +1143,24 @@
                     }
                 }
 
-                // 推进本地游标：只前进、不后退（补齐回放可能带来较小的 seq）。
-                if (data.seq > lastSeqSeen) {
-                    lastSeqSeen = data.seq;
-                    saveCursor(document.getElementById('roomName').value.trim(), serverInstance, data.seq);
-                }
-
                 const myName = document.getElementById('userName').value.trim();
                 const isSelf = data.name === myName;
                 appendChatMessage(data.name || `User_${data.id}`, data.message, isSelf);
             }
 
             ws.onclose = () => {
+                if (myWs !== ws) return;
                 stopHeartbeat();
+                // 断线时补齐状态必须复位：残留的 syncing=true 会让重连后的
+                // 实时帧一直被缓冲，而 sync_done 永远不会再来（它是上一个连接的）。
+                clearSyncTimer();
+                if (syncRetryTimer !== null) {
+                    clearTimeout(syncRetryTimer);
+                    syncRetryTimer = null;
+                }
+                syncing = false;
+                syncBuffer = [];
+                // pendingAcks 故意保留：重连补齐完成后再统一重发（见 flushPendingAcks）。
                 dot.classList.remove('online');
                 statusText.innerText = '已断开';
                 statusText.style.color = 'var(--hm-text-secondary)';
@@ -971,6 +1186,7 @@
             };
 
             ws.onerror = () => {
+                if (myWs !== ws) return;
                 addSystemMessage('通信链路发生异常波动');
             };
         }
@@ -1004,6 +1220,8 @@
                 msgContent: content,
                 toUser: toUser
             }));
+            // 发出去就开始计时：ACK 丢在断线里时靠它退避重发，而不是无限悬置。
+            scheduleAckTimeout(msgKey, pendingAcks.get(msgKey));
             sentTotal++;
             document.getElementById('sentCount').innerText = sentTotal.toLocaleString();
             input.value = '';

@@ -18,6 +18,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 // getpid()：用于生成可诊断的实例 ID（见构造函数）
@@ -61,6 +62,10 @@ public:
             sweepConnectionFlow(*core);
             publishRoomMetrics(*core);
             publishKafkaMetrics();
+            // 总线存活探针：Redis 订阅断连后 drogon 会自己重连，但期间收不到
+            // 任何跨实例消息，clusterBusReady 却仍是 true ⇒ 私聊回假 200。
+            // 这里用自回环包确认「整条链路真的通」，连续 3 个周期不通就置 false。
+            probeClusterBus(*core);
             // 去重表 TTL 清理（去重关闭时表为空，立即返回）
             sweepDedupTable(*core);
             // 开关热更新：改 config.json 不必重启进程（见 reloadSwitches 注释）
@@ -149,7 +154,27 @@ private:
         }
 
         std::atomic<int64_t> lastActiveNanos_{nowNanos()};
+
+        // 错误通知（-1 协议错误 / 400 空内容）的按连接限流。
+        //
+        // 为什么必须限流：这几条早退分支原先【每收一帧就回一帧】。1 字节的
+        // 非法帧能换出约 100 字节的通知 ⇒ 约 100 倍的出向放大，而且这些 send
+        // 发生在拥塞闸门之外 —— 只发不读的客户端可以借此把 outputBuffer_ 撑到
+        // 无界，正好是 HWM 闸门要防的场景。限流后仍然「会告知」，只是不再
+        // 与错误帧数量成正比。
+        bool shouldSendErrorNotice(int64_t minIntervalNanos = 1'000'000'000LL)
+        {
+            const int64_t now = nowNanos();
+            int64_t last = lastErrorNoticeNanos_.load(std::memory_order_relaxed);
+            if (now - last < minIntervalNanos)
+            {
+                return false;
+            }
+            return lastErrorNoticeNanos_.compare_exchange_strong(
+                last, now, std::memory_order_relaxed);
+        }
         std::atomic<int64_t> lastOverloadNoticeNanos_{0};
+        std::atomic<int64_t> lastErrorNoticeNanos_{0};
 
         // ── 连接级输出流控（2026-09-16）────────────────────────────────────────
         //
@@ -187,6 +212,97 @@ private:
         // 本连接的待写缓冲观测到的峰值（字节）。由高水位回调直接给出 ——
         // 回调的第二个参数就是 pending 字节数，比事后去问 socket 更准且零成本。
         std::atomic<uint64_t> peakPendingBytes_{0};
+
+        // 连接是否正处于输出拥塞。私聊与 sync 也必须尊重这个闸门：
+        // 它们原先绕过 RoomRegistry 的 Entry::gate 直接 send，慢连接仍可把
+        // trantor 的 outputBuffer_ 撑到无界（房间扇出的保护管不到这两条路）。
+        bool isCongested() const noexcept
+        {
+            return gate && gate->load(std::memory_order_relaxed) != 0;
+        }
+
+        // sync 的最小间隔。sync 一次最多回放 journalCap 条，而请求本身很小；
+        // 没有间隔限制时，一个连接可以持续触发「小请求 → 大回放」的放大。
+        // 只允许同一连接每秒发起一次 sync；被拒时回可重试的 503。
+        static constexpr int64_t kSyncMinIntervalNanos = 1'000'000'000LL;
+        std::atomic<int64_t> lastSyncNanos_{0};
+
+        bool tryAcquireSync() noexcept
+        {
+            const int64_t now = nowNanos();
+            int64_t last = lastSyncNanos_.load(std::memory_order_relaxed);
+            if (last != 0 && now - last < kSyncMinIntervalNanos)
+            {
+                return false;
+            }
+            return lastSyncNanos_.compare_exchange_strong(
+                last, now, std::memory_order_relaxed);
+        }
+
+        // ── 每连接消息速率（token bucket）────────────────────────────────────
+        //
+        // 只由本连接所属 IO 线程读写，不需要原子量。速率限制的目的不是替代
+        // 鉴权，而是阻止单个连接无限量地占用 JSON 解析、日志、扇出与 ACK 路径。
+        // 默认值很高（见 Core::kDefaultMaxMsgsPerSec），正常压测与聊天不会碰到；
+        // LOONG_WS_MAX_MSGS_PER_SEC=0 可显式关闭。
+        int64_t rateTokens_ = 0;
+        int64_t rateLastNanos_ = 0;
+        uint32_t consecutiveRateViolations_ = 0;
+
+        bool allowMessage(size_t perSec, size_t burst) noexcept
+        {
+            if (perSec == 0)
+            {
+                consecutiveRateViolations_ = 0;
+                return true;
+            }
+            const int64_t capacity = static_cast<int64_t>(std::max<size_t>(burst, 1));
+            if (rateLastNanos_ == 0)
+            {
+                rateLastNanos_ = nowNanos();
+                rateTokens_ = capacity;
+            }
+
+            // 热路径：只要还有 token 就只做一次整数减法，不读时钟。
+            // 只有额度耗尽时才计算补充量，避免每条消息都付一次 steady_clock。
+            if (rateTokens_ > 0)
+            {
+                --rateTokens_;
+                consecutiveRateViolations_ = 0;
+                return true;
+            }
+
+            const int64_t now = nowNanos();
+            const int64_t elapsed = std::max<int64_t>(0, now - rateLastNanos_);
+            const int64_t refill = static_cast<int64_t>(
+                (static_cast<__int128>(elapsed) * static_cast<__int128>(perSec)) /
+                1'000'000'000LL);
+            if (refill <= 0)
+            {
+                // ⚠️ 这里【不能】把 rateLastNanos_ 推到 now。
+                //
+                // 原先无论补充多少都无条件 `rateLastNanos_ = now`，于是「不足
+                // 一个 token 的那点时间」每次都被丢掉：只要相邻两条的间隔
+                // 小于 1/perSec，refill 恒为 0 且计时起点被不断前移 ⇒ 额度
+                // 永远补不回来。后果不是「限到 perSec」，而是略超速（比如
+                // 1.5 倍）的客户端被 100% 拒绝，几百毫秒内就攒够 256 次
+                // consecutiveRateViolations_ 被强断 —— 429 与强断的语义边界塌陷。
+                //
+                // 正确做法：失败时保持计时起点不动，让时间自然累积到够一个
+                // token 为止。
+                ++consecutiveRateViolations_;
+                return false;
+            }
+            // 只把「已经兑换成 token 的那部分时间」从计时起点里扣掉，
+            // 余下的零头留给下一次（原来直接丢弃）。
+            rateLastNanos_ +=
+                static_cast<int64_t>((static_cast<__int128>(refill) * 1'000'000'000LL) /
+                                     static_cast<__int128>(perSec));
+            rateTokens_ = std::min(capacity, refill);
+            --rateTokens_;
+            consecutiveRateViolations_ = 0;
+            return true;
+        }
     };
 
     // 一个在线会话：连接 + 它的 Subscriber。
@@ -228,6 +344,18 @@ private:
             if (readEnvSize("LOONG_WS_CONGESTION_CLEAR_MS", clearMs))
             {
                 congestionClearMs = static_cast<int64_t>(clearMs);
+            }
+
+            readEnvSize("LOONG_WS_MAX_MSGS_PER_SEC", maxMsgsPerSec);
+            readEnvSize("LOONG_WS_MSG_BURST", msgBurst);
+            if (maxMsgsPerSec == 0)
+            {
+                msgBurst = 0;
+            }
+            else if (msgBurst < maxMsgsPerSec)
+            {
+                // 突发额度至少容纳一秒的正常流量，避免把平滑速率误伤成限流。
+                msgBurst = maxMsgsPerSec;
             }
         }
 
@@ -275,6 +403,16 @@ private:
         // 1 秒是个保守值：既让慢客户端不至于完全饿死，又不给它积累缓冲的机会。
         static constexpr int64_t kDefaultCongestionClearMs = 1000;
         int64_t congestionClearMs = kDefaultCongestionClearMs;
+
+        // ── 每连接消息速率准入（2026-10-25）────────────────────────────────────
+        //
+        // 缺省 20000 条/秒、突发 40000：远高于正常聊天与既有压测的单连接速率，
+        // 但能阻止一个连接无上限地占用解析、扇出和 ACK 路径。0 = 关闭。
+        // 不替代鉴权，只补齐「没有流量准入」这一层资源保护。
+        static constexpr size_t kDefaultMaxMsgsPerSec = 20000;
+        static constexpr size_t kDefaultMsgBurst = 40000;
+        size_t maxMsgsPerSec = kDefaultMaxMsgsPerSec;
+        size_t msgBurst = kDefaultMsgBurst;
 
         // 房间注册表：按订阅者分片 + 多核并行扇出，严格保序。
         // 取代了原先的 drogon::PubSubService（它单线程扇出，房间越大越慢）
@@ -352,6 +490,28 @@ private:
         // 哪儿都没去（假 ACK）。用这个运行时标志替代，才能诚实回答
         // 「本实例现在到底能不能跨实例投递」。
         std::atomic<bool> clusterBusReady{false};
+
+        // ── 总线存活探针（2026-10-25）──────────────────────────────────────────
+        //
+        // 光有 clusterBusReady 是不够的：它只在「订阅注册成功」时置 true，
+        // 而 drogon 的 Redis 订阅连接断掉后会自己重连（有约 2 秒空窗），
+        // 期间本实例收不到任何跨实例消息，标志却仍是 true ⇒ 私聊跳过 404
+        // 判定、回一个假 200。反过来，进程启动后 Redis 才挂掉也不会被发现。
+        //
+        // 做法：每 5 秒往总线 PUBLISH 一个探针包，自己的订阅会收到（Redis
+        // pub/sub 会把消息投给包括发布者在内的所有订阅者）。收到就刷新
+        // lastBusEchoNanos；连续 3 个周期没收到 ⇒ 判定总线不可用。
+        //
+        // 为什么用「自回环」而不是「查连接状态」：drogon 的 RedisClient 没有
+        // 公开的连接状态查询，而且「命令能缓冲」不等于「订阅还活着」——
+        // 只有真正收到一帧才证明整条链路通。
+        std::atomic<int64_t> lastBusEchoNanos{0};
+
+        // 探针包的 topic 值。用不可能与真实房间名重合的字面量（真实房间名来自
+        // HTTP header/查询参数，不会带 `__` 前缀的双下划线）：
+        // 收到 topic 等于它的包 → 只当作「链路还通」的证据，绝不投递。
+        // 这样不必给 ClusterPacket 加字段，滚动升级期间新旧实例都能安全忽略它。
+        static constexpr std::string_view kBusProbeTopic = "__loong_bus_probe__";
     };
 
     std::shared_ptr<Core> core_;
@@ -371,6 +531,18 @@ private:
     static void publishToCluster(const Core& core, const std::string& topic,
                                  const std::string& json, const std::string& toUser = {},
                                  uint64_t roomSeq = 0);
+
+    // 总线存活探针：发一个自回环包，并据此维护 Core::clusterBusReady。
+    //
+    // 由 5 秒定时任务调用。为什么需要它见 Core::lastBusEchoNanos 的说明：
+    // clusterBusReady 只在订阅注册成功时置 true，而 Redis 订阅连接断开重连的
+    // 空窗期（约 2 秒）与「启动后 Redis 才挂掉」这两种情况都不会把它改回 false，
+    // 于是私聊会跳过 404 判定、回一个「哪儿都没去」的假 200。
+    //
+    // 探针判定：连续 3 个周期（15 秒）收不到自己的回环包 ⇒ 置 false。
+    // 15 秒是「Redis 重连空窗 2 秒」的 7 倍余量，不会因为一次抖动误判；
+    // 而一旦真的判死，代价只是私聊回 404（诚实）而不是假 200（撒谎）。
+    static void probeClusterBus(Core& core);
 
     // 用入站包的房间序号更新基线，并检测「缺口」与「回退（乱序）」。
     //
@@ -407,7 +579,8 @@ private:
                                        const std::string& json,
                                        const WebSocketConnectionPtr& sender,
                                        bool* echoedToSender = nullptr,
-                                       size_t* backpressured = nullptr);
+                                       size_t* backpressured = nullptr,
+                                       size_t* gated = nullptr);
     // 形参用 string_view：开关关闭时（压测/开发常态）调用方不必先构造 std::string，
     // 避免「已经拷贝完了才在函数里 short-circuit」这种白付的分配。
     // 需要所有权的地方（TBB worker）在 lambda 捕获里再落成 std::string。
@@ -869,23 +1042,48 @@ private:
     // 客户端拿它做重连游标（见 chatMessageVo::seq），而它只能在注册表确定
     // 「这条消息会被接受」之后才分配，所以「构造负载」必须挪进注册表的临界区。
     // 无订阅者时 build 不会被调用（默认配置下不白付序列化开销）。
-    template <typename BuildFn>
+    // onAccepted(seq, payload) 在【房间 pubMtx 内、确定消息被接受之后】调用。
+    // Kafka 落库用它来保证「同一房间的归档提交顺序 == 房间 seq 顺序」：
+    // 若等 fanOutRoom 返回后再提交，两个 IO 线程可能在这里反超。
+    // 回调必须便宜且不抛；异常会被吞掉，绝不能影响实时投递。
+    template <typename BuildFn, typename AcceptedFn = std::nullptr_t>
     bool fanOutRoom(Core& core, const std::string& topic, BuildFn&& build,
                     bool broadcastToCluster = true,
                     const RoomRegistry::RoomHandle& hint = {},
-                    uint64_t* outRoomSeq = nullptr)
+                    uint64_t* outRoomSeq = nullptr,
+                    AcceptedFn&& onAccepted = AcceptedFn{})
     {
         // 房间级序号由 RoomRegistry 在 pubMtx 内分配（见 publishShared 的说明）：
         // 拿到它才能让接收端判断「总线链路上有没有丢/乱序」，
         // 也才能把它写进 Kafka 落库信封供回放端还原顺序。
         uint64_t roomSeq = 0;
         std::shared_ptr<const std::string> built;
-        const bool ok = core.roomRegistry.publishWithSeq(topic, hint, &roomSeq,
-                                                         [&](uint64_t seq) {
-                                                             built = std::make_shared<const std::string>(
-                                                                 build(seq));
-                                                             return built;
-                                                         });
+        const bool ok = core.roomRegistry.publishWithSeq(
+            topic, hint, &roomSeq,
+            [&](uint64_t seq)
+            {
+                built = std::make_shared<const std::string>(build(seq));
+                if constexpr (!std::is_same_v<std::decay_t<AcceptedFn>, std::nullptr_t>)
+                {
+                    // 归档失败绝不能影响消息投递：吞掉异常并只留一行告警。
+                    // 正常路径（Kafka 关闭）根本不会调用到这里。
+                    try
+                    {
+                        onAccepted(seq, built);
+                    }
+                    catch (const std::exception& e)
+                    {
+                        LOG_WARN << "accepted-hook failed for room '" << topic
+                                 << "': " << e.what();
+                    }
+                    catch (...)
+                    {
+                        LOG_WARN << "accepted-hook failed for room '" << topic
+                                 << "': unknown exception";
+                    }
+                }
+                return built;
+            });
         if (!ok)
         {
             // ⚠️ 本地入队被拒（背压）时【不能】再广播集群、也不能落库。

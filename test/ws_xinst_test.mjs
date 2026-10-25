@@ -145,6 +145,34 @@ ok(daveA1.message === '[私聊] multi-end', `同实例那一端收到（实际: 
 const daveB1 = await daveB.next();
 ok(daveB1.message === '[私聊] multi-end', `跨实例同名那一端也收到（实际: ${daveB1.message}）`);
 
+// 7. 跨实例房间消息的 seq 必须是【接收实例的本地序号】。
+//
+//    旧实现把总线包里发送实例的 seq 原样转发给本地订阅者，而本实例 journal
+//    里存的是【本地】seq —— 两套真相。客户端拿实时帧的 seq 当游标回来补齐，
+//    就会去补一个错区间（漏补，或补出一段不相干的消息）。
+//
+//    判据：B 上先本地发 3 条（B 的计数器前进），再让 A 发 5 条（A 的计数器
+//    从自己的值开始）。若 seq 没被重写，B 侧观察者会看到「先 2,3,4 再 2,3,4,5,6」
+//    —— 序号回退。修复后整串必须是严格递增的本地序号。
+for (const c of [alice, bob, carol, daveA, daveB]) c.inbox.length = 0;
+
+for (let i = 0; i < 3; i++) {
+  bob.send({ key: `bl${i}_${ROOM}`, action: 'message', msgContent: `b_local_${i}` });
+}
+await sleep(400);
+for (let i = 0; i < 5; i++) {
+  alice.send({ key: `ar${i}_${ROOM}`, action: 'message', msgContent: `a_remote_${i}` });
+}
+await sleep(1500);
+
+const mixed = daveB.inbox.filter((m) => /^(b_local_|a_remote_)/.test(m.message || ''));
+const mixedSeqs = mixed.map((m) => m.seq);
+ok(mixed.length === 8, `B 侧观察者收满 8 条（实际 ${mixed.length}）`);
+ok(
+  mixedSeqs.every((s, i) => i === 0 || s > mixedSeqs[i - 1]),
+  `跨实例房间消息的 seq 在接收实例内不回退（${mixedSeqs.join(',')}）`
+);
+
 for (const c of [alice, bob, carol, daveA, daveB]) c.close();
 console.log(`\n${failures === 0 ? 'ALL PASSED' : 'FAILED'} (failures=${failures})`);
 process.exit(failures === 0 ? 0 : 1);
