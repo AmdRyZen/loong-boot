@@ -241,6 +241,28 @@ public:
         wsRoomMaxBacklog_.store(maxRoomBacklog, std::memory_order_relaxed);
     }
 
+    // ── 回放日志（journal）的内存占用 ────────────────────────────────────────
+    //
+    // entries 是 gauge：当前所有【活跃】房间的日志条目总数。
+    //   它乘以单条大小（≈200B）就是这块内存的真实占用，是回答
+    //   「回放日志吃了多少内存」的唯一直接数字。
+    // activeCap 是 gauge：配置的全局预算（0 = 未启用）。
+    //   只报用量不报上限，就不知道离被削还有多远 —— 两者必须一起看。
+    // evicted 是 counter：因超预算被淘汰掉的条目累计数。
+    //   ⚠️ 它一旦开始涨，就意味着【有客户端重连时会拿到 206 而不是完整补齐】。
+    //   这是「为了保住内存而牺牲回放完整性」的代价，必须可见，不能静默。
+    void setJournalEntries(uint64_t entries) {
+        wsJournalEntries_.store(entries, std::memory_order_relaxed);
+    }
+
+    void setJournalActiveCap(uint64_t cap) {
+        wsJournalActiveCap_.store(cap, std::memory_order_relaxed);
+    }
+
+    void recordJournalEvicted(uint64_t count = 1) {
+        wsJournalEvicted_.fetch_add(count, std::memory_order_relaxed);
+    }
+
     // 端到端扇出延迟的一个样本（纳秒）。
     //
     // 由 RoomRegistry 通过注入的回调在【目标 IO loop 上】调用，因此：
@@ -521,7 +543,16 @@ public:
            << "ws_room_queued_messages " << wsRoomQueued_.load(std::memory_order_relaxed) << "\n"
            << "# HELP ws_room_max_backlog Backlog of the single most backed-up room at the last 5s sample (gauge). Compare with the per-shard cap (LOONG_WS_BACKLOG_PER_SHARD): approaching it means the next publish to that room gets refused. NOTE: instantaneous sample, so a short burst can be missed - cross-check ws_messages_dropped_total. NOTE: with inline fanout (the default, no LOONG_WS_FANOUT_THREADS) the publisher drains its own shard, so this stays near 0 by construction; the signals there are ws_messages_dropped_total and the right tail of ws_fanout_latency_us.\n"
            << "# TYPE ws_room_max_backlog gauge\n"
-           << "ws_room_max_backlog " << wsRoomMaxBacklog_.load(std::memory_order_relaxed) << "\n\n";
+           << "ws_room_max_backlog " << wsRoomMaxBacklog_.load(std::memory_order_relaxed) << "\n"
+           << "# HELP ws_journal_entries Total replay-journal entries held by ALL active rooms. Multiply by ~200 bytes for the actual memory. This is the number the global budget (ws_journal_active_cap) constrains.\n"
+           << "# TYPE ws_journal_entries gauge\n"
+           << "ws_journal_entries " << wsJournalEntries_.load(std::memory_order_relaxed) << "\n"
+           << "# HELP ws_journal_active_cap Configured global cap on replay-journal entries across all active rooms (0 = budget disabled). Compare with ws_journal_entries to see how close the eviction threshold is.\n"
+           << "# TYPE ws_journal_active_cap gauge\n"
+           << "ws_journal_active_cap " << wsJournalActiveCap_.load(std::memory_order_relaxed) << "\n"
+           << "# HELP ws_journal_evicted_total Journal entries dropped because the global budget was exceeded. Non-zero means some reconnecting clients will get a 206 (partial replay) instead of a full catch-up - the deliberate price of a bounded memory footprint.\n"
+           << "# TYPE ws_journal_evicted_total counter\n"
+           << "ws_journal_evicted_total " << wsJournalEvicted_.load(std::memory_order_relaxed) << "\n\n";
 
         // 扇出分组效果（A1）。两个都是 counter：看增量，不看绝对值。
         // 健康形态：crossthread_batches 增量 ≈ 消息数 × IO线程数，远小于
@@ -682,6 +713,9 @@ private:
     std::atomic<uint64_t> wsRoomMaxSubscribers_{0};
     std::atomic<uint64_t> wsRoomQueued_{0};
     std::atomic<uint64_t> wsRoomMaxBacklog_{0};
+    std::atomic<uint64_t> wsJournalEntries_{0};
+    std::atomic<uint64_t> wsJournalActiveCap_{0};
+    std::atomic<uint64_t> wsJournalEvicted_{0};
     std::atomic<uint64_t> wsFanoutInLoop_{0};
     std::atomic<uint64_t> wsFanoutCrossThread_{0};
     std::atomic<uint64_t> wsFanoutCrossThreadDeliveries_{0};

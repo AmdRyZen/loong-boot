@@ -908,6 +908,9 @@ private:
         readEnvSize("LOONG_WS_WORKER_SPIN_ROUNDS", opt.workerSpinRounds);
         // 房间消息日志容量（回放用；0 = 关闭回放）。
         readEnvSize("LOONG_WS_JOURNAL_CAP", opt.journalCap);
+        // 全局回放日志预算（条目总数，跨所有活跃房间；0 = 关闭该预算）。
+        // journalCap 只管单房间，房间一多就没有东西管住总量 —— 见 Options 里的说明。
+        readEnvSize("LOONG_WS_JOURNAL_ACTIVE_CAP", opt.journalActiveCap);
         // 端到端延迟直方图的采样掩码（必须是 2^n - 1；0 = 关闭采样）。
         // 用局部 size_t 中转：readEnvSize 的形参是 size_t&，而这里刻意用
         // uint64_t 存掩码，直接传引用在 LP64 上能编过、但换平台就是隐患。

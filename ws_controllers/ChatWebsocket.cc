@@ -1793,9 +1793,35 @@ void ChatWebsocket::checkAndEvictIdleConnections(Core& core)
 void ChatWebsocket::publishRoomMetrics(Core& core)
 {
     auto& m = Metrics::PrometheusRegistry::instance();
+    const auto& opt = core.roomRegistry.options();
+
+    // ── 先执行全局回放日志预算，再采统计 ────────────────────────────────────
+    //
+    // 顺序很重要：如果先采统计再淘汰，gauge 报的是「削平前」的值，
+    // 下一拍又突然掉下来 —— 看板上会呈现锯齿，误以为日志在剧烈波动。
+    // 先削再采，gauge 恒等于「当前真实占用量」。
+    const size_t journalEvicted = core.roomRegistry.enforceJournalBudget(opt.journalActiveCap);
+    if (journalEvicted != 0)
+    {
+        m.recordJournalEvicted(journalEvicted);
+        // 这条是「内存安全阀在动」的直接信号，必须可见（默认 WARN 级别能出来）。
+        // 每 5 秒最多一行；持续出现说明房间数/消息量已经超出预算，
+        // 应当调大 LOONG_WS_JOURNAL_ACTIVE_CAP 或加实例，而不是让它一直削。
+        static loong::log::RateLimiter evictLimiter{1, "journal.budget_evict"};
+        if (evictLimiter.allow())
+        {
+            LOG_WARN << "Journal budget exceeded: evicted "
+                     << (journalEvicted + evictLimiter.takeSuppressed())
+                     << " entr(ies) from least-recently-active rooms (cap: "
+                     << opt.journalActiveCap << ", see ws_journal_entries / ws_journal_evicted_total)";
+        }
+    }
+
     const auto s = core.roomRegistry.stats();
     m.setRoomStats(s.rooms, s.shards, s.subscribers, s.maxRoomSubscribers, s.queuedMessages,
                    s.maxRoomBacklog);
+    m.setJournalEntries(s.journalEntries);
+    m.setJournalActiveCap(opt.journalActiveCap);
 
     // ── 「最深积压房间」的边沿日志（C2）───────────────────────────────────────
     //

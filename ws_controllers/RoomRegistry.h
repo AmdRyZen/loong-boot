@@ -296,6 +296,22 @@ class RoomRegistryT
         // 容量 × 平均消息大小就是每个活跃房间的常驻内存。512 × ~120B ≈ 60KB/房间。
         // 可用 LOONG_WS_JOURNAL_CAP 覆盖。
         size_t journalCap = 512;
+
+        // ── 全局回放日志预算（条目总数，跨所有【活跃】房间）────────────────────
+        //
+        // journalCap 只管住【单个】房间；房间一多就没有任何东西管住总量：
+        // 1 万个活跃房间 × 60~100KB ≈ 0.6~1GB，而这部分内存完全由「房间数」驱动，
+        // 与消息量无关 —— 一个只会改房间名的客户端就能把它推上去。
+        //
+        // 已回收房间的暂存日志【本来就有】全局上限（kMaxJournalRooms / kMaxJournalEntries，
+        // 约 10MB），缺口只在「活跃」这一侧，这里补的就是它。
+        //
+        // 取值依据：单条 JournalEntry ≈ 8B(seq) + 16B(shared_ptr) + payload
+        // （std::string 对象 32B + 堆块头 ~16B + 一条聊天 VO 的 JSON ~130B）≈ 200B。
+        // 默认 1<<20 条 ⇒ 最坏约 200MB，是「正常流量永远碰不到、真出事时也压得住」
+        // 的量级。设 0 = 关闭该预算（退回旧行为：只受单房间上限约束）。
+        // 可用 LOONG_WS_JOURNAL_ACTIVE_CAP 覆盖。
+        size_t journalActiveCap = 1 << 20;
     };
 
     explicit RoomRegistryT(Options opt = Options{}) : opt_(opt)
@@ -930,6 +946,13 @@ class RoomRegistryT
                 {
                     r->journal.pop_front();
                 }
+                // 供全局预算淘汰按 LRU 选受害者（见 enforceJournalBudget）。
+                // relaxed 即可：它只是排序用的近似时间戳，没有任何同步语义。
+                r->lastPublishNanos.store(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count(),
+                    std::memory_order_relaxed);
             }
         }
 
@@ -1084,6 +1107,7 @@ class RoomRegistryT
         size_t maxRoomSubscribers = 0; // 最大单房间订阅者数（扇出成本的关键指标）
         size_t queuedMessages = 0;     // 全体房间的分片队列积压总条数
         size_t maxRoomBacklog = 0;     // 单房间最大积压条数（该房间所有分片之和）
+        size_t journalEntries = 0;     // 全体【活跃】房间的回放日志条目总数
         std::string worstRoom;         // 上面对应的房间名（仅用于日志）
     };
 
@@ -1144,8 +1168,11 @@ class RoomRegistryT
             //（drainShard 只取分片锁），故不成环。
             // pubMtx 是必须的：它才是 r->shards 容器的保护者（见函数开头的说明）。
             size_t backlog = 0;
+            size_t journalEntries = 0;
             {
                 std::lock_guard pubLock(r->pubMtx);
+                // journal 与 shards 同一把 pubMtx 保护 ⇒ 顺手一起读，不额外加锁。
+                journalEntries = r->journal.size();
                 for (const auto& sh : r->shards)
                 {
                     if (!sh)
@@ -1156,6 +1183,7 @@ class RoomRegistryT
                     backlog += sh->queue.size();
                 }
             }
+            s.journalEntries += journalEntries;
             s.queuedMessages += backlog;
             if (backlog > s.maxRoomBacklog)
             {
@@ -1164,6 +1192,105 @@ class RoomRegistryT
             }
         }
         return s;
+    }
+
+    // ── 全局回放日志预算的执行器（由 5 秒定时任务驱动）──────────────────────
+    //
+    // 返回本次淘汰掉的日志条目数（调用方拿去记指标）。
+    //
+    // 为什么不在 publish 里做：淘汰要跨房间选受害者（需要遍历全局房间表），
+    // 而 publish 只持【房间级】pubMtx。在热路径上取全局锁既贵，又会引入
+    // roomsMtx_ ↔ pubMtx 的锁序风险（unsubscribe 已存在 pubMtx → roomsMtx_ 的方向）。
+    // 放到定时任务里，代价只是「超限后最多 5 秒才被削平」—— 这期间的超额量
+    // 有界（5 秒内新增的消息数），对一个本来就只在极端场景触发的安全阀来说完全可以接受。
+    //
+    // 为什么用「每次现算总量」而不是维护一个全局计数器：
+    // 手工计数器必须逐条配平，本工程已经在 journalRetainedEntries_ 上栽过两次
+    // （漏减 ⇒ 单调上溢 ⇒ 开始淘汰【别的房间】的日志）。这里每次现算，
+    // 没有任何可以泄漏的状态 —— 慢一点（5 秒一次），但不会算错。
+    //
+    // 淘汰策略：按 lastPublishNanos 升序（最久没有新消息的房间优先）整体清空其日志。
+    // 为什么整体清空而不是削到一半：清空之后 replay 会走「日志为空」那条既有分支，
+    // 判据是 `sinceSeq < maxSeq` ⇒ 落后的客户端拿到 reset=true ⇒ 206（部分补齐）。
+    // 这条语义已经实现且有测试覆盖，不需要引入任何新的「日志被裁剪过」状态。
+    //
+    // 为什么按 LRU 而不是按「日志最大的房间」：最大的房间往往正是最活跃的房间，
+    // 削它等于惩罚真实用户；而「最久没人说话」的房间，其日志本来也快没人需要了。
+    size_t enforceJournalBudget(size_t cap)
+    {
+        if (cap == 0 || opt_.journalCap == 0)
+        {
+            return 0; // 预算关闭 / 回放本身关闭：无事可做
+        }
+
+        // ① 快照房间句柄（只持全局共享锁，不碰 pubMtx —— 见 stats() 里的锁序说明）
+        std::vector<std::shared_ptr<Room>> rooms;
+        {
+            std::shared_lock lock(roomsMtx_);
+            rooms.reserve(rooms_.size());
+            for (const auto& [name, r] : rooms_)
+            {
+                rooms.push_back(r);
+            }
+        }
+
+        // ② 逐房间持 pubMtx 读日志长度（roomsMtx_ 已释放）
+        struct Entry
+        {
+            size_t size;
+            int64_t lastPublish;
+            std::shared_ptr<Room> room;
+        };
+        std::vector<Entry> entries;
+        entries.reserve(rooms.size());
+        size_t total = 0;
+        for (auto& r : rooms)
+        {
+            std::lock_guard pubLock(r->pubMtx);
+            const size_t n = r->journal.size();
+            if (n == 0)
+            {
+                continue; // 空日志不参与排序，也不可能被淘汰
+            }
+            entries.push_back(Entry{n, r->lastPublishNanos.load(std::memory_order_relaxed), r});
+            total += n;
+        }
+
+        if (total <= cap)
+        {
+            return 0;
+        }
+
+        // ③ 最久没有新消息的房间优先淘汰，直到回到预算内
+        std::sort(entries.begin(), entries.end(),
+                  [](const Entry& a, const Entry& b) { return a.lastPublish < b.lastPublish; });
+
+        size_t evicted = 0;
+        for (auto& e : entries)
+        {
+            if (total <= cap)
+            {
+                break;
+            }
+            {
+                std::lock_guard pubLock(e.room->pubMtx);
+                // 二次确认：排序与加锁之间该房间可能刚好被回收或已被别人清空。
+                const size_t n = e.room->journal.size();
+                if (n == 0)
+                {
+                    continue;
+                }
+                e.room->journal.clear();
+                // clear() 释放 deque 里的元素（即那些 shared_ptr 与 payload），
+                // 这正是内存的大头；deque 自身的块数组很小，不必 swap 重建。
+            }
+            // 用快照时的 size 记账而不是重新读：两者差一个「窗口内新增」的量，
+            // 偏小则本次少淘汰一点（下次 5 秒再削），偏大则多清一个房间 ——
+            // 两种偏差都无害，且保证循环一定收敛。
+            total = total > e.size ? total - e.size : 0;
+            evicted += e.size;
+        }
+        return evicted;
     }
 
     // 分组投递的效果观测 —— 用来在生产上确认 A1 的快速路径真的生效了
@@ -1340,6 +1467,12 @@ class RoomRegistryT
         // 原实现随 Room 一起销毁，于是「房间空过一轮」就等于「老客户端必然报 206」——
         // 而房间空掉最常见的原因恰恰是「客户端自己就是最后一个离开的人」。
         std::deque<JournalEntry> journal;
+
+        // 最近一次【被接受】的发布时间（steady_clock 纳秒）。只在 pubMtx 内写，
+        // 但允许无锁读 —— 全局预算淘汰要按它排序，而那时正持有别的锁。
+        // 用 relaxed 原子量而不是普通成员：跨线程读非原子量是 data race。
+        // 精度要求极低（只用来排序「谁最久没说话」），所以不做任何同步。
+        std::atomic<int64_t> lastPublishNanos{0};
     };
 
     // 把「分片成员表」编成「按 loop 分组的投递计划」。

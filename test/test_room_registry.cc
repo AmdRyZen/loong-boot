@@ -1488,6 +1488,81 @@ static void testJournalReplay()
         const auto c = reg.replay("churn", 0);
         CHECK(c.entries.empty() && !c.reset, "sinceSeq = 0 仍然不回放");
     }
+
+    // ---- 14i. 全局日志预算：按「最久没有新消息」淘汰，淘汰后回放必须报 206 ----
+    //
+    // 覆盖 journalActiveCap。journalCap 只管住【单个】房间，房间一多就没有任何
+    // 东西管住总量（1 万活跃房间 × 60~100KB ≈ 0.6~1GB，且完全由房间数驱动、
+    // 与消息量无关）。这里用很小的预算把同样的问题压缩到 3 个房间上。
+    {
+        RegDynamic::Options tiny = opt;
+        tiny.journalCap = 10;       // 单房间最多 10 条
+        tiny.journalActiveCap = 15; // 全局最多 15 条 ⇒ 3 个房间（30 条）就会超
+        RegDynamic reg(tiny);
+
+        auto fill = [&](const char* room, int n) {
+            const auto id =
+                reg.subscribe(room, std::make_shared<MockConn>(), DynamicLoopHandle{&loop});
+            for (int i = 1; i <= n; ++i)
+            {
+                reg.publish(room, std::string("x"));
+            }
+            return id;
+        };
+
+        // ⚠️ 每轮之间必须真睡一下：淘汰按 lastPublishNanos 排序，而三个房间
+        // 连续发布只隔几微秒 —— 时钟分辨率不够时时间戳会相等，排序退化，
+        // 「最久没消息」的语义就测不准了（会变成随机的某个房间被淘汰）。
+        const auto idA = fill("ja", 10);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        const auto idB = fill("jb", 10);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        const auto idC = fill("jc", 10);
+        drainLoop(loop);
+
+        CHECK(reg.stats().journalEntries == 30, "预算执行前：三个房间共 30 条（全局无约束）");
+
+        CHECK(reg.enforceJournalBudget(0) == 0, "cap = 0 ⇒ 不淘汰任何东西（关闭预算）");
+
+        const size_t evicted = reg.enforceJournalBudget(15);
+        CHECK(evicted == 20, "超预算 30→15：淘汰 2 个房间共 20 条");
+        CHECK(reg.stats().journalEntries <= 15, "淘汰后总条目回到预算内");
+
+        // ja 最久没有新消息 ⇒ 优先淘汰；jc 最新 ⇒ 必须完整保留
+        const auto ra = reg.replay("ja", 1);
+        CHECK(ra.entries.empty(), "最久没有新消息的房间，日志被清空");
+        CHECK(ra.reset,
+              "被清空后落后的游标必须拿到 reset=true（206）—— 绝不能假装补齐成功");
+        const auto rc = reg.replay("jc", 5);
+        CHECK(rc.entries.size() == 5, "最新的房间完整保留（游标 5 ⇒ 补 6..10）");
+        CHECK(!rc.reset, "最新房间仍是完整补齐");
+
+        CHECK(reg.enforceJournalBudget(15) == 0, "已在预算内 ⇒ 再调一次是幂等空操作");
+
+        reg.unsubscribe("ja", idA);
+        reg.unsubscribe("jb", idB);
+        reg.unsubscribe("jc", idC);
+        drainLoop(loop);
+    }
+
+    // 回放本身关闭时（journalCap = 0）预算无事可做，且不得误清任何东西
+    {
+        RegDynamic::Options noJ = opt;
+        noJ.journalCap = 0;
+        noJ.journalActiveCap = 1;
+        RegDynamic reg(noJ);
+        const auto id =
+            reg.subscribe("nj", std::make_shared<MockConn>(), DynamicLoopHandle{&loop});
+        for (int i = 0; i < 10; ++i)
+        {
+            reg.publish("nj", std::string("x"));
+        }
+        drainLoop(loop);
+        CHECK(reg.enforceJournalBudget(1) == 0, "journalCap = 0 ⇒ 预算无事可做（没有日志可淘汰）");
+        CHECK(reg.stats().journalEntries == 0, "且不会凭空产生条目");
+        reg.unsubscribe("nj", id);
+        drainLoop(loop);
+    }
 }
 
 // ── 15. 连接级投递闸门（拥塞跳过）──────────────────────────────────────────────
