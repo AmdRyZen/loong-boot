@@ -48,14 +48,37 @@ public:
         wsTotalMessages_.fetch_add(count, std::memory_order_relaxed);
     }
 
-    // 因【房间分片积压达上限】而被丢弃的消息数（含聊天消息与入群/退群公告）。
+    // 因【房间分片积压达上限】而被丢弃的【客户端消息】数。
     // 该计数必须暴露：一旦持续增长说明吞吐已达上限，需要扩实例而不是继续加压。
     //
     // ⚠️ 语义收窄（2026-09-12）：此前 Kafka 持久化的 TBB 池饱和也往这里 +1，
     // 于是「消息没投出去」和「消息投出去了但没落库」混成同一个数，线上看到涨了
     // 无法判断是哪一类。现在这里只表示前者，后者见 recordKafkaPersistDropped()。
+    //
+    // ⚠️ 语义再收窄（2026-10-25）：此前【入群/退群公告】与【集群入站消息】被拒也
+    // 往这里 +1，而它们从不进 ws_messages_received_total —— 于是 dropped 可能
+    // 大于 received，比值彻底失去意义（正常情况 dropped 应当只是 received 的一小部分）。
+    // 现在这里严格是 received 的【子集】：只统计「客户端发来、已被接受、但被背压拒绝」。
+    // 公告见 recordRoomNoticeDropped()，跨实例见 recordClusterInboundDropped()。
     void recordWsMessageDropped(uint64_t count = 1) {
         wsDroppedMessages_.fetch_add(count, std::memory_order_relaxed);
+    }
+
+    // 服务端自己生成的【入群/退群公告】因房间积压被丢弃的次数。
+    //
+    // 单独计的理由：公告不是用户消息，塞进 ws_messages_dropped_total 会让
+    // 「用户消息丢了多少」这个数虚高，而且它永远不会出现在 received 里。
+    // 它涨说明「房间已经挤到连加入/离开的系统提示都发不出去」，是很强的过载信号。
+    void recordRoomNoticeDropped(uint64_t count = 1) {
+        wsRoomNoticeDropped_.fetch_add(count, std::memory_order_relaxed);
+    }
+
+    // 【跨实例入站消息】在本实例被房间背压拒绝的次数。
+    //
+    // 单独计的理由同上，且它还有个额外含义：源实例已经回了 200（它那边接受了），
+    // 而本实例没接住 —— 跨实例链路没有端到端确认，这个数是唯一能看见「另一头丢了」的地方。
+    void recordClusterInboundDropped(uint64_t count = 1) {
+        wsClusterInboundDropped_.fetch_add(count, std::memory_order_relaxed);
     }
 
     // 被识别为【客户端重发】而不再广播/落库的消息数（幂等去重命中）。
@@ -413,9 +436,15 @@ public:
            << "# HELP ws_messages_received_total Total WebSocket messages processed.\n"
            << "# TYPE ws_messages_received_total counter\n"
            << "ws_messages_received_total " << wsTotalMessages_.load(std::memory_order_relaxed) << "\n\n"
-           << "# HELP ws_messages_dropped_total WebSocket messages refused by the server (room shard backlog or private-delivery backpressure).\n"
+           << "# HELP ws_messages_dropped_total Client messages refused by the server (room shard backlog or private-delivery backpressure). Always a SUBSET of ws_messages_received_total - if it ever exceeds that, the two counters are being fed by different sources (a bug).\n"
            << "# TYPE ws_messages_dropped_total counter\n"
-           << "ws_messages_dropped_total " << wsDroppedMessages_.load(std::memory_order_relaxed) << "\n\n"
+           << "ws_messages_dropped_total " << wsDroppedMessages_.load(std::memory_order_relaxed) << "\n"
+           << "# HELP ws_room_notice_dropped_total Server-generated join/leave notices refused by room backpressure. NOT part of ws_messages_* (notices are never counted as received). Rising means even system notices can no longer be delivered.\n"
+           << "# TYPE ws_room_notice_dropped_total counter\n"
+           << "ws_room_notice_dropped_total " << wsRoomNoticeDropped_.load(std::memory_order_relaxed) << "\n"
+           << "# HELP ws_cluster_inbound_dropped_total Cross-instance messages refused by local room backpressure. The origin instance already answered 200, so this is the only place where 'the other side dropped it' is visible.\n"
+           << "# TYPE ws_cluster_inbound_dropped_total counter\n"
+           << "ws_cluster_inbound_dropped_total " << wsClusterInboundDropped_.load(std::memory_order_relaxed) << "\n\n"
            << "# HELP ws_messages_deduped_total Messages recognised as client retries and therefore not re-broadcast (idempotency dedup). Expected to grow slowly; a sharp rise means a client is reusing a non-unique key.\n"
            << "# TYPE ws_messages_deduped_total counter\n"
            << "ws_messages_deduped_total " << wsMessagesDeduped_.load(std::memory_order_relaxed) << "\n"
@@ -626,6 +655,8 @@ private:
     std::atomic<int64_t> wsOnlineConnections_{0};
     std::atomic<uint64_t> wsTotalMessages_{0};
     std::atomic<uint64_t> wsDroppedMessages_{0};
+    std::atomic<uint64_t> wsRoomNoticeDropped_{0};
+    std::atomic<uint64_t> wsClusterInboundDropped_{0};
     std::atomic<uint64_t> wsMessagesDeduped_{0};
     std::atomic<uint64_t> wsMessageDedupEnabled_{0};
     std::atomic<uint64_t> wsDirectBackpressured_{0};

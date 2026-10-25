@@ -945,14 +945,14 @@ void ChatWebsocket::handleNewConnection(const HttpRequestPtr& req, const WebSock
                         /*broadcastToCluster=*/false, subscriber->room_, &roomSeq,
                         persistAccepted))
         {
-            Metrics::PrometheusRegistry::instance().recordWsMessageDropped();
+            Metrics::PrometheusRegistry::instance().recordRoomNoticeDropped();
             // 与消息丢弃共用同一个限流器：同属「房间积压」这一种过载现象。
             // 触发频率同样由客户端决定（反复快速建连/断连即可），不能逐条打。
             if (overloadLogLimiter_.allow())
             {
                 LOG_WARN << "Room backlog full, dropped join notice for room " << topic << ": "
                          << (1 + overloadLogLimiter_.takeSuppressed())
-                         << " occurrence(s) since last log (total: ws_messages_dropped_total)";
+                         << " occurrence(s) since last log (total: ws_room_notice_dropped_total)";
             }
         }
         else if (roomSeq == 0)
@@ -1068,13 +1068,13 @@ void ChatWebsocket::handleConnectionClosed(const WebSocketConnectionPtr& wsConn)
                         /*broadcastToCluster=*/false, subscriber.room_, &roomSeq,
                         persistAccepted))
         {
-            Metrics::PrometheusRegistry::instance().recordWsMessageDropped();
+            Metrics::PrometheusRegistry::instance().recordRoomNoticeDropped();
             // 同上：与消息丢弃共用限流器。
             if (overloadLogLimiter_.allow())
             {
                 LOG_WARN << "Room backlog full, dropped leave notice for room " << topic << ": "
                          << (1 + overloadLogLimiter_.takeSuppressed())
-                         << " occurrence(s) since last log (total: ws_messages_dropped_total)";
+                         << " occurrence(s) since last log (total: ws_room_notice_dropped_total)";
             }
         }
         else if (roomSeq == 0)
@@ -1488,7 +1488,11 @@ void ChatWebsocket::initClusterBus()
                             // 本实例房间背压拒绝：整条消息没有本地投递，也没有进 journal。
                             // 源实例的 ACK 语义只代表「源实例已接受」，跨实例链路本身
                             // 没有端到端确认；这里至少让丢弃在指标上可见。
-                            Metrics::PrometheusRegistry::instance().recordWsMessageDropped();
+                            //
+                            // ⚠️ 不能记进 ws_messages_dropped_total：这条消息不是本实例
+                            // 的客户端发来的，从不进 ws_messages_received_total，
+                            // 混进去会让 dropped > received、比值失去意义。
+                            Metrics::PrometheusRegistry::instance().recordClusterInboundDropped();
                         }
                     }
                     catch (const std::exception& e)
